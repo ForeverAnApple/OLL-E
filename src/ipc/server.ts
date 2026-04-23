@@ -3,6 +3,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import type { EventBus } from "../bus/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
 import { history, revertSubtree } from "../extensions/git.ts";
+import { installStarter, listStarters } from "../starters/index.ts";
 import type { OllePaths } from "../paths.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
 
@@ -215,6 +216,43 @@ async function dispatch(
         const limit = (req.params?.limit as number | undefined) ?? 20;
         const hist = history(opts.paths.extensionsDir, name, limit);
         send({ id: req.id, ok: true, value: hist });
+        return;
+      }
+      case "starters.list": {
+        send({
+          id: req.id,
+          ok: true,
+          value: listStarters().map((s) => ({ name: s.name, description: s.description })),
+        });
+        return;
+      }
+      case "starters.install": {
+        if (!opts.paths || !opts.extensions) {
+          send({ id: req.id, ok: false, error: { message: "extensions unavailable" } });
+          return;
+        }
+        const name = req.params?.name as string | undefined;
+        const overwrite = Boolean(req.params?.overwrite);
+        const load = (req.params?.load as boolean | undefined) ?? true;
+        const authorName = (req.params?.authorName as string | undefined) ?? "cli";
+        if (!name) {
+          send({ id: req.id, ok: false, error: { message: "name required" } });
+          return;
+        }
+        const result = installStarter({
+          name,
+          extensionsDir: opts.paths.extensionsDir,
+          authorName,
+          overwrite,
+        });
+        let status: string | undefined;
+        if (load && !result.alreadyExisted) {
+          const ext = await opts.extensions.reload(name).catch((e) => {
+            throw new Error(`install ok but load failed: ${(e as Error).message}`);
+          });
+          status = ext.status;
+        }
+        send({ id: req.id, ok: true, value: { ...result, status } });
         return;
       }
       case "extensions.revert": {

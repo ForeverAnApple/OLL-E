@@ -36,6 +36,10 @@ export async function runCli(args: string[]): Promise<void> {
     case "ext":
       await cmdExtension(rest);
       return;
+    case "starter":
+    case "starters":
+      await cmdStarter(rest);
+      return;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
@@ -167,6 +171,47 @@ async function cmdExtension(args: string[]): Promise<void> {
   }
 }
 
+async function cmdStarter(args: string[]): Promise<void> {
+  const [sub, ...rest] = args;
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    switch (sub) {
+      case undefined:
+      case "list": {
+        const list = await client.call<Array<{ name: string; description: string }>>("starters.list");
+        for (const s of list) {
+          console.log(`${s.name}\n  ${s.description}`);
+        }
+        return;
+      }
+      case "install": {
+        const name = rest[0];
+        const overwrite = rest.includes("--overwrite");
+        const noLoad = rest.includes("--no-load");
+        if (!name) throw new Error("usage: olle starter install <name> [--overwrite] [--no-load]");
+        const r = await client.call<{
+          name: string;
+          filesWritten: number;
+          alreadyExisted: boolean;
+          commit: string | null;
+          status?: string;
+        }>("starters.install", { name, overwrite, load: !noLoad });
+        if (r.alreadyExisted && !overwrite) {
+          console.log(`${r.name}: already installed (use --overwrite to replace)`);
+        } else {
+          console.log(`${r.name}: installed ${r.filesWritten} files${r.commit ? ` (commit ${r.commit.slice(0, 8)})` : ""}${r.status ? `; status=${r.status}` : ""}`);
+        }
+        return;
+      }
+      default:
+        throw new Error(`unknown starter subcommand: ${sub}`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 async function cmdChat(): Promise<void> {
   const paths = resolvePaths();
   const client = await connectIpc(paths.socketFile);
@@ -254,6 +299,8 @@ function printHelp(): void {
       "  extension reload <name>     hot-reload an extension",
       "  extension history <name>    show git history for an extension",
       "  extension revert <name> <sha>   checkout <sha> of an extension",
+      "  starter list                list shipped starter templates",
+      "  starter install <name>      copy a starter into ~/.olle/extensions/",
       "  version                     show version",
       "  help                        show this help",
     ].join("\n"),

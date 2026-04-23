@@ -21,6 +21,7 @@ import {
 } from "../extensions/git.ts";
 import { validateManifest } from "../extensions/manifest.ts";
 import type { SmokeTest } from "../extensions/types.ts";
+import { installStarter, listStarters } from "../starters/index.ts";
 
 export interface MetaToolsOptions {
   extensions: ExtensionHost;
@@ -135,5 +136,36 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     execute: async ({ name, limit }) => gitHistory(extensionsDir, name, limit ?? 20),
   };
 
-  return [writeExt, runSmoke, register, revert, history];
+  const listStartersT: ToolDef<Record<string, never>, Array<{ name: string; description: string }>> = {
+    name: "list_starters",
+    description: "List the starter extension templates shipped with the binary.",
+    parameters: z.object({}),
+    execute: async () => listStarters().map(({ name, description }) => ({ name, description })),
+  };
+
+  const installStarterT: ToolDef<
+    { name: string; overwrite?: boolean },
+    { name: string; filesWritten: number; alreadyExisted: boolean; commit: string | null }
+  > = {
+    name: "install_starter",
+    description:
+      "Copy a named starter template into the extensions directory and git-commit it. Does not register.",
+    parameters: z.object({ name: z.string(), overwrite: z.boolean().optional() }),
+    execute: async ({ name, overwrite }) => {
+      const r = installStarter({
+        name,
+        extensionsDir,
+        authorName,
+        overwrite,
+      });
+      return {
+        name: r.name,
+        filesWritten: r.filesWritten,
+        alreadyExisted: r.alreadyExisted,
+        commit: r.commit,
+      };
+    },
+  };
+
+  return [writeExt, runSmoke, register, revert, history, listStartersT, installStarterT];
 }
