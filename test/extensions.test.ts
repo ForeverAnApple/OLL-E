@@ -147,6 +147,31 @@ describe("manifest validation", () => {
     expect(() => tool.validate!({})).toThrow(/must be a string/);
   });
 
+  it("defaults a missing inputSchema to an empty object schema", async () => {
+    // A stale extension authored against an older API shape (e.g.
+    // zod-parameters-only) must not brick the chat loop. Runtime fills
+    // in a placeholder schema and logs a warning.
+    const r = rig();
+    writeExt(tmp, "stale", {
+      manifest: { name: "stale", version: "0.1.0" },
+      // No inputSchema — the bug we guard against.
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "stale_tool",
+            description: "a tool authored before the schema refactor",
+            execute: () => "still runs",
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("stale");
+    const entry = host.tools().find((t) => t.tool.name === "stale_tool");
+    expect(entry).toBeDefined();
+    expect(entry!.tool.inputSchema).toEqual({ type: "object" });
+  });
+
   it("rejects a name mismatch", async () => {
     const r = rig();
     writeExt(tmp, "correct-dir", {

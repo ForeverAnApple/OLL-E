@@ -205,7 +205,21 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
             }
           }
         }
-        list.push({ extensionId, extensionName: callerName, tool, resolveSecrets: resolveOwnSecrets });
+        // Defense against stale / malformed extensions: LLM vendors
+        // reject tool specs without a JSON Schema. If an extension
+        // forgets inputSchema (or ships an old zod-based shape), fall
+        // back to an empty-object schema and warn loudly. Better to
+        // expose a broken tool than to 400 every chat turn.
+        const guarded: typeof tool =
+          tool.inputSchema && typeof tool.inputSchema === "object"
+            ? tool
+            : (() => {
+                console.warn(
+                  `[extensions] tool "${tool.name}" from "${callerName}" has no inputSchema — defaulting to { type: "object" }; please update the extension to declare a JSON Schema`,
+                );
+                return { ...tool, inputSchema: { type: "object" } };
+              })();
+        list.push({ extensionId, extensionName: callerName, tool: guarded, resolveSecrets: resolveOwnSecrets });
       },
       registerTrigger(trigger) {
         let list = triggersByExt.get(extensionId);
