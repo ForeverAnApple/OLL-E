@@ -15,9 +15,9 @@ afterEach(() => {
 });
 
 describe("starter templates", () => {
-  it("ships four starters with valid manifests", () => {
+  it("ships the expected starters with valid manifests", () => {
     const names = listStarters().map((s) => s.name).sort();
-    expect(names).toEqual(["claude-code", "cron-trigger", "discord", "github"]);
+    expect(names).toEqual(["claude-code", "cron-trigger", "discord", "discord-communication", "github"]);
     for (const s of listStarters()) {
       const mfRaw = s.files["manifest.json"];
       expect(mfRaw).toBeDefined();
