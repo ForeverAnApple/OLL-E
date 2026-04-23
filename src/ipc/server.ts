@@ -1,6 +1,9 @@
 import { createServer, type Server, type Socket } from "node:net";
 import { existsSync, unlinkSync } from "node:fs";
 import type { EventBus } from "../bus/index.ts";
+import type { ExtensionHost } from "../extensions/index.ts";
+import { history, revertSubtree } from "../extensions/git.ts";
+import type { OllePaths } from "../paths.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
 
 export interface IpcServerOptions {
@@ -8,6 +11,8 @@ export interface IpcServerOptions {
   bus: EventBus;
   /** Version string returned by the `version` method. */
   version: string;
+  extensions?: ExtensionHost;
+  paths?: OllePaths;
 }
 
 export interface IpcServer {
@@ -164,6 +169,77 @@ async function dispatch(
           send({ id: target, stream: "end" });
         }
         send({ id: req.id, ok: true, value: null });
+        return;
+      }
+      case "extensions.list": {
+        if (!opts.extensions) {
+          send({ id: req.id, ok: true, value: [] });
+          return;
+        }
+        send({
+          id: req.id,
+          ok: true,
+          value: opts.extensions.list().map((e) => ({
+            name: e.manifest.name,
+            version: e.manifest.version,
+            status: e.status,
+            failures: e.failures,
+          })),
+        });
+        return;
+      }
+      case "extensions.reload": {
+        if (!opts.extensions) {
+          send({ id: req.id, ok: false, error: { message: "extensions unavailable" } });
+          return;
+        }
+        const name = req.params?.name as string | undefined;
+        if (!name) {
+          send({ id: req.id, ok: false, error: { message: "name required" } });
+          return;
+        }
+        const ext = await opts.extensions.reload(name);
+        send({ id: req.id, ok: true, value: { name, status: ext.status } });
+        return;
+      }
+      case "extensions.history": {
+        if (!opts.paths) {
+          send({ id: req.id, ok: false, error: { message: "extensions unavailable" } });
+          return;
+        }
+        const name = req.params?.name as string | undefined;
+        if (!name) {
+          send({ id: req.id, ok: false, error: { message: "name required" } });
+          return;
+        }
+        const limit = (req.params?.limit as number | undefined) ?? 20;
+        const hist = history(opts.paths.extensionsDir, name, limit);
+        send({ id: req.id, ok: true, value: hist });
+        return;
+      }
+      case "extensions.revert": {
+        if (!opts.paths || !opts.extensions) {
+          send({ id: req.id, ok: false, error: { message: "extensions unavailable" } });
+          return;
+        }
+        const name = req.params?.name as string | undefined;
+        const sha = req.params?.sha as string | undefined;
+        const actorId = (req.params?.actorId as string | undefined) ?? "principal";
+        if (!name || !sha) {
+          send({
+            id: req.id,
+            ok: false,
+            error: { message: "name and sha required" },
+          });
+          return;
+        }
+        const newSha = revertSubtree(opts.paths.extensionsDir, name, sha, actorId);
+        const ext = await opts.extensions.reload(name);
+        send({
+          id: req.id,
+          ok: true,
+          value: { name, revertedTo: sha, newCommit: newSha, status: ext.status },
+        });
         return;
       }
       default:

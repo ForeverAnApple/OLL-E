@@ -28,6 +28,11 @@ export async function runCli(args: string[]): Promise<void> {
     case "publish":
       await cmdPublish(rest);
       return;
+    case "extension":
+    case "extensions":
+    case "ext":
+      await cmdExtension(rest);
+      return;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
@@ -100,6 +105,65 @@ async function cmdPublish(args: string[]): Promise<void> {
   console.log(`${res.hlc} ${res.id}`);
 }
 
+async function cmdExtension(args: string[]): Promise<void> {
+  const [sub, ...rest] = args;
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    switch (sub) {
+      case undefined:
+      case "list": {
+        const list = await client.call<
+          Array<{ name: string; version: string; status: string; failures: number }>
+        >("extensions.list");
+        if (list.length === 0) {
+          console.log("(no extensions loaded)");
+          return;
+        }
+        for (const e of list) {
+          console.log(`${e.name}@${e.version}  ${e.status}  fail=${e.failures}`);
+        }
+        return;
+      }
+      case "reload": {
+        const name = rest[0];
+        if (!name) throw new Error("usage: olle extension reload <name>");
+        const r = await client.call<{ name: string; status: string }>("extensions.reload", { name });
+        console.log(`${r.name} ${r.status}`);
+        return;
+      }
+      case "history": {
+        const name = rest[0];
+        if (!name) throw new Error("usage: olle extension history <name>");
+        const rows = await client.call<
+          Array<{ sha: string; author: string; date: number; subject: string }>
+        >("extensions.history", { name });
+        for (const r of rows) {
+          const when = new Date(r.date).toISOString();
+          console.log(`${r.sha.slice(0, 8)} ${when} ${r.author}: ${r.subject}`);
+        }
+        return;
+      }
+      case "revert": {
+        const [name, sha] = rest;
+        if (!name || !sha) throw new Error("usage: olle extension revert <name> <sha>");
+        const r = await client.call<{
+          name: string;
+          revertedTo: string;
+          newCommit: string | null;
+          status: string;
+        }>("extensions.revert", { name, sha });
+        console.log(`${r.name}: reverted to ${sha.slice(0, 8)} (now ${r.status})`);
+        return;
+      }
+      default:
+        throw new Error(`unknown extension subcommand: ${sub}`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 function printHelp(): void {
   console.log(
     [
@@ -108,12 +172,16 @@ function printHelp(): void {
       "Usage: olle <command> [args]",
       "",
       "Commands:",
-      "  run                start foreground daemon",
-      "  status             show daemon status",
-      "  tail [type]        stream events from the daemon (default: all)",
-      "  publish <type> [json]   emit a durable event",
-      "  version            show version",
-      "  help               show this help",
+      "  run                         start foreground daemon",
+      "  status                      show daemon status",
+      "  tail [type]                 stream events (default: all)",
+      "  publish <type> [json]       emit a durable event",
+      "  extension list              list loaded extensions",
+      "  extension reload <name>     hot-reload an extension",
+      "  extension history <name>    show git history for an extension",
+      "  extension revert <name> <sha>   checkout <sha> of an extension",
+      "  version                     show version",
+      "  help                        show this help",
     ].join("\n"),
   );
 }
