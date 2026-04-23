@@ -28,6 +28,9 @@ export async function runCli(args: string[]): Promise<void> {
     case "publish":
       await cmdPublish(rest);
       return;
+    case "chat":
+      await cmdChat();
+      return;
     case "extension":
     case "extensions":
     case "ext":
@@ -164,6 +167,76 @@ async function cmdExtension(args: string[]): Promise<void> {
   }
 }
 
+async function cmdChat(): Promise<void> {
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  const sessionId = Math.random().toString(36).slice(2, 10);
+  const sub = client.stream("tail", { type: "*" });
+
+  let turnBusy = false;
+  let prompt = () => undefined as void;
+  (async () => {
+    for await (const ev of sub.events) {
+      const p = ev.payload as { sessionId?: string; text?: string; name?: string; input?: unknown; error?: string };
+      if (p?.sessionId !== sessionId) continue;
+      if (ev.type === "chat.assistant-text") {
+        process.stdout.write(p.text ?? "");
+      } else if (ev.type === "chat.tool-call") {
+        process.stdout.write(`\n[tool] ${p.name}(${JSON.stringify(p.input)})\n`);
+      } else if (ev.type === "chat.tool-result") {
+        const payload = ev.payload as { isError?: boolean; content?: string };
+        const tag = payload.isError ? "tool-error" : "tool-ok";
+        process.stdout.write(`[${tag}] ${payload.content}\n`);
+      } else if (ev.type === "chat.turn-end") {
+        process.stdout.write("\n");
+        turnBusy = false;
+        prompt();
+      } else if (ev.type === "chat.error") {
+        process.stderr.write(`\n[error] ${p.error}\n`);
+        turnBusy = false;
+        prompt();
+      }
+    }
+  })();
+
+  const stop = async () => {
+    await sub.cancel();
+    client.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", stop);
+
+  const rl = (await import("node:readline")).createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  prompt = () => {
+    if (turnBusy) return;
+    rl.setPrompt("> ");
+    rl.prompt();
+  };
+  prompt();
+  rl.on("line", async (line) => {
+    const text = line.trim();
+    if (!text) {
+      prompt();
+      return;
+    }
+    if (text === "/exit" || text === "/quit") {
+      await stop();
+      return;
+    }
+    turnBusy = true;
+    await client.call("publish", {
+      type: "chat.input",
+      payload: { sessionId, text },
+      actorId: "cli",
+      durable: true,
+    });
+  });
+  rl.on("close", stop);
+}
+
 function printHelp(): void {
   console.log(
     [
@@ -174,6 +247,7 @@ function printHelp(): void {
       "Commands:",
       "  run                         start foreground daemon",
       "  status                      show daemon status",
+      "  chat                        REPL connected to the default agent",
       "  tail [type]                 stream events (default: all)",
       "  publish <type> [json]       emit a durable event",
       "  extension list              list loaded extensions",

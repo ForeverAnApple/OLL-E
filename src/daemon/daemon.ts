@@ -3,8 +3,13 @@ import { openStore, tables, type Store } from "../store/index.ts";
 import { createBus, persistToStore, type EventBus } from "../bus/index.ts";
 import { createIpcServer, type IpcServer } from "../ipc/server.ts";
 import { createExtensionHost, ensureRepo, type ExtensionHost } from "../extensions/index.ts";
+import { createLedger, type Ledger } from "../ledger/index.ts";
+import { createAnthropicAdapter } from "../llm/index.ts";
+import { startChatAgent, type ChatAgent } from "../agent/index.ts";
+import { buildMetaTools } from "../tools/meta.ts";
 import { ulid } from "../id/index.ts";
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { eq } from "drizzle-orm";
 
 export interface StartDaemonOptions {
   /** Override data root; defaults to $OLLE_HOME or ~/.olle */
@@ -22,6 +27,9 @@ export interface Daemon {
   readonly bus: EventBus;
   readonly ipc: IpcServer;
   readonly extensions: ExtensionHost;
+  readonly ledger: Ledger;
+  readonly chat?: ChatAgent;
+  readonly chatAgentId?: string;
   shutdown(): Promise<void>;
 }
 
@@ -41,7 +49,9 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     store,
     hostId,
     extensionsDir: paths.extensionsDir,
+    secrets: (name) => readSecret(paths.secretsDir, name),
   });
+  const ledger = createLedger({ bus, store, hostId });
 
   const ipc = createIpcServer({
     socketPath: paths.socketFile,
@@ -70,6 +80,37 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     }
   }
 
+  // Chat agent — only if there's an API key. Without it the daemon still
+  // runs but `olle chat` just bounces with chat.error.
+  let chat: ChatAgent | undefined;
+  let chatAgentId: string | undefined;
+  if (process.env.ANTHROPIC_API_KEY) {
+    chatAgentId = ensureAgentRow(store, hostId, "root");
+    const llm = createAnthropicAdapter();
+    const coreTools = buildMetaTools({
+      extensions,
+      extensionsDir: paths.extensionsDir,
+      authorName: chatAgentId,
+    });
+    chat = startChatAgent({
+      bus,
+      store,
+      hostId,
+      llm,
+      agentId: chatAgentId,
+      extensions,
+      coreTools,
+      ledger,
+      system:
+        "You are an agent inside OLL-E, a habitat for agents. You can grow " +
+        "the world by writing and registering extensions. Tools: write_extension, " +
+        "run_smoke_test, register_extension, revert_extension, extension_history. " +
+        "Be concise.",
+    });
+  } else if (!opts.quiet) {
+    console.log("olle: ANTHROPIC_API_KEY not set — chat agent disabled");
+  }
+
   writeFileSync(paths.pidFile, String(process.pid), "utf8");
 
   if (!opts.quiet) {
@@ -96,6 +137,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       actorId: hostId,
       durable: true,
     });
+    chat?.stop();
     for (const ext of extensions.list()) {
       try {
         await extensions.unload(ext.manifest.name);
@@ -115,7 +157,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     }
   };
 
-  return { paths, hostId, store, bus, ipc, extensions, shutdown };
+  return { paths, hostId, store, bus, ipc, extensions, ledger, chat, chatAgentId, shutdown };
 }
 
 function checkNotRunning(paths: OllePaths): void {
@@ -151,4 +193,32 @@ function ensureHostRow(store: Store): string {
     })
     .run();
   return id;
+}
+
+function ensureAgentRow(store: Store, hostId: string, name: string): string {
+  const existing = store.select().from(tables.agents).where(eq(tables.agents.name, name)).all();
+  if (existing.length > 0) return existing[0]!.id;
+  const id = ulid();
+  store
+    .insert(tables.agents)
+    .values({
+      id,
+      name,
+      hostId,
+      scope: { allowTiers: ["operational"] },
+      createdAt: Date.now(),
+    })
+    .run();
+  return id;
+}
+
+function readSecret(secretsDir: string, name: string): string | undefined {
+  try {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const p = require("node:path").join(secretsDir, name) as string;
+    if (!fs.existsSync(p)) return process.env[name];
+    return fs.readFileSync(p, "utf8").trim();
+  } catch {
+    return process.env[name];
+  }
 }
