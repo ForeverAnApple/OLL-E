@@ -40,6 +40,10 @@ export interface ToolDef<I = unknown, O = unknown> {
    *  its return value is passed to `execute`. If omitted, input flows
    *  through unchanged. */
   validate?(input: unknown): I;
+  /** Input property names whose values must be redacted from any audit
+   *  event or persisted message (e.g. secret bodies). The tool still
+   *  receives the raw value; only the trace is sanitized. */
+  sensitiveInputFields?: string[];
   execute(args: I, ctx: ToolExecuteContext): Promise<O> | O;
 }
 
@@ -149,8 +153,19 @@ export interface ExtensionModule {
   unload?(): void | Promise<void>;
 }
 
+/** Context passed to smoke.ts smokeTest — so smoke can read its extension's
+ *  declared secrets without resorting to process.env scraping. */
+export interface SmokeContext {
+  /** Resolved values for the manifest's `secrets` list (file-backed first,
+   *  process.env as fallback). Missing secrets are absent from the record. */
+  secrets: Record<string, string>;
+}
+
 /** Smoke test contract — exported as `smokeTest` in smoke.ts. */
-export type SmokeTest = (bus: EventBus) => Promise<void> | void;
+export type SmokeTest = (
+  bus: EventBus,
+  ctx?: SmokeContext,
+) => Promise<void> | void;
 
 /** Internal: the loaded, live extension record. */
 export interface LoadedExtension {

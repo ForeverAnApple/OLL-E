@@ -109,6 +109,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       extensions,
       extensionsDir: paths.extensionsDir,
       authorName: chatAgentId,
+      secretsDir: paths.secretsDir,
     });
     chat = startChatAgent({
       bus,
@@ -127,8 +128,11 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         "built for agents like you. Your job is to accomplish what the human " +
         "asks. OLL-E is yours to reshape: when the world is missing something " +
         "you need, extend it. Tools for modifying your habitat: write_extension, " +
-        "run_smoke_test, register_extension, revert_extension, extension_history. " +
-        "Be concise.",
+        "run_smoke_test, register_extension, revert_extension, extension_history, " +
+        "read_extension_file (inspect manifest / index.ts / smoke.ts before guessing " +
+        "at error strings), set_secret / list_secrets / remove_secret for credentials " +
+        "(call set_secret yourself when the human gives you a token — don't shell out " +
+        "to external CLIs). Be concise.",
     });
   } else if (!opts.quiet) {
     console.log("olle: ANTHROPIC_API_KEY not set — chat agent disabled");

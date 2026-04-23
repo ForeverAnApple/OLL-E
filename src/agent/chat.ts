@@ -126,6 +126,7 @@ async function runTurn(session: Session, text: string, origin: Event, opts: Chat
   session.messages.push({ role: "user", content: text });
   try {
     const tools = collectTools(opts);
+    const redactions = buildRedactionMap(tools);
     const scope = loadAgentScope(opts.store, opts.agentId);
     const grantProposed = new Set<string>();
     const result = await runAgent({
@@ -141,7 +142,7 @@ async function runTurn(session: Session, text: string, origin: Event, opts: Chat
         secrets: {},
       },
       messages: session.messages,
-      onStep: (step) => emitStep(opts, session.id, origin, step),
+      onStep: (step) => emitStep(opts, session.id, origin, step, redactions),
       authorize: (tool) =>
         checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),
       onDenied: ({ tool, reason }) => {
@@ -192,7 +193,13 @@ async function runTurn(session: Session, text: string, origin: Event, opts: Chat
     }
     // Commit the snapshot before announcing turn-end so any subscriber
     // reacting to the event can rely on the on-disk state being current.
-    if (opts.sessionsDir) saveSession(opts.sessionsDir, session);
+    // Sensitive tool inputs (e.g. set_secret value) are redacted from the
+    // persisted form — the in-memory session still holds the raw values
+    // the current turn already passed to the tool, but no subsequent
+    // reader (disk snapshot, replay) ever sees them.
+    if (opts.sessionsDir) {
+      saveSession(opts.sessionsDir, session, redactions);
+    }
     opts.bus.publish({
       type: "chat.turn-end",
       hostId: opts.hostId,
@@ -253,11 +260,18 @@ function tryLoadSession(dir: string, id: string): Message[] | null {
   }
 }
 
-function saveSession(dir: string, session: Session): void {
+function saveSession(
+  dir: string,
+  session: Session,
+  redactions: Map<string, string[]>,
+): void {
   try {
+    const messages = redactions.size
+      ? redactMessages(session.messages, redactions)
+      : session.messages;
     writeFileSync(
       sessionFile(dir, session.id),
-      JSON.stringify({ id: session.id, messages: session.messages, savedAt: Date.now() }),
+      JSON.stringify({ id: session.id, messages, savedAt: Date.now() }),
       "utf8",
     );
   } catch {
@@ -265,11 +279,53 @@ function saveSession(dir: string, session: Session): void {
   }
 }
 
+function buildRedactionMap(tools: ToolDef[]): Map<string, string[]> {
+  const m = new Map<string, string[]>();
+  for (const t of tools) {
+    if (t.sensitiveInputFields && t.sensitiveInputFields.length) {
+      m.set(t.name, t.sensitiveInputFields);
+    }
+  }
+  return m;
+}
+
+function redactInput(
+  input: unknown,
+  fields: string[],
+): Record<string, unknown> {
+  const src = (input && typeof input === "object") ? (input as Record<string, unknown>) : {};
+  const out: Record<string, unknown> = { ...src };
+  for (const f of fields) {
+    if (f in out) out[f] = "[redacted]";
+  }
+  return out;
+}
+
+// Deep-clone-and-redact: walks assistant messages for tool_use blocks whose
+// tool name has registered sensitive fields. Never mutates the input.
+function redactMessages(
+  messages: Message[],
+  redactions: Map<string, string[]>,
+): Message[] {
+  return messages.map((m) => {
+    if (m.role !== "assistant" || typeof m.content === "string") return m;
+    const content = (m.content as unknown[]).map((block) => {
+      const b = block as { type?: string; name?: string; input?: unknown };
+      if (b.type !== "tool_use" || !b.name) return block;
+      const fields = redactions.get(b.name);
+      if (!fields) return block;
+      return { ...b, input: redactInput(b.input, fields) };
+    });
+    return { ...m, content } as Message;
+  });
+}
+
 function emitStep(
   opts: ChatAgentOptions,
   sessionId: string,
   origin: Event,
   step: AgentStep,
+  redactions: Map<string, string[]>,
 ): void {
   if (step.kind === "assistant") {
     // Flatten to text for the CLI; tool-use blocks go out separately.
@@ -288,13 +344,15 @@ function emitStep(
       });
     }
   } else if (step.kind === "tool_use") {
+    const fields = redactions.get(step.name);
+    const input = fields ? redactInput(step.input, fields) : step.input;
     opts.bus.publish({
       type: "chat.tool-call",
       hostId: opts.hostId,
       actorId: opts.agentId,
       parentEventId: origin.id,
       durable: true,
-      payload: { sessionId, id: step.id, name: step.name, input: step.input },
+      payload: { sessionId, id: step.id, name: step.name, input },
     });
   } else if (step.kind === "tool_result") {
     opts.bus.publish({

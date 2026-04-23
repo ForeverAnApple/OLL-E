@@ -1,11 +1,21 @@
 import { createServer, type Server, type Socket } from "node:net";
-import { existsSync, unlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
 import type { EventBus } from "../bus/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
 import { history, revertSubtree } from "../extensions/git.ts";
 import { installStarter, listStarters } from "../starters/index.ts";
 import type { OllePaths } from "../paths.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
+
+const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 export interface IpcServerOptions {
   socketPath: string;
@@ -253,6 +263,65 @@ async function dispatch(
           status = ext.status;
         }
         send({ id: req.id, ok: true, value: { ...result, status } });
+        return;
+      }
+      case "secrets.list": {
+        if (!opts.paths) {
+          send({ id: req.id, ok: false, error: { message: "paths unavailable" } });
+          return;
+        }
+        const dir = opts.paths.secretsDir;
+        if (!existsSync(dir)) {
+          send({ id: req.id, ok: true, value: [] });
+          return;
+        }
+        const entries = readdirSync(dir)
+          .filter((n) => SECRET_NAME_RE.test(n))
+          .map((name) => {
+            const st = statSync(join(dir, name));
+            return { name, size: st.size, updatedAt: st.mtimeMs };
+          });
+        send({ id: req.id, ok: true, value: entries });
+        return;
+      }
+      case "secrets.set": {
+        if (!opts.paths) {
+          send({ id: req.id, ok: false, error: { message: "paths unavailable" } });
+          return;
+        }
+        const name = req.params?.name as string | undefined;
+        const value = req.params?.value as string | undefined;
+        if (!name || !SECRET_NAME_RE.test(name)) {
+          send({
+            id: req.id,
+            ok: false,
+            error: { message: "name must match /^[A-Z][A-Z0-9_]{0,63}$/" },
+          });
+          return;
+        }
+        if (typeof value !== "string" || value.length === 0) {
+          send({ id: req.id, ok: false, error: { message: "value required" } });
+          return;
+        }
+        mkdirSync(opts.paths.secretsDir, { recursive: true, mode: 0o700 });
+        const p = join(opts.paths.secretsDir, name);
+        writeFileSync(p, value, { mode: 0o600 });
+        send({ id: req.id, ok: true, value: { name, bytes: value.length } });
+        return;
+      }
+      case "secrets.remove": {
+        if (!opts.paths) {
+          send({ id: req.id, ok: false, error: { message: "paths unavailable" } });
+          return;
+        }
+        const name = req.params?.name as string | undefined;
+        if (!name || !SECRET_NAME_RE.test(name)) {
+          send({ id: req.id, ok: false, error: { message: "invalid name" } });
+          return;
+        }
+        const p = join(opts.paths.secretsDir, name);
+        if (existsSync(p)) unlinkSync(p);
+        send({ id: req.id, ok: true, value: { name, removed: true } });
         return;
       }
       case "extensions.revert": {

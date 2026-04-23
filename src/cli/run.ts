@@ -40,6 +40,10 @@ export async function runCli(args: string[]): Promise<void> {
     case "starters":
       await cmdStarter(rest);
       return;
+    case "secret":
+    case "secrets":
+      await cmdSecret(rest);
+      return;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
@@ -212,6 +216,66 @@ async function cmdStarter(args: string[]): Promise<void> {
   }
 }
 
+async function cmdSecret(args: string[]): Promise<void> {
+  const [sub, ...rest] = args;
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    switch (sub) {
+      case undefined:
+      case "list": {
+        const list = await client.call<
+          Array<{ name: string; size: number; updatedAt: number }>
+        >("secrets.list");
+        if (list.length === 0) {
+          console.log("(no secrets set)");
+          return;
+        }
+        for (const s of list) {
+          const when = new Date(s.updatedAt).toISOString();
+          console.log(`${s.name}  ${s.size}B  ${when}`);
+        }
+        return;
+      }
+      case "set": {
+        const name = rest[0];
+        if (!name) {
+          throw new Error("usage: olle secret set <NAME> [<value>]   (omit value to read from stdin)");
+        }
+        let value = rest.slice(1).join(" ");
+        if (!value) {
+          if (process.stdin.isTTY) {
+            throw new Error(
+              "no value provided. pass as argument or pipe on stdin, e.g. `printf '%s' $TOKEN | olle secret set DISCORD_TOKEN`",
+            );
+          }
+          const chunks: Buffer[] = [];
+          for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+          value = Buffer.concat(chunks).toString("utf8").replace(/\r?\n$/, "");
+        }
+        const r = await client.call<{ name: string; bytes: number }>("secrets.set", {
+          name,
+          value,
+        });
+        console.log(`${r.name}: ${r.bytes}B written`);
+        return;
+      }
+      case "remove":
+      case "rm": {
+        const name = rest[0];
+        if (!name) throw new Error("usage: olle secret remove <NAME>");
+        await client.call("secrets.remove", { name });
+        console.log(`${name}: removed`);
+        return;
+      }
+      default:
+        throw new Error(`unknown secret subcommand: ${sub}`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 async function cmdChat(): Promise<void> {
   const paths = resolvePaths();
   const client = await connectIpc(paths.socketFile);
@@ -301,6 +365,9 @@ function printHelp(): void {
       "  extension revert <name> <sha>   checkout <sha> of an extension",
       "  starter list                list shipped starter templates",
       "  starter install <name>      copy a starter into ~/.olle/extensions/",
+      "  secret list                 list secret names (values never shown)",
+      "  secret set <NAME> [value]   store a secret (or pipe on stdin)",
+      "  secret remove <NAME>        remove a stored secret",
       "  version                     show version",
       "  help                        show this help",
     ].join("\n"),

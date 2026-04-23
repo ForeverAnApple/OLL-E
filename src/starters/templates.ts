@@ -493,13 +493,13 @@ export function unload() {
     "smoke.ts":
 `// Smoke: validate DISCORD_TOKEN by calling /users/@me. Doesn't open the
 // gateway (heavier, side-effecting) — just confirms the token is accepted.
-// Reads the token from DISCORD_TOKEN env since smoke runs before secrets
-// are injected into the extension runtime.
+// Prefers the file-backed secret resolved by the daemon, falls back to env
+// for dev runs where the daemon isn't managing secrets.
 
-export async function smokeTest() {
-  const token = process.env.DISCORD_TOKEN;
+export async function smokeTest(_bus, ctx) {
+  const token = ctx?.secrets?.DISCORD_TOKEN ?? process.env.DISCORD_TOKEN;
   if (!token) {
-    throw new Error("discord smoke: DISCORD_TOKEN not set in env. Set it via \`olle secret set DISCORD_TOKEN ...\` or export DISCORD_TOKEN before smoking.");
+    throw new Error("discord smoke: DISCORD_TOKEN not set. Ask olle to store it (set_secret tool) or run: printf %s \\"\\$TOKEN\\" | olle secret set DISCORD_TOKEN");
   }
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 10_000);
@@ -679,13 +679,12 @@ export function unload() {
 `,
     "smoke.ts":
 `// Smoke: confirm GH_TOKEN is accepted by calling /user. Doesn't mutate
-// anything. Reads from GH_TOKEN env since smoke runs before secret
-// injection into the extension runtime.
+// anything. Prefers file-backed secret from the daemon; falls back to env.
 
-export async function smokeTest() {
-  const token = process.env.GH_TOKEN;
+export async function smokeTest(_bus, ctx) {
+  const token = ctx?.secrets?.GH_TOKEN ?? process.env.GH_TOKEN;
   if (!token) {
-    throw new Error("github smoke: GH_TOKEN not set in env. Set it via \`olle secret set GH_TOKEN ...\` or export GH_TOKEN before smoking.");
+    throw new Error("github smoke: GH_TOKEN not set. Ask olle to store it (set_secret tool) or run: printf %s \\"\\$TOKEN\\" | olle secret set GH_TOKEN");
   }
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 10_000);

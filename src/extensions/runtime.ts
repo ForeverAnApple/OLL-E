@@ -142,13 +142,24 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     return stageDir;
   }
 
-  async function runSmoke(stagedDir: string): Promise<void> {
+  function resolveManifestSecrets(manifest: Manifest): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (manifest.secrets && opts.secrets) {
+      for (const s of manifest.secrets) {
+        const v = opts.secrets(s, manifest.name);
+        if (v != null) out[s] = v;
+      }
+    }
+    return out;
+  }
+
+  async function runSmoke(stagedDir: string, manifest: Manifest): Promise<void> {
     const smokePath = join(stagedDir, "smoke.ts");
     if (!existsSync(smokePath)) return; // no smoke.ts is allowed; tool-only extensions
     const url = pathToFileURL(smokePath).href;
     const mod = (await import(url)) as { smokeTest?: SmokeTest };
     if (typeof mod.smokeTest !== "function") return;
-    await mod.smokeTest(opts.bus);
+    await mod.smokeTest(opts.bus, { secrets: resolveManifestSecrets(manifest) });
   }
 
   function makeApi(manifest: Manifest, extensionId: string, extDir: string): {
@@ -445,7 +456,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     const stagedDir = stage(extDir, name);
 
     // Smoke-gate before any side-effect-ful registration.
-    await runSmoke(stagedDir);
+    await runSmoke(stagedDir, manifest);
 
     const extensionId = upsertRow(opts.store, manifest, extDir);
     const indexUrl = pathToFileURL(join(stagedDir, "index.ts")).href;
