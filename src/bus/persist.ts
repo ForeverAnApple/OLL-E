@@ -6,8 +6,8 @@ import type { Event } from "./types.ts";
  *  the events table synchronously so order matches HLC. */
 export function persistToStore(db: Store): (event: Event) => void {
   const insert = db.raw.prepare(
-    `INSERT INTO events (id, hlc, host_id, actor_id, type, payload, parent_event_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (id, hlc, host_id, actor_id, type, payload, parent_event_id, to_agent_id, thread_id, parent_thread_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   return (event) => {
     insert.run(
@@ -18,6 +18,9 @@ export function persistToStore(db: Store): (event: Event) => void {
       event.type,
       JSON.stringify(event.payload ?? null),
       event.parentEventId ?? null,
+      event.toAgentId ?? null,
+      event.threadId ?? null,
+      event.parentThreadId ?? null,
       event.createdAt,
     );
   };

@@ -7,6 +7,13 @@ export interface PublishInput<T = unknown> {
   hostId: string;
   actorId: string;
   parentEventId?: string;
+  /** Address this event to a specific agent's mailbox. */
+  toAgentId?: string;
+  /** Correlation id for the conversation/work-stream this belongs to. */
+  threadId?: string;
+  /** If this event opens a new thread descending from another, reference
+   *  the parent thread so observers can correlate. */
+  parentThreadId?: string;
   durable?: boolean;
 }
 
@@ -85,6 +92,9 @@ export function createBus(opts: BusOptions): EventBus {
       type: input.type,
       payload: input.payload,
       parentEventId: input.parentEventId,
+      toAgentId: input.toAgentId,
+      threadId: input.threadId,
+      parentThreadId: input.parentThreadId,
       createdAt: stamp.l,
       durable: input.durable ?? false,
     };

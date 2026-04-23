@@ -154,12 +154,20 @@ export const events = sqliteTable(
     type: text("type").notNull(),
     payload: text("payload", { mode: "json" }).$type<Record<string, unknown>>().notNull(),
     parentEventId: text("parent_event_id"),
+    // Mailbox routing: which agent is this addressed to, and which
+    // correlation thread does it belong to. Both nullable for
+    // untargeted/untagged events. See migration 0003 for the story.
+    toAgentId: text("to_agent_id"),
+    threadId: text("thread_id"),
+    parentThreadId: text("parent_thread_id"),
     createdAt: integer("created_at").notNull(),
   },
   (t) => ({
     byHlc: index("events_hlc").on(t.hlc),
     byType: index("events_type").on(t.type),
     byParent: index("events_parent").on(t.parentEventId),
+    byMailbox: index("events_mailbox").on(t.toAgentId, t.hlc),
+    byThread: index("events_thread").on(t.threadId, t.hlc),
   }),
 );
 
