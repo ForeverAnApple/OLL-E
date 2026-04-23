@@ -137,3 +137,23 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# References (studied, not shipped)
+references/
+
+# Design/planning docs are personal drafts, not source
+docs/plan/
+docs/plans/
+docs/design/
+
+# Build output and local state
+.artifacts/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local tooling
+.lastty-worktrees/
+.lastty-shared/
+.claude/
