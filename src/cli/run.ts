@@ -279,15 +279,19 @@ async function cmdSecret(args: string[]): Promise<void> {
 async function cmdChat(): Promise<void> {
   const paths = resolvePaths();
   const client = await connectIpc(paths.socketFile);
-  const sessionId = Math.random().toString(36).slice(2, 10);
+  // Fetch the root agent's id so we can address events to its mailbox.
+  // Falls back to "root" only as a last resort — ids are ULID so the
+  // lookup is cheap and authoritative.
+  const { rootAgentId } = await client.call<{ rootAgentId: string }>("status.rootAgent");
+  const threadId = `cli:${Math.random().toString(36).slice(2, 10)}`;
   const sub = client.stream("tail", { type: "*" });
 
   let turnBusy = false;
   let prompt = () => undefined as void;
   (async () => {
     for await (const ev of sub.events) {
-      const p = ev.payload as { sessionId?: string; text?: string; name?: string; input?: unknown; error?: string };
-      if (p?.sessionId !== sessionId) continue;
+      if (ev.threadId !== threadId) continue;
+      const p = ev.payload as { text?: string; name?: string; input?: unknown; error?: string };
       if (ev.type === "chat.assistant-text") {
         process.stdout.write(p.text ?? "");
       } else if (ev.type === "chat.tool-call") {
@@ -338,9 +342,11 @@ async function cmdChat(): Promise<void> {
     turnBusy = true;
     await client.call("publish", {
       type: "chat.input",
-      payload: { sessionId, text },
+      payload: { text },
       actorId: "cli",
       durable: true,
+      toAgentId: rootAgentId,
+      threadId,
     });
   });
   rl.on("close", stop);

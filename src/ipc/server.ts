@@ -24,6 +24,9 @@ export interface IpcServerOptions {
   version: string;
   extensions?: ExtensionHost;
   paths?: OllePaths;
+  /** Root agent id, returned by `status.rootAgent` so clients (CLI chat,
+   *  bridges) can address their mailbox publishes. */
+  rootAgentId?: string;
 }
 
 export interface IpcServer {
@@ -144,6 +147,9 @@ async function dispatch(
           payload?: unknown;
           actorId?: string;
           durable?: boolean;
+          toAgentId?: string;
+          threadId?: string;
+          parentThreadId?: string;
         };
         if (typeof p.type !== "string" || typeof p.actorId !== "string") {
           send({
@@ -159,8 +165,19 @@ async function dispatch(
           hostId: opts.bus.hostId,
           actorId: p.actorId,
           durable: p.durable ?? false,
+          toAgentId: p.toAgentId,
+          threadId: p.threadId,
+          parentThreadId: p.parentThreadId,
         });
         send({ id: req.id, ok: true, value: { id: ev.id, hlc: ev.hlc } });
+        return;
+      }
+      case "status.rootAgent": {
+        if (!opts.rootAgentId) {
+          send({ id: req.id, ok: false, error: { message: "root agent id unavailable" } });
+          return;
+        }
+        send({ id: req.id, ok: true, value: { rootAgentId: opts.rootAgentId } });
         return;
       }
       case "tail": {

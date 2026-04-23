@@ -198,6 +198,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     const api: ExtensionApi = {
       hostId: opts.hostId,
       extensionId,
+      rootAgentId: opts.defaultTaskAgentId,
       secrets: resolved,
       scratchDir,
       registerTool(tool) {
@@ -284,13 +285,27 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
         unsubs.push(un);
         return un;
       },
-      publish<T>(type: string, payload: T, publishOpts?: { durable?: boolean }) {
+      publish<T>(
+        type: string,
+        payload: T,
+        publishOpts?: {
+          durable?: boolean;
+          toAgentId?: string;
+          threadId?: string;
+          parentThreadId?: string;
+          parentEventId?: string;
+        },
+      ) {
         opts.bus.publish({
           type,
           payload,
           hostId: opts.hostId,
           actorId: extensionId,
           durable: publishOpts?.durable ?? false,
+          toAgentId: publishOpts?.toAgentId,
+          threadId: publishOpts?.threadId,
+          parentThreadId: publishOpts?.parentThreadId,
+          parentEventId: publishOpts?.parentEventId,
         });
       },
       async callTool<I, O>(name: string, args: I, callOpts?: CallToolOptions): Promise<O> {

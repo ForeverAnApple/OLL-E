@@ -740,16 +740,20 @@ const discordCommunication: StarterTemplate = {
 //   - DMs: always pumped in.
 //   - Guild channels: only if the channel is in watchedChannels AND
 //     (the bot is mentioned OR the wake-word matches content).
-//   - Session key: discord:<channel_id>:<author_id> — one session per
-//     user per channel. MESSAGE_CREATE's channel_id is the thread id
-//     when the message was in a thread, so channel-keyed sends land
-//     in the right place without needing separate thread handling.
+//   - Thread id: discord:<channel_id>:<author_id> — one correlation per
+//     user per channel. Channel-keyed sends land in the right place for
+//     MESSAGE_CREATE from threads too, so separate thread handling isn't
+//     needed.
+//   - toAgentId: api.rootAgentId so the event lands in root's mailbox.
+//     Retargeting (a secretary taking over a thread, say) will be the
+//     agent's own job via retarget_thread.
 //
 // Outbound (chat.turn-end -> discord_send):
-//   - Accumulates chat.assistant-text chunks through the turn.
+//   - Accumulates chat.assistant-text chunks through the turn, filtered
+//     by threadId (not payload.sessionId — threading is a bus-level tag).
 //   - On chat.turn-end, posts the accumulated text as one message.
 //   - asAgent is threaded so the call passes the same permission gate
-//     the chat agent applies to its own tool dispatch.
+//     the agent applies to its own tool dispatch.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -790,7 +794,7 @@ function loadConfig(): Config {
   return manifest.config as Config;
 }
 
-function sessionKey(msg: ChannelMessage): string {
+function threadKey(msg: ChannelMessage): string {
   return \`discord:\${msg.channel_id}:\${msg.author.id}\`;
 }
 
@@ -812,9 +816,9 @@ function cleanContent(raw: string, re: RegExp, isDm: boolean): string {
   return stripped || raw;
 }
 
-function finalize(sessionId: string): string | null {
-  const chunks = accumulators.get(sessionId) ?? [];
-  accumulators.delete(sessionId);
+function finalize(threadId: string): string | null {
+  const chunks = accumulators.get(threadId) ?? [];
+  accumulators.delete(threadId);
   const text = chunks.join("\\n\\n").trim();
   return text || null;
 }
@@ -830,28 +834,34 @@ export function register(api: any) {
   api.on("channel-message", (ev: any) => {
     const msg = ev.payload as ChannelMessage;
     if (!shouldAnswer(msg, cfg!, wakeRe!)) return;
-    const sessionId = sessionKey(msg);
-    routes.set(sessionId, { channelId: msg.channel_id, originMessageId: msg.message_id });
+    const threadId = threadKey(msg);
+    routes.set(threadId, { channelId: msg.channel_id, originMessageId: msg.message_id });
     const text = cleanContent(msg.content, wakeRe!, msg.is_dm);
-    api.publish("chat.input", { sessionId, text }, { durable: true });
+    api.publish(
+      "chat.input",
+      { text },
+      { durable: true, toAgentId: api.rootAgentId, threadId },
+    );
   });
 
   api.on("chat.assistant-text", (ev: any) => {
-    const p = ev.payload as { sessionId: string; text: string };
-    if (!routes.has(p.sessionId)) return;
-    const acc = accumulators.get(p.sessionId) ?? [];
+    const threadId = ev.threadId;
+    if (!threadId || !routes.has(threadId)) return;
+    const p = ev.payload as { text: string };
+    const acc = accumulators.get(threadId) ?? [];
     acc.push(p.text);
-    accumulators.set(p.sessionId, acc);
-    if (ev.actorId) turnActors.set(p.sessionId, ev.actorId as string);
+    accumulators.set(threadId, acc);
+    if (ev.actorId) turnActors.set(threadId, ev.actorId as string);
   });
 
   api.on("chat.turn-end", async (ev: any) => {
-    const p = ev.payload as { sessionId: string };
-    const route = routes.get(p.sessionId);
+    const threadId = ev.threadId;
+    if (!threadId) return;
+    const route = routes.get(threadId);
     if (!route) return;
-    const text = finalize(p.sessionId);
-    const actor = turnActors.get(p.sessionId);
-    turnActors.delete(p.sessionId);
+    const text = finalize(threadId);
+    const actor = turnActors.get(threadId);
+    turnActors.delete(threadId);
     if (!text) return;
     try {
       await api.callTool(
@@ -860,16 +870,15 @@ export function register(api: any) {
         actor ? { asAgent: actor } : undefined,
       );
     } catch (err) {
-      // Log but don't throw — a failed post shouldn't crash the
-      // extension. Next turn-end can still try.
       console.error("[discord-communication] discord_send failed:", (err as Error).message);
     }
   });
 
   api.on("chat.error", (ev: any) => {
-    const p = ev.payload as { sessionId: string };
-    accumulators.delete(p.sessionId);
-    turnActors.delete(p.sessionId);
+    const threadId = ev.threadId;
+    if (!threadId) return;
+    accumulators.delete(threadId);
+    turnActors.delete(threadId);
   });
 }
 

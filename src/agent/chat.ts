@@ -1,15 +1,20 @@
-// Chat agent — channel-of-first-contact. Subscribes to chat.input events
-// for a given session, runs the agent loop, and streams assistant text
-// + tool visibility back as chat.* events so the CLI can tail and render.
+// Agent loop — the generic mailbox drainer.
 //
-// Concurrency: one worker per session. chat.input always enqueues; the
-// worker drains pending messages in order. Never drops — concurrent
-// inputs to the same session serialize behind the current turn. Different
-// sessions run independently.
+// Every agent is a mailbox-holder. This loop subscribes to events addressed
+// to its mailbox (toAgentId === agentId), keeps a message history PER
+// THREAD (ev.threadId), and drains each thread's pending input in order.
 //
-// Durability: when sessionsDir is configured, session.messages is
-// snapshotted to disk after each turn-end and loaded on first-touch so
-// a restart doesn't lose conversation state.
+// The collapse: there is no special "chat agent" — chat is just one kind
+// of event that lands in a mailbox. chat.input from a CLI, chat.input
+// from the discord bridge, and later child-agent replies all route through
+// the same mechanism: addressed-to-me + tagged-with-a-thread.
+//
+// Replies (chat.assistant-text, chat.tool-call, chat.tool-result,
+// chat.turn-end) carry the same threadId so bridges route them back.
+//
+// Durability: per-thread message history snapshotted to
+// `<threadsDir>/<agentId-sanitized>/<threadId-sanitized>.json` after
+// each turn, loaded on first-touch.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -27,16 +32,16 @@ import { tables } from "../store/index.ts";
 import { eq } from "drizzle-orm";
 import { runAgent, type AgentStep } from "./runtime.ts";
 
-export interface ChatAgentOptions {
+export interface AgentLoopOptions {
   bus: EventBus;
   store: Store;
   hostId: string;
   llm: Llm;
   system?: string;
-  /** The agent's id (for attribution + ledger). */
+  /** The agent whose mailbox we're draining. */
   agentId: string;
-  /** Extension runtime — chat agent uses it to expose extension-owned
-   *  tools alongside core tools. */
+  /** Extension runtime — loop exposes extension-owned tools alongside
+   *  core tools. */
   extensions?: ExtensionHost;
   /** Core/meta tools injected by the host. */
   coreTools?: ToolDef[];
@@ -45,85 +50,107 @@ export interface ChatAgentOptions {
   /** Principal id for budget enforcement + inbox routing on denied calls. */
   principalId?: string;
   /** Inbox used when a tool call is denied by scope — we auto-propose a
-   *  grant_scope via askUp. Omit to just return the denial to the model. */
+   *  grant_scope via askUp. */
   inbox?: Inbox;
   /** Model override. */
   model?: string;
-  /** Directory to persist session message history as JSON snapshots.
-   *  One file per session, written after each turn-end and loaded on
-   *  first-touch. Omit to disable persistence (sessions live only in
-   *  memory). */
-  sessionsDir?: string;
+  /** Root directory for per-thread message snapshots. Per agent, per
+   *  thread. Omit to disable persistence. */
+  threadsDir?: string;
 }
 
-interface Session {
+interface Thread {
   id: string;
   messages: Message[];
   /** Text queued from chat.input events while the worker is busy. */
   pending: string[];
+  /** Origin events paired 1:1 with `pending`; used for parent_event_id
+   *  so causal chains stay intact across queued turns. */
+  pendingOrigin: Event[];
   /** Set by the single drain loop; undefined means no worker running. */
   worker?: Promise<void>;
 }
 
-export interface ChatAgent {
+export interface AgentLoop {
   stop(): void;
-  sessions(): string[];
+  threads(): string[];
 }
 
-export function startChatAgent(opts: ChatAgentOptions): ChatAgent {
-  const sessions = new Map<string, Session>();
-  if (opts.sessionsDir) mkdirSync(opts.sessionsDir, { recursive: true });
+export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
+  const threads = new Map<string, Thread>();
+  const agentDir = opts.threadsDir
+    ? join(opts.threadsDir, sanitizeId(opts.agentId))
+    : undefined;
+  if (agentDir) mkdirSync(agentDir, { recursive: true });
 
-  function getOrCreateSession(id: string): Session {
-    let s = sessions.get(id);
-    if (s) return s;
-    const loaded = opts.sessionsDir ? tryLoadSession(opts.sessionsDir, id) : null;
-    s = { id, messages: loaded ?? [], pending: [] };
-    sessions.set(id, s);
-    return s;
+  function getOrCreate(id: string): Thread {
+    let t = threads.get(id);
+    if (t) return t;
+    const loaded = agentDir ? tryLoadThread(agentDir, id) : null;
+    t = { id, messages: loaded ?? [], pending: [], pendingOrigin: [] };
+    threads.set(id, t);
+    return t;
   }
 
   const unsub = opts.bus.subscribe("chat.input", (ev) => {
-    const p = ev.payload as { sessionId?: string; text?: string };
-    if (!p?.sessionId || typeof p.text !== "string") return;
-    const session = getOrCreateSession(p.sessionId);
-    session.pending.push(p.text);
-    // Preserve the originating event so emitted steps keep the parent
-    // chain. First message in a burst wins as parent for the whole
-    // drain; v0.1 can emit per-turn parenting if the granularity matters.
-    if (!session.worker) {
-      session.worker = drain(session, ev, opts)
+    // Mailbox gate: only events addressed to this agent.
+    if (ev.toAgentId !== opts.agentId) return;
+    // Threaded: every mailbox event must declare its thread.
+    if (!ev.threadId) return;
+    const p = ev.payload as { text?: string };
+    if (typeof p?.text !== "string") return;
+
+    const thread = getOrCreate(ev.threadId);
+    thread.pending.push(p.text);
+    thread.pendingOrigin.push(ev);
+    if (!thread.worker) {
+      thread.worker = drain(thread, opts, agentDir)
         .catch((err) => {
+          // Fallback error event anchored to the most recent origin so
+          // observers still get a causal chain.
+          const last = thread.pendingOrigin.at(-1) ?? ev;
           opts.bus.publish({
             type: "chat.error",
             hostId: opts.hostId,
             actorId: opts.agentId,
-            parentEventId: ev.id,
+            parentEventId: last.id,
+            threadId: thread.id,
             durable: true,
-            payload: { sessionId: session.id, error: (err as Error).message },
+            payload: { error: (err as Error).message },
           });
         })
         .finally(() => {
-          session.worker = undefined;
+          thread.worker = undefined;
         });
     }
   });
 
   return {
     stop: () => unsub(),
-    sessions: () => [...sessions.keys()],
+    threads: () => [...threads.keys()],
   };
 }
 
-async function drain(session: Session, origin: Event, opts: ChatAgentOptions): Promise<void> {
-  while (session.pending.length > 0) {
-    const text = session.pending.shift()!;
-    await runTurn(session, text, origin, opts);
+async function drain(
+  thread: Thread,
+  opts: AgentLoopOptions,
+  agentDir: string | undefined,
+): Promise<void> {
+  while (thread.pending.length > 0) {
+    const text = thread.pending.shift()!;
+    const origin = thread.pendingOrigin.shift()!;
+    await runTurn(thread, text, origin, opts, agentDir);
   }
 }
 
-async function runTurn(session: Session, text: string, origin: Event, opts: ChatAgentOptions): Promise<void> {
-  session.messages.push({ role: "user", content: text });
+async function runTurn(
+  thread: Thread,
+  text: string,
+  origin: Event,
+  opts: AgentLoopOptions,
+  agentDir: string | undefined,
+): Promise<void> {
+  thread.messages.push({ role: "user", content: text });
   try {
     const tools = collectTools(opts);
     const redactions = buildRedactionMap(tools);
@@ -141,8 +168,8 @@ async function runTurn(session: Session, text: string, origin: Event, opts: Chat
         abort: new AbortController().signal,
         secrets: {},
       },
-      messages: session.messages,
-      onStep: (step) => emitStep(opts, session.id, origin, step, redactions),
+      messages: thread.messages,
+      onStep: (step) => emitStep(opts, thread.id, origin, step, redactions),
       authorize: (tool) =>
         checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),
       onDenied: ({ tool, reason }) => {
@@ -151,9 +178,9 @@ async function runTurn(session: Session, text: string, origin: Event, opts: Chat
           hostId: opts.hostId,
           actorId: opts.agentId,
           parentEventId: origin.id,
+          threadId: thread.id,
           durable: true,
           payload: {
-            sessionId: session.id,
             tool: tool.name,
             tier: tool.tier ?? "operational",
             reason,
@@ -180,7 +207,7 @@ async function runTurn(session: Session, text: string, origin: Event, opts: Chat
         );
       },
     });
-    session.messages = result.messages;
+    thread.messages = result.messages;
     if (opts.ledger && result.totalUsage.totalTokens > 0) {
       opts.ledger.record({
         actorId: opts.agentId,
@@ -191,23 +218,18 @@ async function runTurn(session: Session, text: string, origin: Event, opts: Chat
         usd: result.totalUsdMicros,
       });
     }
-    // Commit the snapshot before announcing turn-end so any subscriber
-    // reacting to the event can rely on the on-disk state being current.
-    // Sensitive tool inputs (e.g. set_secret value) are redacted from the
-    // persisted form — the in-memory session still holds the raw values
-    // the current turn already passed to the tool, but no subsequent
-    // reader (disk snapshot, replay) ever sees them.
-    if (opts.sessionsDir) {
-      saveSession(opts.sessionsDir, session, redactions);
-    }
+    // Commit snapshot before announcing turn-end so subscribers reacting
+    // to the event can rely on disk state being current. Sensitive tool
+    // inputs (e.g. set_secret value) are redacted from the persisted form.
+    if (agentDir) saveThread(agentDir, thread, redactions);
     opts.bus.publish({
       type: "chat.turn-end",
       hostId: opts.hostId,
       actorId: opts.agentId,
       parentEventId: origin.id,
+      threadId: thread.id,
       durable: true,
       payload: {
-        sessionId: session.id,
         stopReason: result.stopReason,
         tokens: result.totalUsage.totalTokens,
         usdMicros: result.totalUsdMicros,
@@ -219,13 +241,14 @@ async function runTurn(session: Session, text: string, origin: Event, opts: Chat
       hostId: opts.hostId,
       actorId: opts.agentId,
       parentEventId: origin.id,
+      threadId: thread.id,
       durable: true,
-      payload: { sessionId: session.id, error: (err as Error).message },
+      payload: { error: (err as Error).message },
     });
   }
 }
 
-function collectTools(opts: ChatAgentOptions): ToolDef[] {
+function collectTools(opts: AgentLoopOptions): ToolDef[] {
   const tools: ToolDef[] = [...(opts.coreTools ?? [])];
   if (opts.extensions) {
     for (const { tool } of opts.extensions.tools()) tools.push(tool);
@@ -238,14 +261,16 @@ function loadAgentScope(store: Store, agentId: string): AgentScope {
   return (row?.scope as AgentScope) ?? {};
 }
 
-function sessionFile(dir: string, id: string): string {
-  // Only allow url-safe characters in the filename to avoid path traversal.
-  const safe = id.replace(/[^a-zA-Z0-9._-]/g, "_");
-  return join(dir, `${safe}.json`);
+function sanitizeId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-function tryLoadSession(dir: string, id: string): Message[] | null {
-  const f = sessionFile(dir, id);
+function threadFile(agentDir: string, threadId: string): string {
+  return join(agentDir, `${sanitizeId(threadId)}.json`);
+}
+
+function tryLoadThread(agentDir: string, threadId: string): Message[] | null {
+  const f = threadFile(agentDir, threadId);
   if (!existsSync(f)) return null;
   try {
     const raw = JSON.parse(readFileSync(f, "utf8")) as unknown;
@@ -254,28 +279,27 @@ function tryLoadSession(dir: string, id: string): Message[] | null {
     }
     return (raw as { messages: Message[] }).messages;
   } catch {
-    // Corrupt snapshot — start fresh. Not worth crashing over; the events
-    // log is still the canonical history if we ever need to rebuild.
+    // Corrupt snapshot — start fresh. The events log is still canonical.
     return null;
   }
 }
 
-function saveSession(
-  dir: string,
-  session: Session,
+function saveThread(
+  agentDir: string,
+  thread: Thread,
   redactions: Map<string, string[]>,
 ): void {
   try {
     const messages = redactions.size
-      ? redactMessages(session.messages, redactions)
-      : session.messages;
+      ? redactMessages(thread.messages, redactions)
+      : thread.messages;
     writeFileSync(
-      sessionFile(dir, session.id),
-      JSON.stringify({ id: session.id, messages, savedAt: Date.now() }),
+      threadFile(agentDir, thread.id),
+      JSON.stringify({ id: thread.id, messages, savedAt: Date.now() }),
       "utf8",
     );
   } catch {
-    // Best-effort persistence; the session remains intact in memory.
+    // Best-effort; in-memory thread remains intact.
   }
 }
 
@@ -289,11 +313,8 @@ function buildRedactionMap(tools: ToolDef[]): Map<string, string[]> {
   return m;
 }
 
-function redactInput(
-  input: unknown,
-  fields: string[],
-): Record<string, unknown> {
-  const src = (input && typeof input === "object") ? (input as Record<string, unknown>) : {};
+function redactInput(input: unknown, fields: string[]): Record<string, unknown> {
+  const src = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
   const out: Record<string, unknown> = { ...src };
   for (const f of fields) {
     if (f in out) out[f] = "[redacted]";
@@ -301,8 +322,6 @@ function redactInput(
   return out;
 }
 
-// Deep-clone-and-redact: walks assistant messages for tool_use blocks whose
-// tool name has registered sensitive fields. Never mutates the input.
 function redactMessages(
   messages: Message[],
   redactions: Map<string, string[]>,
@@ -321,14 +340,13 @@ function redactMessages(
 }
 
 function emitStep(
-  opts: ChatAgentOptions,
-  sessionId: string,
+  opts: AgentLoopOptions,
+  threadId: string,
   origin: Event,
   step: AgentStep,
   redactions: Map<string, string[]>,
 ): void {
   if (step.kind === "assistant") {
-    // Flatten to text for the CLI; tool-use blocks go out separately.
     const text = step.content
       .filter((b): b is { type: "text"; text: string } => b.type === "text")
       .map((b) => b.text)
@@ -339,8 +357,9 @@ function emitStep(
         hostId: opts.hostId,
         actorId: opts.agentId,
         parentEventId: origin.id,
+        threadId,
         durable: true,
-        payload: { sessionId, text },
+        payload: { text },
       });
     }
   } else if (step.kind === "tool_use") {
@@ -351,8 +370,9 @@ function emitStep(
       hostId: opts.hostId,
       actorId: opts.agentId,
       parentEventId: origin.id,
+      threadId,
       durable: true,
-      payload: { sessionId, id: step.id, name: step.name, input },
+      payload: { id: step.id, name: step.name, input },
     });
   } else if (step.kind === "tool_result") {
     opts.bus.publish({
@@ -360,9 +380,9 @@ function emitStep(
       hostId: opts.hostId,
       actorId: opts.agentId,
       parentEventId: origin.id,
+      threadId,
       durable: true,
       payload: {
-        sessionId,
         id: step.id,
         name: step.name,
         isError: step.isError,
@@ -375,8 +395,9 @@ function emitStep(
       hostId: opts.hostId,
       actorId: opts.agentId,
       parentEventId: origin.id,
+      threadId,
       durable: false,
-      payload: { sessionId, ...step.usage, usdMicros: step.usdMicros },
+      payload: { ...step.usage, usdMicros: step.usdMicros },
     });
   }
 }

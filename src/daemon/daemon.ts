@@ -6,7 +6,7 @@ import { createExtensionHost, ensureRepo, type ExtensionHost } from "../extensio
 import { createLedger, type Ledger } from "../ledger/index.ts";
 import { createScheduler, type Scheduler } from "../scheduler/index.ts";
 import { createAnthropicAdapter } from "../llm/index.ts";
-import { startChatAgent, type ChatAgent } from "../agent/index.ts";
+import { startAgentLoop, type AgentLoop } from "../agent/index.ts";
 import { buildMetaTools } from "../tools/meta.ts";
 import { createInbox, type Inbox } from "../inbox/index.ts";
 import { ulid } from "../id/index.ts";
@@ -34,7 +34,7 @@ export interface Daemon {
   readonly inbox: Inbox;
   readonly rootAgentId: string;
   readonly rootPrincipalId: string;
-  readonly chat?: ChatAgent;
+  readonly chat?: AgentLoop;
   readonly chatAgentId?: string;
   shutdown(): Promise<void>;
 }
@@ -77,6 +77,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     version: opts.version ?? "0.0.0",
     extensions,
     paths,
+    rootAgentId,
   });
   await ipc.listen();
 
@@ -98,9 +99,11 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     }
   }
 
-  // Chat agent — only if there's an API key. Without it the daemon still
-  // runs but `olle chat` just bounces with chat.error.
-  let chat: ChatAgent | undefined;
+  // Root agent loop — only if there's an API key. Without it the daemon
+  // still runs but `olle chat` just bounces with chat.error. Note: this
+  // is no longer a "chat agent"; it's the generic agent drain loop
+  // anchored to root's mailbox. Bridges publish into that mailbox.
+  let chat: AgentLoop | undefined;
   let chatAgentId: string | undefined;
   if (process.env.ANTHROPIC_API_KEY) {
     chatAgentId = rootAgentId;
@@ -111,7 +114,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       authorName: chatAgentId,
       secretsDir: paths.secretsDir,
     });
-    chat = startChatAgent({
+    chat = startAgentLoop({
       bus,
       store,
       hostId,
@@ -122,7 +125,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       ledger,
       inbox,
       principalId: rootPrincipalId,
-      sessionsDir: paths.sessionsDir,
+      threadsDir: paths.threadsDir,
       system:
         "You are olle, a helpful assistant living inside OLL-E — a habitat " +
         "built for agents like you. Your job is to accomplish what the human " +

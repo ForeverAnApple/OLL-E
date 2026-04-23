@@ -156,7 +156,9 @@ export const events = sqliteTable(
     parentEventId: text("parent_event_id"),
     // Mailbox routing: which agent is this addressed to, and which
     // correlation thread does it belong to. Both nullable for
-    // untargeted/untagged events. See migration 0003 for the story.
+    // untargeted/untagged events. Weak reference on to_agent_id
+    // (no FK) — mesh events may address agents not present locally.
+    // See migration 0003 for the story.
     toAgentId: text("to_agent_id"),
     threadId: text("thread_id"),
     parentThreadId: text("parent_thread_id"),

@@ -15,7 +15,10 @@
 -- Indexes are the two read patterns every mailbox query runs: "give me
 -- this agent's inbox" and "give me this thread's history".
 
-ALTER TABLE events ADD COLUMN to_agent_id TEXT REFERENCES agents(id);
+-- to_agent_id is a weak reference (like actor_id) — we don't enforce FK
+-- because mesh events may address agents that don't exist on this host
+-- yet, and retired-agent cleanup shouldn't cascade through the event log.
+ALTER TABLE events ADD COLUMN to_agent_id TEXT;
 ALTER TABLE events ADD COLUMN thread_id TEXT;
 ALTER TABLE events ADD COLUMN parent_thread_id TEXT;
 

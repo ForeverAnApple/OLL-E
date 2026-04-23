@@ -15,7 +15,9 @@ export interface OllePaths {
   readonly socketFile: string;
   readonly pidFile: string;
   readonly secretsDir: string;
-  readonly sessionsDir: string;
+  /** Per-agent, per-thread message-history snapshots. Was `sessionsDir`
+   *  in the chat-only era — renamed when every agent became a mailbox. */
+  readonly threadsDir: string;
 }
 
 export function resolvePaths(rootOverride?: string): OllePaths {
@@ -34,7 +36,7 @@ export function resolvePaths(rootOverride?: string): OllePaths {
     socketFile: join(root, "run", "olle.sock"),
     pidFile: join(root, "run", "olle.pid"),
     secretsDir: join(root, "secrets"),
-    sessionsDir: join(root, "sessions"),
+    threadsDir: join(root, "threads"),
   };
 }
 
@@ -47,7 +49,7 @@ export function ensurePaths(paths: OllePaths): void {
     paths.logsDir,
     paths.runDir,
     paths.secretsDir,
-    paths.sessionsDir,
+    paths.threadsDir,
   ]) {
     mkdirSync(dir, { recursive: true });
   }

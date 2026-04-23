@@ -129,7 +129,24 @@ export interface ExtensionApi {
    *  restart must go through registerTask so it gets a task_runs row. */
   registerTask(task: TaskRegistration): void;
   on(event: string, handler: (ev: Event) => void | Promise<void>): Unsubscribe;
-  publish<T>(type: string, payload: T, opts?: { durable?: boolean }): void;
+  publish<T>(
+    type: string,
+    payload: T,
+    opts?: {
+      durable?: boolean;
+      /** Address the event to an agent's mailbox. */
+      toAgentId?: string;
+      /** Correlation id for a conversation / work stream. */
+      threadId?: string;
+      /** If opening a thread that descends from another, record the parent. */
+      parentThreadId?: string;
+      parentEventId?: string;
+    },
+  ): void;
+  /** The root agent id on this host. Bridges use this to address events
+   *  into the root's mailbox by default. Retargeting (Stage 4) will give
+   *  agents a way to route threads elsewhere. */
+  rootAgentId?: string;
   /** Invoke a tool registered by any extension (including this one).
    *  Gated by manifest.callsTools — the tool's name must be on the
    *  allowlist or the call is rejected. The target tool runs with its
