@@ -60,7 +60,7 @@ describe("manifest validation", () => {
           api.registerTool({
             name: "echo",
             description: "echo",
-            parameters: { parse: (x) => x },
+            inputSchema: { type: "object" },
             execute: (args) => args,
           });
         }
@@ -71,6 +71,80 @@ describe("manifest validation", () => {
     expect(ext.manifest.name).toBe("hello");
     expect(ext.status).toBe("active");
     expect(host.tools()).toHaveLength(1);
+  });
+
+  it("preserves a rich inputSchema from extension to host.tools()", async () => {
+    // Guards the host↔extension boundary: whatever JSON Schema the
+    // extension authors must flow through unmodified so the LLM sees
+    // exactly what the author intended. No library identity required.
+    const r = rig();
+    writeExt(tmp, "schema-bearer", {
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "create_issue",
+            description: "open an issue",
+            inputSchema: {
+              type: "object",
+              properties: {
+                repo: { type: "string", description: "owner/name" },
+                title: { type: "string" },
+                labels: { type: "array", items: { type: "string" } },
+              },
+              required: ["repo", "title"],
+              additionalProperties: false,
+            },
+            execute: (args) => args,
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("schema-bearer");
+    const tools = host.tools();
+    expect(tools).toHaveLength(1);
+    const schema = tools[0]!.tool.inputSchema as {
+      type: string;
+      properties: Record<string, unknown>;
+      required: string[];
+    };
+    expect(schema.type).toBe("object");
+    expect(schema.properties.repo).toEqual({ type: "string", description: "owner/name" });
+    expect(schema.properties.labels).toEqual({ type: "array", items: { type: "string" } });
+    expect(schema.required).toEqual(["repo", "title"]);
+  });
+
+  it("runs a validator supplied by the extension", async () => {
+    // An extension may ship any validator it likes (zod, hand-rolled,
+    // nothing). The host calls it once per tool_use before execute.
+    const r = rig();
+    writeExt(tmp, "with-validator", {
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "upper",
+            description: "upper",
+            inputSchema: {
+              type: "object",
+              properties: { s: { type: "string" } },
+              required: ["s"],
+            },
+            validate(input) {
+              if (typeof input?.s !== "string") throw new Error("s must be a string");
+              return { s: input.s.toUpperCase() };
+            },
+            execute: ({ s }) => s,
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("with-validator");
+    const { tool } = host.tools()[0]!;
+    expect(tool.validate).toBeInstanceOf(Function);
+    const validated = tool.validate!({ s: "hello" }) as { s: string };
+    expect(validated).toEqual({ s: "HELLO" });
+    expect(() => tool.validate!({})).toThrow(/must be a string/);
   });
 
   it("rejects a name mismatch", async () => {
@@ -116,7 +190,7 @@ describe("hot reload + failure tracking", () => {
           api.registerTool({
             name: "v1",
             description: "",
-            parameters: { parse: (x) => x },
+            inputSchema: { type: "object" },
             execute: () => "v1",
           });
         }
@@ -133,7 +207,7 @@ describe("hot reload + failure tracking", () => {
           api.registerTool({
             name: "v2",
             description: "",
-            parameters: { parse: (x) => x },
+            inputSchema: { type: "object" },
             execute: () => "v2",
           });
         }
@@ -213,6 +287,240 @@ describe("git-backed rollback", () => {
   });
 });
 
+describe("cross-extension callTool", () => {
+  // Common rig: two extensions, "callee" registers echo_b, "caller"
+  // registers run_cross which invokes api.callTool. Both secrets
+  // declared so we can verify isolation.
+  async function loadPair(
+    callerManifest: Record<string, unknown>,
+    calleeToolDef?: string,
+  ) {
+    const r = rig();
+    writeExt(tmp, "callee", {
+      manifest: { name: "callee", version: "0.1.0", secrets: ["TOK"] },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "echo_b",
+            description: "",
+            inputSchema: { type: "object" },
+            ${calleeToolDef ?? ""}
+            execute: (args, ctx) => ({
+              echoed: args,
+              actorId: ctx.actorId,
+              extensionId: ctx.extensionId,
+              seesTok: ctx.secrets.TOK ?? null,
+              seesCallerSecret: ctx.secrets.SECRET_A ?? null,
+            }),
+          });
+        }
+      `,
+    });
+    writeExt(tmp, "caller", {
+      manifest: { name: "caller", version: "0.1.0", secrets: ["SECRET_A"], ...callerManifest },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "run_cross",
+            description: "",
+            inputSchema: { type: "object" },
+            execute: async (args) => api.callTool("echo_b", args),
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({
+      ...r,
+      extensionsDir: tmp,
+      secrets: (name, ext) => {
+        if (name === "TOK" && ext === "callee") return "token-b";
+        if (name === "SECRET_A" && ext === "caller") return "secret-a-val";
+        return undefined;
+      },
+    });
+    await host.load("callee");
+    await host.load("caller");
+    return { r, host };
+  }
+
+  async function invokeCross(host: ReturnType<typeof createExtensionHost>, r: ReturnType<typeof rig>, args: unknown) {
+    const runCross = host.tools().find((t) => t.tool.name === "run_cross");
+    if (!runCross) throw new Error("run_cross not found");
+    return runCross.tool.execute(args as never, {
+      hostId: r.hostId,
+      extensionId: "outer",
+      actorId: "outer",
+      abort: new AbortController().signal,
+      secrets: {},
+    });
+  }
+
+  it("honors the allowlist and isolates secrets across extensions", async () => {
+    const { r, host } = await loadPair({ callsTools: ["echo_b"] });
+    const result = (await invokeCross(host, r, { hello: "world" })) as {
+      echoed: unknown;
+      actorId: string;
+      extensionId: string;
+      seesTok: string | null;
+      seesCallerSecret: string | null;
+    };
+    // Input flowed through unchanged.
+    expect(result.echoed).toEqual({ hello: "world" });
+    // Target's ctx.extensionId is callee's id; ctx.actorId is caller's id.
+    const callerId = host.get("caller")!.id;
+    const calleeId = host.get("callee")!.id;
+    expect(result.extensionId).toBe(calleeId);
+    expect(result.actorId).toBe(callerId);
+    // Callee sees its OWN secret, and NOT the caller's. Secret isolation
+    // is the load-bearing security property of callTool.
+    expect(result.seesTok).toBe("token-b");
+    expect(result.seesCallerSecret).toBeNull();
+  });
+
+  it("rejects the call when the tool is not on the caller's allowlist", async () => {
+    const { r, host } = await loadPair({}); // no callsTools declared
+    await expect(invokeCross(host, r, {})).rejects.toThrow(/manifest\.callsTools/);
+  });
+
+  it("rejects the call when the allowlisted tool doesn't exist", async () => {
+    const r = rig();
+    writeExt(tmp, "lonely", {
+      manifest: { name: "lonely", version: "0.1.0", callsTools: ["nobody_home"] },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "run",
+            description: "",
+            inputSchema: { type: "object" },
+            execute: () => api.callTool("nobody_home", {}),
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("lonely");
+    const tool = host.tools()[0]!.tool;
+    await expect(
+      tool.execute({} as never, {
+        hostId: r.hostId,
+        extensionId: "outer",
+        actorId: "outer",
+        abort: new AbortController().signal,
+        secrets: {},
+      }),
+    ).rejects.toThrow(/not registered/);
+  });
+
+  it("rejects strategic-tier tools — they must route through the inbox", async () => {
+    const r = rig();
+    writeExt(tmp, "strat-target", {
+      manifest: { name: "strat-target", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "dangerous",
+            description: "",
+            tier: "strategic",
+            inputSchema: { type: "object" },
+            execute: () => "should not run",
+          });
+        }
+      `,
+    });
+    writeExt(tmp, "would-be-caller", {
+      manifest: { name: "would-be-caller", version: "0.1.0", callsTools: ["dangerous"] },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "try",
+            description: "",
+            inputSchema: { type: "object" },
+            execute: () => api.callTool("dangerous", {}),
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("strat-target");
+    await host.load("would-be-caller");
+    const tool = host.tools().find((t) => t.tool.name === "try")!.tool;
+    await expect(
+      tool.execute({} as never, {
+        hostId: r.hostId,
+        extensionId: "outer",
+        actorId: "outer",
+        abort: new AbortController().signal,
+        secrets: {},
+      }),
+    ).rejects.toThrow(/strategic/);
+  });
+
+  it("aborts the target via ctx.abort when the call times out", async () => {
+    const r = rig();
+    writeExt(tmp, "slowpoke", {
+      manifest: { name: "slowpoke", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "sleep",
+            description: "",
+            inputSchema: { type: "object" },
+            execute: (_args, ctx) => new Promise((_resolve, reject) => {
+              const t = setTimeout(() => _resolve("done"), 1000);
+              ctx.abort.addEventListener("abort", () => {
+                clearTimeout(t);
+                reject(new Error("aborted by ctx"));
+              });
+            }),
+          });
+        }
+      `,
+    });
+    writeExt(tmp, "hasty", {
+      manifest: { name: "hasty", version: "0.1.0", callsTools: ["sleep"] },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "run",
+            description: "",
+            inputSchema: { type: "object" },
+            execute: () => api.callTool("sleep", {}, { timeoutMs: 30 }),
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("slowpoke");
+    await host.load("hasty");
+    const tool = host.tools().find((t) => t.tool.name === "run")!.tool;
+    await expect(
+      tool.execute({} as never, {
+        hostId: r.hostId,
+        extensionId: "outer",
+        actorId: "outer",
+        abort: new AbortController().signal,
+        secrets: {},
+      }),
+    ).rejects.toThrow(/aborted by ctx/);
+  });
+
+  it("emits a durable tool.called event tagging caller + target for audit", async () => {
+    const { r, host } = await loadPair({ callsTools: ["echo_b"] });
+    const called: Array<{ caller: string; targetExtension: string; tool: string; ok: boolean }> = [];
+    r.bus.subscribe("tool.called", (ev) => {
+      called.push(ev.payload as typeof called[number]);
+    });
+    await invokeCross(host, r, { ping: 1 });
+    expect(called).toHaveLength(1);
+    expect(called[0]).toMatchObject({
+      caller: "caller",
+      targetExtension: "callee",
+      tool: "echo_b",
+      ok: true,
+    });
+  });
+});
+
 describe("secrets + scratch dir", () => {
   it("injects declared secrets into the api", async () => {
     const r = rig();
@@ -223,7 +531,7 @@ describe("secrets + scratch dir", () => {
           api.registerTool({
             name: "reveal",
             description: "",
-            parameters: { parse: (x) => x },
+            inputSchema: { type: "object" },
             execute: () => api.secrets.TOKEN,
           });
         }

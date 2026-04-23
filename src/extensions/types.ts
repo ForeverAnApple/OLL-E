@@ -1,4 +1,3 @@
-import type { z } from "zod";
 import type { EventBus } from "../bus/index.ts";
 import type { Event, Unsubscribe } from "../bus/types.ts";
 import type { Tier } from "../scheduler/index.ts";
@@ -16,12 +15,31 @@ export interface Manifest {
   /** Capabilities declared by the extension — informational in v0, the
    *  permission gate uses it in v1+. */
   capabilities?: string[];
+  /** Allowlist of tool names this extension is permitted to invoke via
+   *  `api.callTool`. Cross-extension tool use is opt-in and declared up
+   *  front so the coupling is visible in git. Tools not listed here are
+   *  rejected at call time; self-registered tools are not exempt. */
+  callsTools?: string[];
 }
 
 export interface ToolDef<I = unknown, O = unknown> {
   name: string;
   description: string;
-  parameters: z.ZodType<I>;
+  /** Significance tier for the permission check. Defaults to "operational".
+   *  Read-only / idempotent tools stay operational; tools that write to
+   *  the world (extensions, external services) are strategic; tools that
+   *  rewrite mission/budget/goals are vision. */
+  tier?: Tier;
+  /** JSON Schema describing the tool's input. Handed straight to the LLM
+   *  vendor's tool-use spec — the host does not introspect it. Extensions
+   *  author this as a plain object (or convert from their preferred schema
+   *  library themselves); this keeps any shared-library identity out of the
+   *  host↔extension boundary. */
+  inputSchema: Record<string, unknown>;
+  /** Optional runtime validator. Called with the raw LLM-emitted input;
+   *  its return value is passed to `execute`. If omitted, input flows
+   *  through unchanged. */
+  validate?(input: unknown): I;
   execute(args: I, ctx: ToolExecuteContext): Promise<O> | O;
 }
 
@@ -69,6 +87,14 @@ export interface ExtensionTaskContext {
   secrets: Record<string, string>;
 }
 
+export interface CallToolOptions {
+  /** Hard wall-clock cap for the call. Default 30s. Aborts via ctx.abort
+   *  so the target tool can short-circuit. */
+  timeoutMs?: number;
+  /** Caller's signal; aborts propagate to the target's ctx.abort. */
+  signal?: AbortSignal;
+}
+
 export interface ExtensionApi {
   readonly hostId: string;
   readonly extensionId: string;
@@ -81,6 +107,16 @@ export interface ExtensionApi {
   registerTask(task: TaskRegistration): void;
   on(event: string, handler: (ev: Event) => void | Promise<void>): Unsubscribe;
   publish<T>(type: string, payload: T, opts?: { durable?: boolean }): void;
+  /** Invoke a tool registered by any extension (including this one).
+   *  Gated by manifest.callsTools — the tool's name must be on the
+   *  allowlist or the call is rejected. The target tool runs with its
+   *  own extension's secrets; the caller's secrets never leak across.
+   *  Attribution: ctx.actorId = caller, ctx.extensionId = target. */
+  callTool<I = unknown, O = unknown>(
+    name: string,
+    args: I,
+    opts?: CallToolOptions,
+  ): Promise<O>;
   /** Secrets declared in manifest.secrets — keys available post-approval. */
   secrets: Record<string, string>;
   /** Scratch dir the extension may read/write. */

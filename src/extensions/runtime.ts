@@ -25,6 +25,7 @@ import { eq } from "drizzle-orm";
 import { readManifest } from "./manifest.ts";
 import type { Scheduler } from "../scheduler/index.ts";
 import type {
+  CallToolOptions,
   ExtensionApi,
   ExtensionModule,
   LoadedExtension,
@@ -69,7 +70,14 @@ export interface ExtensionHost {
 
 interface RegisteredToolEntry {
   extensionId: string;
+  /** Owning extension's user-facing name; used for diagnostics and the
+   *  `tool.called` audit event. */
+  extensionName: string;
   tool: ToolDef;
+  /** Fresh resolution of the target extension's own secrets. Called at
+   *  callTool time so rotation eventually propagates; never exposes the
+   *  caller's secrets. */
+  resolveSecrets: () => Record<string, string>;
 }
 interface RegisteredTriggerEntry {
   extensionId: string;
@@ -156,6 +164,24 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     const scratchDir = join(extDir, ".scratch");
     mkdirSync(scratchDir, { recursive: true });
 
+    // Fresh resolver for this extension's own secrets; captured into each
+    // tool entry so cross-extension callTool sees target's secrets, never
+    // caller's. Re-reads from opts.secrets on each call so rotation
+    // eventually propagates without a full extension reload.
+    const resolveOwnSecrets = (): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (manifest.secrets && opts.secrets) {
+        for (const s of manifest.secrets) {
+          const v = opts.secrets(s, manifest.name);
+          if (v != null) out[s] = v;
+        }
+      }
+      return out;
+    };
+
+    const callerAllowlist = new Set(manifest.callsTools ?? []);
+    const callerName = manifest.name;
+
     const api: ExtensionApi = {
       hostId: opts.hostId,
       extensionId,
@@ -164,7 +190,20 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       registerTool(tool) {
         let list = toolsByExt.get(extensionId);
         if (!list) toolsByExt.set(extensionId, (list = []));
-        list.push({ extensionId, tool });
+        // Warn on name collision across extensions — callTool walks
+        // toolsByExt by name and returns first match, so duplicates
+        // create a routing ambiguity the caller can't see.
+        for (const [otherId, entries] of toolsByExt) {
+          if (otherId === extensionId) continue;
+          for (const e of entries) {
+            if (e.tool.name === tool.name) {
+              console.warn(
+                `[extensions] tool name "${tool.name}" registered by both "${e.extensionName}" and "${callerName}" — callTool resolution is ambiguous`,
+              );
+            }
+          }
+        }
+        list.push({ extensionId, extensionName: callerName, tool, resolveSecrets: resolveOwnSecrets });
       },
       registerTrigger(trigger) {
         let list = triggersByExt.get(extensionId);
@@ -217,6 +256,110 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
           actorId: extensionId,
           durable: publishOpts?.durable ?? false,
         });
+      },
+      async callTool<I, O>(name: string, args: I, callOpts?: CallToolOptions): Promise<O> {
+        // Gate 1: allowlist. No exceptions — even self-calls have to
+        // declare the intent in the manifest. Makes cross-ext coupling
+        // visible in git and reviewable at install time.
+        if (!callerAllowlist.has(name)) {
+          throw new Error(
+            `extensions: "${callerName}" cannot callTool("${name}") — add it to manifest.callsTools`,
+          );
+        }
+        // Gate 2: tool exists. Walk all registered tools; first name
+        // match wins. Collisions already warned at registerTool time.
+        let target: RegisteredToolEntry | undefined;
+        for (const list of toolsByExt.values()) {
+          const hit = list.find((e) => e.tool.name === name);
+          if (hit) {
+            target = hit;
+            break;
+          }
+        }
+        if (!target) {
+          throw new Error(`extensions: callTool("${name}") — tool not registered`);
+        }
+        // Gate 3: tier. Only operational tools are callable directly.
+        // Strategic/vision tools must go through the inbox — a task that
+        // wants to create an issue or install an extension proposes a
+        // decision first; on approval, the resolved-decision handler is
+        // what ultimately invokes the tool. Enforcing this here keeps
+        // callTool a peer-to-peer composition seam, not a self-mod
+        // escape hatch.
+        const toolTier = target.tool.tier ?? "operational";
+        if (toolTier !== "operational") {
+          throw new Error(
+            `extensions: callTool("${name}") — tool is tier "${toolTier}"; route through the decision inbox`,
+          );
+        }
+        // Gate 4: input validation. Defers to the target's own validator;
+        // if absent, args flow through unchanged (same contract as the
+        // chat agent's tool dispatch).
+        const validated = target.tool.validate ? target.tool.validate(args) : args;
+        // Abort plumbing: timeout bounds runaway recursion and hanging
+        // REST calls; caller's signal propagates so cooperative cancel
+        // works end-to-end.
+        const controller = new AbortController();
+        const timeoutMs = callOpts?.timeoutMs ?? 30_000;
+        const timeoutHandle = setTimeout(() => {
+          controller.abort(new Error(`callTool("${name}") timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        const callerSignal = callOpts?.signal;
+        const onCallerAbort = callerSignal ? () => controller.abort(callerSignal.reason) : undefined;
+        if (callerSignal?.aborted) {
+          controller.abort(callerSignal.reason);
+        } else if (callerSignal && onCallerAbort) {
+          callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+        }
+        const startedAt = Date.now();
+        const targetExtensionName = target.extensionName;
+        const targetExtensionId = target.extensionId;
+        try {
+          // Secret isolation: target's OWN secrets via its resolver
+          // closure. The caller has no way to inject or observe these.
+          const result = await target.tool.execute(validated as never, {
+            hostId: opts.hostId,
+            extensionId: targetExtensionId,
+            actorId: extensionId,
+            abort: controller.signal,
+            secrets: target.resolveSecrets(),
+          });
+          opts.bus.publish({
+            type: "tool.called",
+            hostId: opts.hostId,
+            actorId: extensionId,
+            payload: {
+              caller: callerName,
+              targetExtension: targetExtensionName,
+              tool: name,
+              durationMs: Date.now() - startedAt,
+              ok: true,
+            },
+            durable: true,
+          });
+          return result as O;
+        } catch (err) {
+          opts.bus.publish({
+            type: "tool.called",
+            hostId: opts.hostId,
+            actorId: extensionId,
+            payload: {
+              caller: callerName,
+              targetExtension: targetExtensionName,
+              tool: name,
+              durationMs: Date.now() - startedAt,
+              ok: false,
+              error: (err as Error).message,
+            },
+            durable: true,
+          });
+          throw err;
+        } finally {
+          clearTimeout(timeoutHandle);
+          if (callerSignal && onCallerAbort) {
+            callerSignal.removeEventListener("abort", onCallerAbort);
+          }
+        }
       },
     };
 

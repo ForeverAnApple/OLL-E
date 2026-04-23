@@ -28,5 +28,8 @@ export function validateManifest(value: unknown, context = "(unknown)"): Manifes
   if (Array.isArray(v.capabilities) && v.capabilities.every((x) => typeof x === "string")) {
     out.capabilities = v.capabilities as string[];
   }
+  if (Array.isArray(v.callsTools) && v.callsTools.every((x) => typeof x === "string")) {
+    out.callsTools = v.callsTools as string[];
+  }
   return out;
 }
