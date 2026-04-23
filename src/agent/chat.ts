@@ -104,7 +104,7 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
     thread.pending.push(p.text);
     thread.pendingOrigin.push(ev);
     if (!thread.worker) {
-      thread.worker = drain(thread, opts, agentDir)
+      thread.worker = drain(thread, opts, agentDir, threads)
         .catch((err) => {
           // Fallback error event anchored to the most recent origin so
           // observers still get a causal chain.
@@ -135,11 +135,12 @@ async function drain(
   thread: Thread,
   opts: AgentLoopOptions,
   agentDir: string | undefined,
+  allThreads: Map<string, Thread>,
 ): Promise<void> {
   while (thread.pending.length > 0) {
     const text = thread.pending.shift()!;
     const origin = thread.pendingOrigin.shift()!;
-    await runTurn(thread, text, origin, opts, agentDir);
+    await runTurn(thread, text, origin, opts, agentDir, allThreads);
   }
 }
 
@@ -149,6 +150,7 @@ async function runTurn(
   origin: Event,
   opts: AgentLoopOptions,
   agentDir: string | undefined,
+  allThreads: Map<string, Thread>,
 ): Promise<void> {
   thread.messages.push({ role: "user", content: text });
   try {
@@ -156,10 +158,18 @@ async function runTurn(
     const redactions = buildRedactionMap(tools);
     const scope = loadAgentScope(opts.store, opts.agentId);
     const grantProposed = new Set<string>();
+    // Mailbox sidebar — a one-line situational awareness block appended
+    // to the system prompt each turn. Makes delegation decidable: the
+    // agent can see "I have 3 threads with pending work" and choose to
+    // spawn a secretary, retarget, or stay focused.
+    const sidebar = buildMailboxSidebar(allThreads, thread.id);
+    const systemWithSidebar = sidebar
+      ? (opts.system ? `${opts.system}\n\n${sidebar}` : sidebar)
+      : opts.system;
     const result = await runAgent({
       llm: opts.llm,
       model: opts.model,
-      system: opts.system,
+      system: systemWithSidebar,
       tools,
       toolCtx: {
         hostId: opts.hostId,
@@ -246,6 +256,32 @@ async function runTurn(
       payload: { error: (err as Error).message },
     });
   }
+}
+
+function buildMailboxSidebar(
+  threads: Map<string, Thread>,
+  currentThreadId: string,
+): string {
+  const others: Array<{ id: string; pending: number; msgs: number }> = [];
+  for (const [id, t] of threads) {
+    if (id === currentThreadId) continue;
+    // Only surface threads with either unprocessed pending input or
+    // prior history worth noting. Empty placeholder threads are noise.
+    if (t.pending.length === 0 && t.messages.length === 0) continue;
+    others.push({ id, pending: t.pending.length, msgs: t.messages.length });
+  }
+  if (others.length === 0) return "";
+  // Cap the visual — if an agent has 40 open threads the sidebar is
+  // not the right surface anyway; they should use mail_list for detail.
+  const shown = others.slice(0, 8);
+  const truncated = others.length - shown.length;
+  const lines = shown.map(
+    (o) =>
+      `  - ${o.id}: ${o.pending} unread${o.msgs ? `, ${o.msgs} msgs in context` : ""}`,
+  );
+  const header = `Your mailbox — ${others.length} other thread(s) with activity:`;
+  const footer = truncated > 0 ? `\n  (+${truncated} more — call mail_list for full list)` : "";
+  return `${header}\n${lines.join("\n")}${footer}`;
 }
 
 function collectTools(opts: AgentLoopOptions): ToolDef[] {

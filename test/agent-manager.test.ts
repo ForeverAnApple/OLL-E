@@ -192,6 +192,59 @@ describe("agent manager — kill", () => {
   });
 });
 
+describe("agent manager — mailSummary", () => {
+  it("groups events by thread, most-recent first, only for the given agent", () => {
+    const r = rig();
+    const mgr = createAgentManager({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm: mockLlm([]),
+    });
+    // Drop a mix of events into the store via the bus (durable).
+    // Two threads addressed to "parent"; one thread addressed to
+    // "someone-else" that must not appear in parent's summary.
+    for (let i = 0; i < 3; i++) {
+      r.bus.publish({
+        type: "chat.input",
+        hostId: r.hostId,
+        actorId: "cli",
+        durable: true,
+        toAgentId: r.parentId,
+        threadId: "thread-A",
+        payload: { text: `A${i}` },
+      });
+    }
+    r.bus.publish({
+      type: "chat.input",
+      hostId: r.hostId,
+      actorId: "cli",
+      durable: true,
+      toAgentId: r.parentId,
+      threadId: "thread-B",
+      payload: { text: "B0" },
+    });
+    r.bus.publish({
+      type: "chat.input",
+      hostId: r.hostId,
+      actorId: "cli",
+      durable: true,
+      toAgentId: "someone-else",
+      threadId: "thread-Z",
+      payload: { text: "Z0" },
+    });
+
+    const summary = mgr.mailSummary(r.parentId);
+    const ids = summary.map((s) => s.threadId);
+    expect(ids).toContain("thread-A");
+    expect(ids).toContain("thread-B");
+    expect(ids).not.toContain("thread-Z");
+    const a = summary.find((s) => s.threadId === "thread-A")!;
+    expect(a.events).toBe(3);
+    mgr.shutdown();
+  });
+});
+
 describe("agent manager — retarget_thread", () => {
   it("stores an override and emits thread.retargeted", () => {
     const r = rig();
@@ -202,7 +255,9 @@ describe("agent manager — retarget_thread", () => {
       llm: mockLlm([]),
     });
     const events: Event[] = [];
-    r.bus.subscribe("thread.retargeted", (ev) => events.push(ev));
+    r.bus.subscribe("thread.retargeted", (ev) => {
+      events.push(ev);
+    });
 
     expect(mgr.resolveMailbox("t1")).toBeUndefined();
     mgr.retargetThread("t1", "secretary");

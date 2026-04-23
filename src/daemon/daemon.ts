@@ -168,6 +168,8 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         "to external CLIs). Delegation: spawn_agent / kill_agent / list_agents / " +
         "retarget_thread — hire children for work that shouldn't block the " +
         "conversation; never block a human waiting for a slow task, delegate. " +
+        "Mailbox awareness: the sidebar each turn shows your active threads; " +
+        "call mail_list for a durable view (e.g. to check on children's progress). " +
         "Be concise.",
     });
     agentManager.register(chatAgentId, chat);
