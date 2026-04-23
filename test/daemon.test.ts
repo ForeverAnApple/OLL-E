@@ -44,7 +44,7 @@ describe("daemon + ipc", () => {
     expect(res.id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
     // event lands in the table
     const rows = daemon.store.raw
-      .query<{ type: string }, []>("SELECT type FROM events WHERE id = ?")
+      .query<{ type: string }, [string]>("SELECT type FROM events WHERE id = ?")
       .all(res.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.type).toBe("cli.hello");
