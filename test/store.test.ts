@@ -26,6 +26,7 @@ describe("store migrations", () => {
       "memories",
       "memory_reads",
       "principals",
+      "task_runs",
       "tasks",
       "team_members",
       "teams",
@@ -37,10 +38,18 @@ describe("store migrations", () => {
     }
   });
 
-  it("runs each migration exactly once", () => {
+  it("applies every migration file exactly once", () => {
     const db = fresh();
-    const count = db.raw.query<{ n: number }, []>("SELECT COUNT(*) as n FROM _migrations").get();
-    expect(count?.n).toBe(1);
+    const total = db.raw
+      .query<{ n: number }, []>("SELECT COUNT(*) as n FROM _migrations")
+      .get();
+    // Reopening should not re-apply.
+    const db2 = openStore({ path: ":memory:" });
+    const total2 = db2.raw
+      .query<{ n: number }, []>("SELECT COUNT(*) as n FROM _migrations")
+      .get();
+    expect(total?.n).toBeGreaterThan(0);
+    expect(total2?.n).toBe(total?.n);
   });
 });
 

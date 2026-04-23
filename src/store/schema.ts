@@ -184,6 +184,34 @@ export const claims = sqliteTable(
   }),
 );
 
+export const taskRuns = sqliteTable(
+  "task_runs",
+  {
+    id: text("id").primaryKey(),
+    taskId: text("task_id")
+      .notNull()
+      .references(() => tasks.id),
+    eventId: text("event_id")
+      .notNull()
+      .references(() => events.id),
+    hostId: text("host_id")
+      .notNull()
+      .references(() => hosts.id),
+    agentId: text("agent_id")
+      .notNull()
+      .references(() => agents.id),
+    status: text("status").notNull(), // queued | running | succeeded | failed | lost
+    startedAt: integer("started_at").notNull(),
+    endedAt: integer("ended_at"),
+    error: text("error"),
+  },
+  (t) => ({
+    byTask: index("task_runs_task").on(t.taskId),
+    byStatus: index("task_runs_status").on(t.status),
+    byEvent: index("task_runs_event").on(t.eventId),
+  }),
+);
+
 export const toolCalls = sqliteTable(
   "tool_calls",
   {
@@ -344,3 +372,7 @@ export type Memory = typeof memories.$inferSelect;
 export type NewMemory = typeof memories.$inferInsert;
 export type Extension = typeof extensions.$inferSelect;
 export type NewExtension = typeof extensions.$inferInsert;
+export type TaskRow = typeof tasks.$inferSelect;
+export type NewTaskRow = typeof tasks.$inferInsert;
+export type TaskRun = typeof taskRuns.$inferSelect;
+export type NewTaskRun = typeof taskRuns.$inferInsert;

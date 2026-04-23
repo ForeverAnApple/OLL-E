@@ -88,6 +88,19 @@ A source of events. Types in v0:
 
 A handler bound to triggers by subscription. When a matching event appears, eligible tasks emit `claim` messages; first claim wins; task executes on the claimer's host. A task is a TypeScript function with a declared scope, required tools, token estimate, and significance tier.
 
+**Lifecycle and durability.** `tasks` is the registration; `task_runs` is the per-execution log. The scheduler writes a `task_runs` row on dispatch (`status=running`), updates it on completion (`succeeded` or `failed`), and on daemon startup `recoverLost()` marks any rows still `running` from a prior process as `lost`. After every handler the scheduler emits one of two events:
+
+- `task.<taskId>.completed` — payload `{ taskId, runId, eventId }`
+- `task.<taskId>.failed` — payload `{ taskId, runId, eventId, error }`
+
+Subscribers waiting on a task's outcome listen for these instead of polling `task_runs` or coupling to scheduler internals. The same convention fires for `lost` runs (delivered as `failed` with `error: "lost"`) so resume logic doesn't need to special-case restarts.
+
+Tasks register through one of two surfaces:
+- **Extensions** call `api.registerTask(...)` (per LOG 2026-04-22, "Extension = capability; Task = behavior" — extensions hold capabilities, tasks hold behaviors that compose them).
+- **Core** wires its built-in tasks at daemon startup against the same scheduler.
+
+Direct agent-authored task files (proposed via the inbox `register_task` action) are deferred per LOG 2026-04-22 line 150 — for now task-only authoring goes through extension packaging.
+
 ### Tool
 
 A typed callable capability: `{id, description, parameters (Zod), execute(args, ctx)}`. Tools may request permission gates (ctx.ask) and always carry attribution. Every tool call is logged.
@@ -109,6 +122,7 @@ team_members  (team_id, actor_id, role, joined_at)
 
 triggers      (id, agent_id, type, config, scope, created_at)
 tasks         (id, agent_id, trigger_refs, handler_ref, tier, scope, token_est, created_at)
+task_runs     (id, task_id, event_id, host_id, agent_id, status, started_at, ended_at, error)
 tools         (id, agent_id, extension_id, schema, scope, created_at)
 extensions    (id, name, path, status, last_smoke_at, last_commit_sha)
 

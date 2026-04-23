@@ -1,6 +1,7 @@
 import type { z } from "zod";
 import type { EventBus } from "../bus/index.ts";
 import type { Event, Unsubscribe } from "../bus/types.ts";
+import type { Tier } from "../scheduler/index.ts";
 
 export type ExtensionStatus = "active" | "inactive" | "crashed";
 
@@ -45,11 +46,39 @@ export interface TriggerContext {
   secrets: Record<string, string>;
 }
 
+export interface TaskRegistration {
+  /** Stable id local to this extension. The host namespaces it as
+   *  `ext:<extensionName>:<id>` when persisting. */
+  id: string;
+  eventType: string | "*";
+  tier?: Tier;
+  match?: (ev: Event) => boolean;
+  concurrency?: number;
+  tokenEst?: number;
+  handler: (ctx: ExtensionTaskContext) => void | Promise<void>;
+}
+
+export interface ExtensionTaskContext {
+  event: Event;
+  hostId: string;
+  extensionId: string;
+  agentId: string;
+  /** Emit a follow-on event parented to the trigger; same shape as the
+   *  scheduler's TaskContext.emit but auto-attributed to the extension. */
+  emit<T>(type: string, payload: T, opts?: { durable?: boolean }): void;
+  secrets: Record<string, string>;
+}
+
 export interface ExtensionApi {
   readonly hostId: string;
   readonly extensionId: string;
   registerTool(tool: ToolDef): void;
   registerTrigger(trigger: TriggerDef): void;
+  /** Register a scheduler-managed task. Behaviors (per LOG 2026-04-22)
+   *  belong here; raw bus subscriptions via `on()` exist for fire-and-
+   *  forget side effects, but anything worth remembering across a
+   *  restart must go through registerTask so it gets a task_runs row. */
+  registerTask(task: TaskRegistration): void;
   on(event: string, handler: (ev: Event) => void | Promise<void>): Unsubscribe;
   publish<T>(type: string, payload: T, opts?: { durable?: boolean }): void;
   /** Secrets declared in manifest.secrets — keys available post-approval. */

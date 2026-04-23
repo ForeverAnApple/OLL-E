@@ -72,6 +72,115 @@ describe("scheduler", () => {
     expect(peak).toBe(2);
   });
 
+  it("persists a tasks row on register and a task_runs row per dispatch", async () => {
+    const { bus, scheduler, store, hostId } = rig();
+    store.insert(tables.agents).values({
+      id: "agent-x",
+      name: "x",
+      hostId,
+      scope: {},
+      createdAt: Date.now(),
+    }).run();
+
+    scheduler.register({
+      id: ulid(),
+      agentId: "agent-x",
+      tier: "operational",
+      eventType: "work",
+      handler: () => undefined,
+    });
+
+    bus.publish({ type: "work", payload: {}, hostId, actorId: "trigger", durable: true });
+    await new Promise((r) => setTimeout(r, 10));
+
+    const taskRows = store.raw.query<{ n: number }, []>("SELECT COUNT(*) as n FROM tasks").get();
+    const runRows = store.raw
+      .query<{ status: string }, []>("SELECT status FROM task_runs")
+      .all();
+    expect(taskRows?.n).toBe(1);
+    expect(runRows.length).toBe(1);
+    expect(runRows[0]!.status).toBe("succeeded");
+  });
+
+  it("emits task.<id>.completed and task.<id>.failed", async () => {
+    const { bus, scheduler, hostId } = rig();
+    const seen: string[] = [];
+    bus.subscribe("*", (e) => {
+      if (e.type.startsWith("task.")) seen.push(e.type);
+    });
+
+    scheduler.register({
+      id: "ok",
+      agentId: "a",
+      tier: "operational",
+      eventType: "go.ok",
+      handler: () => undefined,
+    });
+    scheduler.register({
+      id: "bad",
+      agentId: "a",
+      tier: "operational",
+      eventType: "go.bad",
+      handler: () => {
+        throw new Error("boom");
+      },
+    });
+
+    bus.publish({ type: "go.ok", payload: {}, hostId, actorId: "x" });
+    bus.publish({ type: "go.bad", payload: {}, hostId, actorId: "x" });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(seen).toContain("task.ok.completed");
+    expect(seen).toContain("task.bad.failed");
+  });
+
+  it("recoverLost marks orphaned running rows as lost", () => {
+    const { scheduler, store, hostId } = rig();
+    store.insert(tables.agents).values({
+      id: "a",
+      name: "a",
+      hostId,
+      scope: {},
+      createdAt: Date.now(),
+    }).run();
+    store.insert(tables.tasks).values({
+      id: "t",
+      agentId: "a",
+      triggerRefs: [],
+      handlerRef: "",
+      tier: "operational",
+      scope: {},
+      tokenEst: 0,
+      createdAt: Date.now(),
+    }).run();
+    // Seed an event row so the FK is satisfied.
+    store.insert(tables.events).values({
+      id: "e1",
+      hlc: "0",
+      hostId,
+      actorId: "a",
+      type: "x",
+      payload: {},
+      createdAt: Date.now(),
+    }).run();
+    store.insert(tables.taskRuns).values({
+      id: "r1",
+      taskId: "t",
+      eventId: "e1",
+      hostId,
+      agentId: "a",
+      status: "running",
+      startedAt: Date.now() - 60_000,
+    }).run();
+
+    const n = scheduler.recoverLost();
+    expect(n).toBe(1);
+    const row = store.raw
+      .query<{ status: string }, []>("SELECT status FROM task_runs WHERE id='r1'")
+      .get();
+    expect(row?.status).toBe("lost");
+  });
+
   it("writes a claims row for claimable events", () => {
     const { bus, scheduler, store, hostId } = rig();
     // Seed agent + task in the DB so the FK check passes.

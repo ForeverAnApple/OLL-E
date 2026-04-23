@@ -4,6 +4,7 @@ import { createBus, persistToStore, type EventBus } from "../bus/index.ts";
 import { createIpcServer, type IpcServer } from "../ipc/server.ts";
 import { createExtensionHost, ensureRepo, type ExtensionHost } from "../extensions/index.ts";
 import { createLedger, type Ledger } from "../ledger/index.ts";
+import { createScheduler, type Scheduler } from "../scheduler/index.ts";
 import { createAnthropicAdapter } from "../llm/index.ts";
 import { startChatAgent, type ChatAgent } from "../agent/index.ts";
 import { buildMetaTools } from "../tools/meta.ts";
@@ -28,6 +29,8 @@ export interface Daemon {
   readonly ipc: IpcServer;
   readonly extensions: ExtensionHost;
   readonly ledger: Ledger;
+  readonly scheduler: Scheduler;
+  readonly rootAgentId: string;
   readonly chat?: ChatAgent;
   readonly chatAgentId?: string;
   shutdown(): Promise<void>;
@@ -43,12 +46,21 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   const hostId = ensureHostRow(store);
   const bus = createBus({ hostId, persist: persistToStore(store) });
 
+  // Root agent always exists — extensions register tasks against it
+  // even when the chat agent (which requires an API key) isn't running.
+  const rootAgentId = ensureAgentRow(store, hostId, "root");
+
+  const scheduler = createScheduler({ bus, store, hostId });
+  scheduler.recoverLost();
+
   ensureRepo(paths.extensionsDir);
   const extensions = createExtensionHost({
     bus,
     store,
     hostId,
     extensionsDir: paths.extensionsDir,
+    scheduler,
+    defaultTaskAgentId: rootAgentId,
     secrets: (name) => readSecret(paths.secretsDir, name),
   });
   const ledger = createLedger({ bus, store, hostId });
@@ -85,7 +97,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   let chat: ChatAgent | undefined;
   let chatAgentId: string | undefined;
   if (process.env.ANTHROPIC_API_KEY) {
-    chatAgentId = ensureAgentRow(store, hostId, "root");
+    chatAgentId = rootAgentId;
     const llm = createAnthropicAdapter();
     const coreTools = buildMetaTools({
       extensions,
@@ -140,6 +152,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       durable: true,
     });
     chat?.stop();
+    scheduler.close();
     for (const ext of extensions.list()) {
       try {
         await extensions.unload(ext.manifest.name);
@@ -159,7 +172,20 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     }
   };
 
-  return { paths, hostId, store, bus, ipc, extensions, ledger, chat, chatAgentId, shutdown };
+  return {
+    paths,
+    hostId,
+    store,
+    bus,
+    ipc,
+    extensions,
+    ledger,
+    scheduler,
+    rootAgentId,
+    chat,
+    chatAgentId,
+    shutdown,
+  };
 }
 
 function checkNotRunning(paths: OllePaths): void {

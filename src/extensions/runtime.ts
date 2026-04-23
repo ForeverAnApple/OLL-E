@@ -23,12 +23,14 @@ import { tables } from "../store/index.ts";
 import { ulid } from "../id/index.ts";
 import { eq } from "drizzle-orm";
 import { readManifest } from "./manifest.ts";
+import type { Scheduler } from "../scheduler/index.ts";
 import type {
   ExtensionApi,
   ExtensionModule,
   LoadedExtension,
   Manifest,
   SmokeTest,
+  TaskRegistration,
   ToolDef,
   TriggerDef,
 } from "./types.ts";
@@ -44,6 +46,11 @@ export interface ExtensionHostOptions {
   failureThreshold?: number;
   /** Rolling window in ms for the failure count. Default 5 min. */
   failureWindowMs?: number;
+  /** Scheduler for `registerTask`. If omitted, registerTask throws. */
+  scheduler?: Scheduler;
+  /** Agent id to attribute extension-registered tasks to. Required if
+   *  scheduler is provided. */
+  defaultTaskAgentId?: string;
 }
 
 export interface ExtensionHost {
@@ -69,12 +76,17 @@ interface RegisteredTriggerEntry {
   trigger: TriggerDef;
   stop?: () => void | Promise<void>;
 }
+interface RegisteredTaskEntry {
+  taskId: string;
+  unregister: () => void;
+}
 
 export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   const loaded = new Map<string, LoadedExtension>();
   const subs = new Map<string, Unsubscribe[]>();
   const toolsByExt = new Map<string, RegisteredToolEntry[]>();
   const triggersByExt = new Map<string, RegisteredTriggerEntry[]>();
+  const tasksByExt = new Map<string, RegisteredTaskEntry[]>();
   const failureLog = new Map<string, number[]>();
   const threshold = opts.failureThreshold ?? 2;
   const windowMs = opts.failureWindowMs ?? 5 * 60 * 1000;
@@ -158,6 +170,39 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
         let list = triggersByExt.get(extensionId);
         if (!list) triggersByExt.set(extensionId, (list = []));
         list.push({ extensionId, trigger });
+      },
+      registerTask(task: TaskRegistration) {
+        if (!opts.scheduler || !opts.defaultTaskAgentId) {
+          throw new Error(
+            `extensions: registerTask called by "${manifest.name}" but host has no scheduler wired`,
+          );
+        }
+        const taskId = `ext:${manifest.name}:${task.id}`;
+        const agentId = opts.defaultTaskAgentId;
+        const unregister = opts.scheduler.register({
+          id: taskId,
+          agentId,
+          tier: task.tier ?? "operational",
+          eventType: task.eventType,
+          match: task.match,
+          concurrency: task.concurrency,
+          tokenEst: task.tokenEst,
+          handler: async (ctx) => {
+            await task.handler({
+              event: ctx.event,
+              hostId: ctx.hostId,
+              extensionId,
+              agentId,
+              secrets: resolved,
+              emit: (type, payload, emitOpts) => {
+                ctx.emit(type, payload, emitOpts);
+              },
+            });
+          },
+        });
+        let list = tasksByExt.get(extensionId);
+        if (!list) tasksByExt.set(extensionId, (list = []));
+        list.push({ taskId, unregister });
       },
       on(event: string, handler: (ev: Event) => void | Promise<void>) {
         const un = opts.bus.subscribe(event, handler);
@@ -261,6 +306,14 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     for (const entry of triggersByExt.get(record.id) ?? []) {
       if (entry.stop) await entry.stop();
     }
+    for (const entry of tasksByExt.get(record.id) ?? []) {
+      try {
+        entry.unregister();
+      } catch {
+        /* best-effort */
+      }
+    }
+    tasksByExt.delete(record.id);
     triggersByExt.delete(record.id);
     toolsByExt.delete(record.id);
     try {
