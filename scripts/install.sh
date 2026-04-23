@@ -42,23 +42,24 @@ require_bun() {
 build_binary() {
   require_bun
   log "building olle from $REPO_DIR"
-  # bun build --compile writes a .<hash>.bun-build temp in CWD and renames it
-  # to --outfile; kills between write and rename orphan the temp. Scrub
-  # before and after, so even a crashed prior run doesn't leave litter.
-  rm -f "$REPO_DIR"/.*.bun-build 2>/dev/null || true
   ( cd "$REPO_DIR" && bun install --frozen-lockfile >/dev/null && bun run build >/dev/null )
-  rm -f "$REPO_DIR"/.*.bun-build 2>/dev/null || true
   [[ -x "$REPO_DIR/dist/olle" ]] || die "build produced no dist/olle"
 }
 
 install_binary() {
   mkdir -p "$BIN_DIR"
   install -m 0755 "$REPO_DIR/dist/olle" "$BIN_DIR/olle"
-  # macOS: ad-hoc sign + clear quarantine so Gatekeeper doesn't SIGKILL the
-  # binary on first run. Harmless no-ops on Linux.
+  # macOS: ad-hoc sign + clear quarantine so the kernel doesn't SIGKILL the
+  # binary on first run. `bun build --compile` ships an LC_CODE_SIGNATURE
+  # load command from its embedded runtime that the appended JS payload
+  # invalidates — codesign refuses to overwrite it, so strip it first.
+  # Harmless no-ops on Linux.
   if [[ "$PLATFORM" == "darwin" ]]; then
     xattr -d com.apple.quarantine "$BIN_DIR/olle" 2>/dev/null || true
-    codesign --force --sign - "$BIN_DIR/olle" 2>/dev/null || true
+    codesign --remove-signature "$BIN_DIR/olle" 2>/dev/null || true
+    if ! codesign --force --sign - "$BIN_DIR/olle"; then
+      die "codesign failed on $BIN_DIR/olle — macOS will SIGKILL it on launch"
+    fi
   fi
   log "installed $BIN_DIR/olle"
   case ":$PATH:" in

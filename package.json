@@ -14,7 +14,7 @@
     "test": "bun test test",
     "test:ci": "bun test test --reporter=junit --reporter-outfile=.artifacts/junit.xml",
     "db:generate": "drizzle-kit generate",
-    "build": "bun build --compile --target=bun ./src/cli/index.ts --outfile=dist/olle"
+    "build": "bash scripts/build.sh"
   },
   "dependencies": {
     "drizzle-orm": "^0.38.3",

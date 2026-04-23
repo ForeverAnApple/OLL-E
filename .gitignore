@@ -1,3 +1,7 @@
+# bun build --compile temps (orphaned if the build is interrupted
+# between write and rename-to-outfile)
+.*.bun-build
+
 # Logs
 logs
 *.log
