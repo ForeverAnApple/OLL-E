@@ -837,10 +837,13 @@ export function register(api: any) {
     const threadId = threadKey(msg);
     routes.set(threadId, { channelId: msg.channel_id, originMessageId: msg.message_id });
     const text = cleanContent(msg.content, wakeRe!, msg.is_dm);
+    // Retargeted threads (e.g. a secretary child taking over DMs) win
+    // over the default root mailbox.
+    const target = api.resolveMailbox?.(threadId) ?? api.rootAgentId;
     api.publish(
       "chat.input",
       { text },
-      { durable: true, toAgentId: api.rootAgentId, threadId },
+      { durable: true, toAgentId: target, threadId },
     );
   });
 

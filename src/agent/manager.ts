@@ -1,0 +1,268 @@
+// Agent manager — the registry of running agent loops on this host.
+//
+// One daemon holds one manager. It owns the map of agentId → running
+// loop, handles spawn / kill, and plays a thin retarget-thread role
+// (in-memory only for v0; persistence lands later if we need it).
+//
+// The root agent is registered at daemon startup. Children are registered
+// as spawn_agent fires. Killing an agent stops its loop but leaves the
+// agents row intact so history (parent chain, past events) stays auditable.
+
+import { eq } from "drizzle-orm";
+import type { EventBus } from "../bus/index.ts";
+import type { Store } from "../store/db.ts";
+import type { Ledger } from "../ledger/index.ts";
+import type { ExtensionHost } from "../extensions/index.ts";
+import type { Llm } from "../llm/index.ts";
+import type { Inbox } from "../inbox/index.ts";
+import type { ToolDef } from "../extensions/types.ts";
+import type { AgentScope } from "../store/schema.ts";
+import { tables } from "../store/index.ts";
+import { ulid } from "../id/index.ts";
+import { narrowsScope } from "../permissions/index.ts";
+import { startAgentLoop, type AgentLoop } from "./chat.ts";
+
+export interface AgentManagerDeps {
+  bus: EventBus;
+  store: Store;
+  hostId: string;
+  llm: Llm;
+  extensions?: ExtensionHost;
+  /** Core meta-tools injected for every agent the manager runs. Often
+   *  set post-construction via setCoreTools because building meta-tools
+   *  requires a manager reference (spawn_agent etc.). */
+  coreTools?: ToolDef[];
+  ledger?: Ledger;
+  inbox?: Inbox;
+  /** Principal id used for budget + askUp routing on denials. */
+  principalId?: string;
+  /** Where per-thread snapshots live. */
+  threadsDir?: string;
+  /** Default model the manager starts children with. Omit to use the
+   *  llm adapter's defaultModel. */
+  model?: string;
+}
+
+export interface SpawnOptions {
+  /** Stable, human-readable name; shown in traces. */
+  name: string;
+  /** Initial message text delivered into the child's mailbox in the
+   *  work thread. This is the child's mission. */
+  mission: string;
+  /** Agent id of the spawning parent. Required — orphan agents are a
+   *  mesh concept we haven't defined yet. */
+  parentAgentId: string;
+  /** System prompt for the child. Keep it focused — children are hired
+   *  for a job, not general conversation. */
+  systemPrompt?: string;
+  /** Scope the child runs under. Must `narrowsScope` under the parent's
+   *  actual scope — we look the parent up to enforce this. */
+  scope?: AgentScope;
+  /** Thread id to use for the child's work stream. When omitted, a
+   *  fresh ULID is minted. Callers (notably spawn_agent) pass the
+   *  thread id they want to track this spawn under. */
+  threadId?: string;
+  /** Parent thread id — when the spawn descends from a parent thread
+   *  (e.g. root DMing a human is thread X, spawns a researcher for X),
+   *  link back so observers can correlate. */
+  parentThreadId?: string;
+}
+
+export interface SpawnResult {
+  agentId: string;
+  threadId: string;
+}
+
+export interface AgentManager {
+  /** Register an already-running loop (used for the root agent whose
+   *  loop is wired by the daemon before the manager starts tracking). */
+  register(agentId: string, loop: AgentLoop): void;
+  /** Swap the coreTools passed to future spawned children. Daemon calls
+   *  this after building meta-tools that themselves reference the
+   *  manager (resolving the circular dep cleanly). */
+  setCoreTools(tools: ToolDef[]): void;
+  /** Start a new child loop. Returns the child's id + the thread id the
+   *  mission was delivered on. */
+  spawn(opts: SpawnOptions): Promise<SpawnResult>;
+  /** Stop a running loop. No-op if the agent isn't tracked. */
+  kill(agentId: string): void;
+  /** List currently-running agent ids. */
+  list(): string[];
+  /** Retarget a thread to a different agent. Bridges call
+   *  `resolveMailbox(threadId)` when deciding where to publish — the
+   *  override wins. `undefined` as target removes the override. */
+  retargetThread(threadId: string, toAgentId: string | undefined): void;
+  /** Look up a thread's current mailbox target. Undefined = no override. */
+  resolveMailbox(threadId: string): string | undefined;
+  /** Stop every tracked loop (daemon shutdown). */
+  shutdown(): void;
+}
+
+export function createAgentManager(deps: AgentManagerDeps): AgentManager {
+  const loops = new Map<string, AgentLoop>();
+  const threadRoutes = new Map<string, string>();
+  let coreTools = deps.coreTools;
+
+  function register(agentId: string, loop: AgentLoop): void {
+    loops.set(agentId, loop);
+  }
+
+  function setCoreTools(tools: ToolDef[]): void {
+    coreTools = tools;
+  }
+
+  async function spawn(opts: SpawnOptions): Promise<SpawnResult> {
+    if (!opts.name || !/^[a-zA-Z0-9][\w-]{0,63}$/.test(opts.name)) {
+      throw new Error(`spawn: invalid name "${opts.name}"`);
+    }
+    if (!opts.mission || typeof opts.mission !== "string") {
+      throw new Error("spawn: mission (string) is required");
+    }
+    // Scope narrowing: load parent's real scope and validate the child's
+    // requested scope stays within it.
+    const parent = deps.store
+      .select()
+      .from(tables.agents)
+      .where(eq(tables.agents.id, opts.parentAgentId))
+      .all()[0];
+    if (!parent) {
+      throw new Error(`spawn: parent agent ${opts.parentAgentId} not found`);
+    }
+    const parentScope = (parent.scope as AgentScope) ?? {};
+    const childScope: AgentScope = opts.scope ?? {};
+    const check = narrowsScope(parentScope, childScope);
+    if (!check.ok) {
+      throw new Error(`spawn: child scope rejected — ${check.reason}`);
+    }
+
+    const childId = ulid();
+    deps.store
+      .insert(tables.agents)
+      .values({
+        id: childId,
+        name: opts.name,
+        hostId: deps.hostId,
+        parentAgentId: opts.parentAgentId,
+        systemPrompt: opts.systemPrompt ?? null,
+        scope: childScope,
+        createdAt: Date.now(),
+      })
+      .run();
+
+    const threadId = opts.threadId ?? ulid();
+
+    const loop = startAgentLoop({
+      bus: deps.bus,
+      store: deps.store,
+      hostId: deps.hostId,
+      llm: deps.llm,
+      agentId: childId,
+      extensions: deps.extensions,
+      coreTools,
+      ledger: deps.ledger,
+      inbox: deps.inbox,
+      principalId: deps.principalId,
+      threadsDir: deps.threadsDir,
+      model: deps.model,
+      system:
+        opts.systemPrompt ??
+        // Default prompt makes clear to the child that it's a worker
+        // reporting back to its parent via its own reply stream. The
+        // parent sees those replies by observing events in the thread.
+        [
+          `You are ${opts.name}, a child agent spawned to complete a specific mission.`,
+          `Your parent is agent ${opts.parentAgentId}.`,
+          `Your replies flow back in thread ${threadId}; keep them focused and terminate when the mission is complete.`,
+        ].join(" "),
+    });
+    loops.set(childId, loop);
+
+    // Deliver the mission into the child's mailbox. The child's loop is
+    // subscribed by toAgentId === childId; this is what wakes it up.
+    deps.bus.publish({
+      type: "chat.input",
+      hostId: deps.hostId,
+      actorId: opts.parentAgentId,
+      durable: true,
+      toAgentId: childId,
+      threadId,
+      parentThreadId: opts.parentThreadId,
+      payload: { text: opts.mission },
+    });
+
+    // Auditable spawn record — distinct event type so observers (tail,
+    // other agents) can filter for it without squinting at chat.input.
+    deps.bus.publish({
+      type: "agent.spawned",
+      hostId: deps.hostId,
+      actorId: opts.parentAgentId,
+      durable: true,
+      threadId: opts.parentThreadId,
+      payload: {
+        childId,
+        childName: opts.name,
+        threadId,
+        mission: opts.mission,
+      },
+    });
+
+    return { agentId: childId, threadId };
+  }
+
+  function kill(agentId: string): void {
+    const loop = loops.get(agentId);
+    if (!loop) return;
+    loop.stop();
+    loops.delete(agentId);
+    deps.bus.publish({
+      type: "agent.killed",
+      hostId: deps.hostId,
+      actorId: agentId,
+      durable: true,
+      payload: { agentId },
+    });
+  }
+
+  function retargetThread(threadId: string, toAgentId: string | undefined): void {
+    if (!threadId) throw new Error("retargetThread: threadId required");
+    const previous = threadRoutes.get(threadId);
+    if (toAgentId) threadRoutes.set(threadId, toAgentId);
+    else threadRoutes.delete(threadId);
+    deps.bus.publish({
+      type: "thread.retargeted",
+      hostId: deps.hostId,
+      actorId: agentFromCall() ?? "manager",
+      durable: true,
+      threadId,
+      payload: { threadId, previous, current: toAgentId ?? null },
+    });
+  }
+
+  function resolveMailbox(threadId: string): string | undefined {
+    return threadRoutes.get(threadId);
+  }
+
+  function shutdown(): void {
+    for (const loop of loops.values()) loop.stop();
+    loops.clear();
+    threadRoutes.clear();
+  }
+
+  return {
+    register,
+    setCoreTools,
+    spawn,
+    kill,
+    list: () => [...loops.keys()],
+    retargetThread,
+    resolveMailbox,
+    shutdown,
+  };
+}
+
+// There's no agent-call-stack yet; this is a placeholder for when we
+// thread caller identity through. For now retargeting is attributed to
+// the manager itself in the emitted event.
+function agentFromCall(): string | undefined {
+  return undefined;
+}

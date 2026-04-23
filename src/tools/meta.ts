@@ -20,6 +20,8 @@ import {
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ExtensionHost, ToolDef } from "../extensions/index.ts";
+import type { AgentManager } from "../agent/index.ts";
+import type { AgentScope } from "../store/schema.ts";
 import {
   commitSubtree,
   ensureRepo,
@@ -38,6 +40,11 @@ export interface MetaToolsOptions {
   /** Dir where file-backed secrets live. When omitted, secret meta-tools
    *  are not registered. */
   secretsDir?: string;
+  /** Agent manager. When present, spawn / kill / retarget meta-tools
+   *  are registered so the agent can grow its own workforce. The
+   *  spawning agent id is taken from `authorName` — the chat loop
+   *  already sets this to the acting agent. */
+  agentManager?: AgentManager;
 }
 
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -311,6 +318,130 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     listStartersT,
     installStarterT,
   ];
+
+  if (opts.agentManager) {
+    const manager = opts.agentManager;
+
+    const spawnAgent: ToolDef<
+      {
+        name: string;
+        mission: string;
+        systemPrompt?: string;
+        scope?: AgentScope;
+        threadId?: string;
+        parentThreadId?: string;
+      },
+      { agentId: string; threadId: string }
+    > = {
+      name: "spawn_agent",
+      tier: "strategic",
+      description:
+        "Hire a child agent to work on a specific mission. The child runs its own loop in its own thread and replies flow back in chat.* events tagged with the returned threadId. Scope must narrow under your own (narrowsScope) — you can only delegate authority you already hold. Use this when work will take multiple turns or shouldn't block the conversation.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Short human-readable label (e.g. `researcher`, `secretary`).",
+          },
+          mission: {
+            type: "string",
+            description:
+              "The initial message delivered into the child's mailbox — what you want done.",
+          },
+          systemPrompt: {
+            type: "string",
+            description:
+              "Optional system prompt override. Omit for the default 'you are a child agent, report back in thread X, terminate when done'.",
+          },
+          scope: {
+            type: "object",
+            description:
+              "Child scope. Must narrow under yours. Undefined keys = unrestricted at the child level (still bounded by parent).",
+          },
+          threadId: { type: "string", description: "Thread id for the spawn; minted if omitted." },
+          parentThreadId: {
+            type: "string",
+            description:
+              "Thread id this spawn descends from (e.g. the human conversation you're fulfilling). Enables observers to correlate.",
+          },
+        },
+        required: ["name", "mission"],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const result = await manager.spawn({
+          name: args.name,
+          mission: args.mission,
+          systemPrompt: args.systemPrompt,
+          scope: args.scope,
+          threadId: args.threadId,
+          parentThreadId: args.parentThreadId,
+          parentAgentId: opts.authorName,
+        });
+        return result;
+      },
+    };
+
+    const killAgent: ToolDef<{ agentId: string }, { agentId: string; stopped: boolean }> = {
+      name: "kill_agent",
+      tier: "strategic",
+      description:
+        "Stop a child agent's loop. The agents row stays for audit but the loop no longer receives mail. Use when a spawn turned out wrong, took too long, or the mission was obsoleted.",
+      inputSchema: {
+        type: "object",
+        properties: { agentId: { type: "string" } },
+        required: ["agentId"],
+        additionalProperties: false,
+      },
+      execute: async ({ agentId }) => {
+        const wasRunning = manager.list().includes(agentId);
+        manager.kill(agentId);
+        return { agentId, stopped: wasRunning };
+      },
+    };
+
+    const listAgents: ToolDef<
+      Record<string, never>,
+      Array<{ agentId: string }>
+    > = {
+      name: "list_agents",
+      tier: "operational",
+      description: "List agent loops currently running on this host.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: async () => manager.list().map((agentId) => ({ agentId })),
+    };
+
+    const retargetThread: ToolDef<
+      { threadId: string; toAgentId?: string },
+      { threadId: string; current: string | null }
+    > = {
+      name: "retarget_thread",
+      tier: "strategic",
+      description:
+        "Route future inbound in a thread to a different agent's mailbox (e.g. a secretary takes over DMs while you focus on work). Omit toAgentId to clear the override and let the bridge's default target (usually root) apply again.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: { type: "string" },
+          toAgentId: {
+            type: "string",
+            description:
+              "Agent id that should receive inbound for this thread. Omit to remove the override.",
+          },
+        },
+        required: ["threadId"],
+        additionalProperties: false,
+      },
+      execute: async ({ threadId, toAgentId }) => {
+        manager.retargetThread(threadId, toAgentId);
+        const current = manager.resolveMailbox(threadId);
+        return { threadId, current: current ?? null };
+      },
+    };
+
+    tools.push(spawnAgent, killAgent, listAgents, retargetThread);
+  }
 
   if (opts.secretsDir) {
     const secretsDir = opts.secretsDir;

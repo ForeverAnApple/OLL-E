@@ -54,6 +54,10 @@ export interface ExtensionHostOptions {
   /** Agent id to attribute extension-registered tasks to. Required if
    *  scheduler is provided. */
   defaultTaskAgentId?: string;
+  /** Thread-routing resolver. Bridges call api.resolveMailbox(threadId)
+   *  to find out if a thread has been retargeted away from the default
+   *  mailbox. Omit when routing isn't available (tests). */
+  resolveMailbox?: (threadId: string) => string | undefined;
 }
 
 export interface ExtensionHost {
@@ -199,6 +203,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       hostId: opts.hostId,
       extensionId,
       rootAgentId: opts.defaultTaskAgentId,
+      resolveMailbox: opts.resolveMailbox,
       secrets: resolved,
       scratchDir,
       registerTool(tool) {

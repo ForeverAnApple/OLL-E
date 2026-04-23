@@ -6,7 +6,12 @@ import { createExtensionHost, ensureRepo, type ExtensionHost } from "../extensio
 import { createLedger, type Ledger } from "../ledger/index.ts";
 import { createScheduler, type Scheduler } from "../scheduler/index.ts";
 import { createAnthropicAdapter } from "../llm/index.ts";
-import { startAgentLoop, type AgentLoop } from "../agent/index.ts";
+import {
+  startAgentLoop,
+  createAgentManager,
+  type AgentLoop,
+  type AgentManager,
+} from "../agent/index.ts";
 import { buildMetaTools } from "../tools/meta.ts";
 import { createInbox, type Inbox } from "../inbox/index.ts";
 import { ulid } from "../id/index.ts";
@@ -36,6 +41,7 @@ export interface Daemon {
   readonly rootPrincipalId: string;
   readonly chat?: AgentLoop;
   readonly chatAgentId?: string;
+  readonly agentManager?: AgentManager;
   shutdown(): Promise<void>;
 }
 
@@ -59,6 +65,12 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   scheduler.recoverLost();
   const inbox = createInbox({ bus, store, hostId });
 
+  // Late-bound manager reference: extensions are created before the
+  // agent manager (which needs the LLM adapter, conditionally built),
+  // but the resolveMailbox callback captures a closure that reads the
+  // manager once it exists.
+  let agentManager: AgentManager | undefined;
+
   ensureRepo(paths.extensionsDir);
   const extensions = createExtensionHost({
     bus,
@@ -68,6 +80,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     scheduler,
     defaultTaskAgentId: rootAgentId,
     secrets: (name) => readSecret(paths.secretsDir, name),
+    resolveMailbox: (threadId) => agentManager?.resolveMailbox(threadId),
   });
   const ledger = createLedger({ bus, store, hostId });
 
@@ -108,12 +121,29 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   if (process.env.ANTHROPIC_API_KEY) {
     chatAgentId = rootAgentId;
     const llm = createAnthropicAdapter();
+    // Manager first — meta-tools need a reference so spawn_agent etc.
+    // resolve. The root loop gets registered into it after start.
+    agentManager = createAgentManager({
+      bus,
+      store,
+      hostId,
+      llm,
+      extensions,
+      ledger,
+      inbox,
+      principalId: rootPrincipalId,
+      threadsDir: paths.threadsDir,
+    });
     const coreTools = buildMetaTools({
       extensions,
       extensionsDir: paths.extensionsDir,
       authorName: chatAgentId,
       secretsDir: paths.secretsDir,
+      agentManager,
     });
+    // Children inherit the same tool set so they can themselves spawn,
+    // read extension files, etc. Scope still gates what they get to use.
+    agentManager.setCoreTools(coreTools);
     chat = startAgentLoop({
       bus,
       store,
@@ -135,8 +165,12 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         "read_extension_file (inspect manifest / index.ts / smoke.ts before guessing " +
         "at error strings), set_secret / list_secrets / remove_secret for credentials " +
         "(call set_secret yourself when the human gives you a token — don't shell out " +
-        "to external CLIs). Be concise.",
+        "to external CLIs). Delegation: spawn_agent / kill_agent / list_agents / " +
+        "retarget_thread — hire children for work that shouldn't block the " +
+        "conversation; never block a human waiting for a slow task, delegate. " +
+        "Be concise.",
     });
+    agentManager.register(chatAgentId, chat);
   } else if (!opts.quiet) {
     console.log("olle: ANTHROPIC_API_KEY not set — chat agent disabled");
   }
@@ -167,6 +201,10 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       actorId: hostId,
       durable: true,
     });
+    // Manager shutdown stops every tracked loop (including the root);
+    // explicit chat?.stop() is redundant when the manager owns it, but
+    // safe if the manager never came up (no API key).
+    agentManager?.shutdown();
     chat?.stop();
     scheduler.close();
     for (const ext of extensions.list()) {
@@ -202,6 +240,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     rootPrincipalId,
     chat,
     chatAgentId,
+    agentManager,
     shutdown,
   };
 }

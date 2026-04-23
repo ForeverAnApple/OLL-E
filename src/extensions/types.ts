@@ -144,9 +144,12 @@ export interface ExtensionApi {
     },
   ): void;
   /** The root agent id on this host. Bridges use this to address events
-   *  into the root's mailbox by default. Retargeting (Stage 4) will give
-   *  agents a way to route threads elsewhere. */
+   *  into the root's mailbox by default. */
   rootAgentId?: string;
+  /** Look up a thread's current mailbox target (from retarget_thread).
+   *  Returns the override or undefined — bridges should fall back to
+   *  rootAgentId when nothing matches. */
+  resolveMailbox?(threadId: string): string | undefined;
   /** Invoke a tool registered by any extension (including this one).
    *  Gated by manifest.callsTools — the tool's name must be on the
    *  allowlist or the call is rejected. The target tool runs with its
