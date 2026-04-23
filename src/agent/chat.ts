@@ -2,9 +2,17 @@
 // for a given session, runs the agent loop, and streams assistant text
 // + tool visibility back as chat.* events so the CLI can tail and render.
 //
-// Session ids keep parallel conversations isolated; the CLI generates one
-// per repl and sticks it in the event payload.
+// Concurrency: one worker per session. chat.input always enqueues; the
+// worker drains pending messages in order. Never drops — concurrent
+// inputs to the same session serialize behind the current turn. Different
+// sessions run independently.
+//
+// Durability: when sessionsDir is configured, session.messages is
+// snapshotted to disk after each turn-end and loaded on first-touch so
+// a restart doesn't lose conversation state.
 
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { EventBus } from "../bus/index.ts";
 import type { Event } from "../bus/types.ts";
 import type { Store } from "../store/db.ts";
@@ -41,14 +49,20 @@ export interface ChatAgentOptions {
   inbox?: Inbox;
   /** Model override. */
   model?: string;
+  /** Directory to persist session message history as JSON snapshots.
+   *  One file per session, written after each turn-end and loaded on
+   *  first-touch. Omit to disable persistence (sessions live only in
+   *  memory). */
+  sessionsDir?: string;
 }
 
-/** History is kept in-memory per session for v0. Durable reconstruction
- *  from the events table is a v0.1 concern. */
 interface Session {
   id: string;
   messages: Message[];
-  running: boolean;
+  /** Text queued from chat.input events while the worker is busy. */
+  pending: string[];
+  /** Set by the single drain loop; undefined means no worker running. */
+  worker?: Promise<void>;
 }
 
 export interface ChatAgent {
@@ -58,121 +72,40 @@ export interface ChatAgent {
 
 export function startChatAgent(opts: ChatAgentOptions): ChatAgent {
   const sessions = new Map<string, Session>();
+  if (opts.sessionsDir) mkdirSync(opts.sessionsDir, { recursive: true });
 
-  const unsub = opts.bus.subscribe("chat.input", async (ev) => {
+  function getOrCreateSession(id: string): Session {
+    let s = sessions.get(id);
+    if (s) return s;
+    const loaded = opts.sessionsDir ? tryLoadSession(opts.sessionsDir, id) : null;
+    s = { id, messages: loaded ?? [], pending: [] };
+    sessions.set(id, s);
+    return s;
+  }
+
+  const unsub = opts.bus.subscribe("chat.input", (ev) => {
     const p = ev.payload as { sessionId?: string; text?: string };
     if (!p?.sessionId || typeof p.text !== "string") return;
-    let session = sessions.get(p.sessionId);
-    if (!session) {
-      session = { id: p.sessionId, messages: [], running: false };
-      sessions.set(p.sessionId, session);
-    }
-    if (session.running) {
-      // Drop or queue? v0: drop with a warning event. Reasonable because
-      // chat input is interactive — the user shouldn't be multiplexing.
-      opts.bus.publish({
-        type: "chat.busy",
-        hostId: opts.hostId,
-        actorId: opts.agentId,
-        payload: { sessionId: session.id },
-        durable: false,
-      });
-      return;
-    }
-    session.running = true;
-    session.messages.push({ role: "user", content: p.text });
-
-    try {
-      const tools = collectTools(opts);
-      const scope = loadAgentScope(opts.store, opts.agentId);
-      const grantProposed = new Set<string>();
-      const result = await runAgent({
-        llm: opts.llm,
-        model: opts.model,
-        system: opts.system,
-        tools,
-        toolCtx: {
-          hostId: opts.hostId,
-          extensionId: opts.agentId,
-          actorId: opts.agentId,
-          abort: new AbortController().signal,
-          secrets: {},
-        },
-        messages: session.messages,
-        onStep: (step) => emitStep(opts, session!.id, ev, step),
-        authorize: (tool) =>
-          checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),
-        onDenied: ({ tool, reason }) => {
+    const session = getOrCreateSession(p.sessionId);
+    session.pending.push(p.text);
+    // Preserve the originating event so emitted steps keep the parent
+    // chain. First message in a burst wins as parent for the whole
+    // drain; v0.1 can emit per-turn parenting if the granularity matters.
+    if (!session.worker) {
+      session.worker = drain(session, ev, opts)
+        .catch((err) => {
           opts.bus.publish({
-            type: "tool.denied",
+            type: "chat.error",
             hostId: opts.hostId,
             actorId: opts.agentId,
             parentEventId: ev.id,
             durable: true,
-            payload: {
-              sessionId: session!.id,
-              tool: tool.name,
-              tier: tool.tier ?? "operational",
-              reason,
-            },
+            payload: { sessionId: session.id, error: (err as Error).message },
           });
-          // Debounce: one grant_scope proposal per tool per session turn.
-          if (!opts.inbox || !opts.principalId) return;
-          if (grantProposed.has(tool.name)) return;
-          grantProposed.add(tool.name);
-          askUp(
-            { bus: opts.bus, store: opts.store, hostId: opts.hostId, inbox: opts.inbox },
-            {
-              proposingAgentId: opts.agentId,
-              principalId: opts.principalId,
-              tier: "strategic",
-              summary: `grant ${opts.agentId} permission to call ${tool.name}`,
-              payload: {
-                action: "grant_scope",
-                agentId: opts.agentId,
-                tool: tool.name,
-                tier: tool.tier ?? "operational",
-                reason,
-              },
-            },
-          );
-        },
-      });
-      session.messages = result.messages;
-      if (opts.ledger && result.totalUsage.totalTokens > 0) {
-        opts.ledger.record({
-          actorId: opts.agentId,
-          principalId: opts.principalId,
-          provider: opts.llm.provider,
-          model: opts.model ?? opts.llm.defaultModel,
-          tokens: result.totalUsage.totalTokens,
-          usd: result.totalUsdMicros,
+        })
+        .finally(() => {
+          session.worker = undefined;
         });
-      }
-      opts.bus.publish({
-        type: "chat.turn-end",
-        hostId: opts.hostId,
-        actorId: opts.agentId,
-        parentEventId: ev.id,
-        durable: true,
-        payload: {
-          sessionId: session.id,
-          stopReason: result.stopReason,
-          tokens: result.totalUsage.totalTokens,
-          usdMicros: result.totalUsdMicros,
-        },
-      });
-    } catch (err) {
-      opts.bus.publish({
-        type: "chat.error",
-        hostId: opts.hostId,
-        actorId: opts.agentId,
-        parentEventId: ev.id,
-        durable: true,
-        payload: { sessionId: session.id, error: (err as Error).message },
-      });
-    } finally {
-      session.running = false;
     }
   });
 
@@ -180,6 +113,109 @@ export function startChatAgent(opts: ChatAgentOptions): ChatAgent {
     stop: () => unsub(),
     sessions: () => [...sessions.keys()],
   };
+}
+
+async function drain(session: Session, origin: Event, opts: ChatAgentOptions): Promise<void> {
+  while (session.pending.length > 0) {
+    const text = session.pending.shift()!;
+    await runTurn(session, text, origin, opts);
+  }
+}
+
+async function runTurn(session: Session, text: string, origin: Event, opts: ChatAgentOptions): Promise<void> {
+  session.messages.push({ role: "user", content: text });
+  try {
+    const tools = collectTools(opts);
+    const scope = loadAgentScope(opts.store, opts.agentId);
+    const grantProposed = new Set<string>();
+    const result = await runAgent({
+      llm: opts.llm,
+      model: opts.model,
+      system: opts.system,
+      tools,
+      toolCtx: {
+        hostId: opts.hostId,
+        extensionId: opts.agentId,
+        actorId: opts.agentId,
+        abort: new AbortController().signal,
+        secrets: {},
+      },
+      messages: session.messages,
+      onStep: (step) => emitStep(opts, session.id, origin, step),
+      authorize: (tool) =>
+        checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),
+      onDenied: ({ tool, reason }) => {
+        opts.bus.publish({
+          type: "tool.denied",
+          hostId: opts.hostId,
+          actorId: opts.agentId,
+          parentEventId: origin.id,
+          durable: true,
+          payload: {
+            sessionId: session.id,
+            tool: tool.name,
+            tier: tool.tier ?? "operational",
+            reason,
+          },
+        });
+        if (!opts.inbox || !opts.principalId) return;
+        if (grantProposed.has(tool.name)) return;
+        grantProposed.add(tool.name);
+        askUp(
+          { bus: opts.bus, store: opts.store, hostId: opts.hostId, inbox: opts.inbox },
+          {
+            proposingAgentId: opts.agentId,
+            principalId: opts.principalId,
+            tier: "strategic",
+            summary: `grant ${opts.agentId} permission to call ${tool.name}`,
+            payload: {
+              action: "grant_scope",
+              agentId: opts.agentId,
+              tool: tool.name,
+              tier: tool.tier ?? "operational",
+              reason,
+            },
+          },
+        );
+      },
+    });
+    session.messages = result.messages;
+    if (opts.ledger && result.totalUsage.totalTokens > 0) {
+      opts.ledger.record({
+        actorId: opts.agentId,
+        principalId: opts.principalId,
+        provider: opts.llm.provider,
+        model: opts.model ?? opts.llm.defaultModel,
+        tokens: result.totalUsage.totalTokens,
+        usd: result.totalUsdMicros,
+      });
+    }
+    // Commit the snapshot before announcing turn-end so any subscriber
+    // reacting to the event can rely on the on-disk state being current.
+    if (opts.sessionsDir) saveSession(opts.sessionsDir, session);
+    opts.bus.publish({
+      type: "chat.turn-end",
+      hostId: opts.hostId,
+      actorId: opts.agentId,
+      parentEventId: origin.id,
+      durable: true,
+      payload: {
+        sessionId: session.id,
+        stopReason: result.stopReason,
+        tokens: result.totalUsage.totalTokens,
+        usdMicros: result.totalUsdMicros,
+      },
+    });
+  } catch (err) {
+    opts.bus.publish({
+      type: "chat.error",
+      hostId: opts.hostId,
+      actorId: opts.agentId,
+      parentEventId: origin.id,
+      durable: true,
+      payload: { sessionId: session.id, error: (err as Error).message },
+    });
+  }
 }
 
 function collectTools(opts: ChatAgentOptions): ToolDef[] {
@@ -193,6 +229,40 @@ function collectTools(opts: ChatAgentOptions): ToolDef[] {
 function loadAgentScope(store: Store, agentId: string): AgentScope {
   const row = store.select().from(tables.agents).where(eq(tables.agents.id, agentId)).all()[0];
   return (row?.scope as AgentScope) ?? {};
+}
+
+function sessionFile(dir: string, id: string): string {
+  // Only allow url-safe characters in the filename to avoid path traversal.
+  const safe = id.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return join(dir, `${safe}.json`);
+}
+
+function tryLoadSession(dir: string, id: string): Message[] | null {
+  const f = sessionFile(dir, id);
+  if (!existsSync(f)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(f, "utf8")) as unknown;
+    if (!raw || typeof raw !== "object" || !Array.isArray((raw as { messages?: unknown }).messages)) {
+      return null;
+    }
+    return (raw as { messages: Message[] }).messages;
+  } catch {
+    // Corrupt snapshot — start fresh. Not worth crashing over; the events
+    // log is still the canonical history if we ever need to rebuild.
+    return null;
+  }
+}
+
+function saveSession(dir: string, session: Session): void {
+  try {
+    writeFileSync(
+      sessionFile(dir, session.id),
+      JSON.stringify({ id: session.id, messages: session.messages, savedAt: Date.now() }),
+      "utf8",
+    );
+  } catch {
+    // Best-effort persistence; the session remains intact in memory.
+  }
 }
 
 function emitStep(

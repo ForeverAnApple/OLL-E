@@ -121,6 +121,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       ledger,
       inbox,
       principalId: rootPrincipalId,
+      sessionsDir: paths.sessionsDir,
       system:
         "You are olle, a helpful assistant living inside OLL-E — a habitat " +
         "built for agents like you. Your job is to accomplish what the human " +

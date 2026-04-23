@@ -24,6 +24,8 @@ import { ulid } from "../id/index.ts";
 import { eq } from "drizzle-orm";
 import { readManifest } from "./manifest.ts";
 import type { Scheduler } from "../scheduler/index.ts";
+import { checkTool } from "../permissions/index.ts";
+import type { AgentScope } from "../store/schema.ts";
 import type {
   CallToolOptions,
   ExtensionApi,
@@ -236,6 +238,15 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
               emit: (type, payload, emitOpts) => {
                 ctx.emit(type, payload, emitOpts);
               },
+              // Task-context callTool threads the acting agentId so
+              // scope narrowing applies. Handlers that need a different
+              // acting agent can still reach api.callTool directly.
+              callTool: <I, O>(name: string, args: I, toolOpts?: Omit<CallToolOptions, "asAgent">) =>
+                (api.callTool as <I2, O2>(n: string, a: I2, o?: CallToolOptions) => Promise<O2>)<I, O>(
+                  name,
+                  args,
+                  { ...toolOpts, asAgent: agentId },
+                ),
             });
           },
         });
@@ -292,7 +303,21 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
             `extensions: callTool("${name}") — tool is tier "${toolTier}"; route through the decision inbox`,
           );
         }
-        // Gate 4: input validation. Defers to the target's own validator;
+        // Gate 4: agent scope. When the caller declares an acting agent,
+        // run the same permission gate the chat agent uses so scope
+        // narrowing applies uniformly to task-authored tool invocations.
+        // Pure extension-to-extension calls without an agent context skip
+        // this gate — the allowlist + tier gates above still apply.
+        if (callOpts?.asAgent) {
+          const scope = loadScopeForAgent(opts.store, callOpts.asAgent);
+          const authz = checkTool(scope, { name, tier: toolTier });
+          if (!authz.ok) {
+            throw new Error(
+              `extensions: callTool("${name}") denied by scope of agent "${callOpts.asAgent}": ${authz.reason}`,
+            );
+          }
+        }
+        // Gate 5: input validation. Defers to the target's own validator;
         // if absent, args flow through unchanged (same contract as the
         // chat agent's tool dispatch).
         const validated = target.tool.validate ? target.tool.validate(args) : args;
@@ -533,6 +558,11 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   }
 
   return { list, get, discover, load, unload, reload, reportFailure, tools, triggers };
+}
+
+function loadScopeForAgent(store: Store, agentId: string): AgentScope {
+  const row = store.select().from(tables.agents).where(eq(tables.agents.id, agentId)).all()[0];
+  return (row?.scope as AgentScope) ?? {};
 }
 
 function upsertRow(store: Store, manifest: Manifest, path: string): string {

@@ -15,6 +15,7 @@ export interface OllePaths {
   readonly socketFile: string;
   readonly pidFile: string;
   readonly secretsDir: string;
+  readonly sessionsDir: string;
 }
 
 export function resolvePaths(rootOverride?: string): OllePaths {
@@ -33,6 +34,7 @@ export function resolvePaths(rootOverride?: string): OllePaths {
     socketFile: join(root, "run", "olle.sock"),
     pidFile: join(root, "run", "olle.pid"),
     secretsDir: join(root, "secrets"),
+    sessionsDir: join(root, "sessions"),
   };
 }
 
@@ -45,6 +47,7 @@ export function ensurePaths(paths: OllePaths): void {
     paths.logsDir,
     paths.runDir,
     paths.secretsDir,
+    paths.sessionsDir,
   ]) {
     mkdirSync(dir, { recursive: true });
   }

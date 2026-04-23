@@ -85,6 +85,17 @@ export interface ExtensionTaskContext {
    *  scheduler's TaskContext.emit but auto-attributed to the extension. */
   emit<T>(type: string, payload: T, opts?: { durable?: boolean }): void;
   secrets: Record<string, string>;
+  /** Invoke a cross-extension tool with the task's own agentId threaded
+   *  in as `asAgent`. Same semantics as `api.callTool` but with scope
+   *  enforcement automatic — the acting agent's allowTools/denyTools/
+   *  allowTiers policy applies per `checkTool`. Use this inside task
+   *  handlers; reach for `api.callTool` only when no agent context
+   *  applies. */
+  callTool<I = unknown, O = unknown>(
+    name: string,
+    args: I,
+    opts?: Omit<CallToolOptions, "asAgent">,
+  ): Promise<O>;
 }
 
 export interface CallToolOptions {
@@ -93,6 +104,14 @@ export interface CallToolOptions {
   timeoutMs?: number;
   /** Caller's signal; aborts propagate to the target's ctx.abort. */
   signal?: AbortSignal;
+  /** Agent on whose behalf the call is being made. When set, the runtime
+   *  looks up the agent's scope and runs checkTool(scope, target) before
+   *  dispatch — the same permission gate the chat agent uses. Task
+   *  handlers thread their own agentId via ctx.callTool automatically;
+   *  other callers pass it explicitly when there's a meaningful acting
+   *  agent. Omit for pure extension-to-extension plumbing without an
+   *  agent context. */
+  asAgent?: string;
 }
 
 export interface ExtensionApi {

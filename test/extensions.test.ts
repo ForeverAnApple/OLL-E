@@ -504,6 +504,65 @@ describe("cross-extension callTool", () => {
     ).rejects.toThrow(/aborted by ctx/);
   });
 
+  it("respects acting-agent scope when asAgent is threaded", async () => {
+    // An agent row with denyTools=[echo_b] must block callTool even when
+    // the caller's manifest allowlist permits it. Agent scope is the
+    // sharper tool — the allowlist is about the relationship between
+    // extensions; scope is about the authority of the acting agent.
+    const r = rig();
+    const agentId = "narrow-agent";
+    r.store
+      .insert(tables.agents)
+      .values({
+        id: agentId,
+        name: "narrow",
+        hostId: r.hostId,
+        scope: { denyTools: ["echo_b"] },
+        createdAt: Date.now(),
+      })
+      .run();
+
+    writeExt(tmp, "callee", {
+      manifest: { name: "callee", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "echo_b",
+            description: "",
+            inputSchema: { type: "object" },
+            execute: (args) => args,
+          });
+        }
+      `,
+    });
+    writeExt(tmp, "caller", {
+      manifest: { name: "caller", version: "0.1.0", callsTools: ["echo_b"] },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "run_as_agent",
+            description: "",
+            inputSchema: { type: "object" },
+            execute: async () => api.callTool("echo_b", {}, { asAgent: "narrow-agent" }),
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("callee");
+    await host.load("caller");
+    const tool = host.tools().find((t) => t.tool.name === "run_as_agent")!.tool;
+    await expect(
+      tool.execute({} as never, {
+        hostId: r.hostId,
+        extensionId: "outer",
+        actorId: "outer",
+        abort: new AbortController().signal,
+        secrets: {},
+      }),
+    ).rejects.toThrow(/denied by scope of agent "narrow-agent"/);
+  });
+
   it("emits a durable tool.called event tagging caller + target for audit", async () => {
     const { r, host } = await loadPair({ callsTools: ["echo_b"] });
     const called: Array<{ caller: string; targetExtension: string; tool: string; ok: boolean }> = [];
