@@ -8,6 +8,7 @@ import { createScheduler, type Scheduler } from "../scheduler/index.ts";
 import { createAnthropicAdapter } from "../llm/index.ts";
 import { startChatAgent, type ChatAgent } from "../agent/index.ts";
 import { buildMetaTools } from "../tools/meta.ts";
+import { createInbox, type Inbox } from "../inbox/index.ts";
 import { ulid } from "../id/index.ts";
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { eq } from "drizzle-orm";
@@ -30,7 +31,9 @@ export interface Daemon {
   readonly extensions: ExtensionHost;
   readonly ledger: Ledger;
   readonly scheduler: Scheduler;
+  readonly inbox: Inbox;
   readonly rootAgentId: string;
+  readonly rootPrincipalId: string;
   readonly chat?: ChatAgent;
   readonly chatAgentId?: string;
   shutdown(): Promise<void>;
@@ -46,12 +49,15 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   const hostId = ensureHostRow(store);
   const bus = createBus({ hostId, persist: persistToStore(store) });
 
-  // Root agent always exists — extensions register tasks against it
-  // even when the chat agent (which requires an API key) isn't running.
+  // Root principal + agent always exist — the root agent is the human's
+  // first-contact delegate, and extensions register tasks against it even
+  // when the chat agent (which requires an API key) isn't running.
+  const rootPrincipalId = ensurePrincipalRow(store, "root");
   const rootAgentId = ensureAgentRow(store, hostId, "root");
 
   const scheduler = createScheduler({ bus, store, hostId });
   scheduler.recoverLost();
+  const inbox = createInbox({ bus, store, hostId });
 
   ensureRepo(paths.extensionsDir);
   const extensions = createExtensionHost({
@@ -113,6 +119,8 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       extensions,
       coreTools,
       ledger,
+      inbox,
+      principalId: rootPrincipalId,
       system:
         "You are olle, a helpful assistant living inside OLL-E — a habitat " +
         "built for agents like you. Your job is to accomplish what the human " +
@@ -181,7 +189,9 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     extensions,
     ledger,
     scheduler,
+    inbox,
     rootAgentId,
+    rootPrincipalId,
     chat,
     chatAgentId,
     shutdown,
@@ -227,15 +237,31 @@ function ensureAgentRow(store: Store, hostId: string, name: string): string {
   const existing = store.select().from(tables.agents).where(eq(tables.agents.name, name)).all();
   if (existing.length > 0) return existing[0]!.id;
   const id = ulid();
+  // Root is the human's first-contact delegate; it may take operational and
+  // strategic actions without blocking. Vision-tier actions still escalate
+  // to the principal's inbox per the ask-up chain.
   store
     .insert(tables.agents)
     .values({
       id,
       name,
       hostId,
-      scope: { allowTiers: ["operational"] },
+      scope: { allowTiers: ["operational", "strategic"] },
       createdAt: Date.now(),
     })
+    .run();
+  return id;
+}
+
+function ensurePrincipalRow(store: Store, display: string): string {
+  const existing = store.raw
+    .query<{ id: string }, []>("SELECT id FROM principals LIMIT 1")
+    .get();
+  if (existing) return existing.id;
+  const id = ulid();
+  store
+    .insert(tables.principals)
+    .values({ id, display, channels: [], createdAt: Date.now() })
     .run();
   return id;
 }

@@ -92,7 +92,6 @@ const claudeCode: StarterTemplate = {
 // returns stdout. Useful when an agent wants to delegate a coding task
 // to a headless Claude Code session.
 
-import { z } from "zod";
 import { spawn } from "node:child_process";
 
 export function register(api) {
@@ -100,11 +99,16 @@ export function register(api) {
     name: "claude_code",
     description:
       "Run the claude CLI with a prompt inside a working directory and return its stdout. Useful for delegating code changes.",
-    parameters: z.object({
-      prompt: z.string().describe("prompt to pass to claude -p"),
-      cwd: z.string().describe("absolute path to the workspace"),
-      timeoutMs: z.number().optional(),
-    }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "prompt to pass to claude -p" },
+        cwd: { type: "string", description: "absolute path to the workspace" },
+        timeoutMs: { type: "number" },
+      },
+      required: ["prompt", "cwd"],
+      additionalProperties: false,
+    },
     execute: ({ prompt, cwd, timeoutMs }) =>
       new Promise((resolve, reject) => {
         const child = spawn("claude", ["-p", prompt], {
@@ -192,7 +196,6 @@ const discord: StarterTemplate = {
 //     Portal, else message.content arrives empty for non-DM, non-mention
 //     messages.
 
-import { z } from "zod";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -395,11 +398,16 @@ export function register(api: any) {
   api.registerTool({
     name: "discord_send",
     description: "Send a message to a Discord channel or thread. Set reply_to to attach a reply reference.",
-    parameters: z.object({
-      channel_id: z.string().describe("Discord channel or thread id"),
-      content: z.string().describe("Message content (plain text or markdown)"),
-      reply_to: z.string().optional().describe("Message id to reply to"),
-    }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: { type: "string", description: "Discord channel or thread id" },
+        content: { type: "string", description: "Message content (plain text or markdown)" },
+        reply_to: { type: "string", description: "Message id to reply to" },
+      },
+      required: ["channel_id", "content"],
+      additionalProperties: false,
+    },
     async execute({ channel_id, content, reply_to }: { channel_id: string; content: string; reply_to?: string }) {
       const body: Record<string, unknown> = { content };
       if (reply_to) body.message_reference = { message_id: reply_to };
@@ -414,11 +422,16 @@ export function register(api: any) {
   api.registerTool({
     name: "discord_react",
     description: "Add a reaction to a message. emoji is unicode (e.g. \\\"👍\\\") or custom \\\"name:id\\\".",
-    parameters: z.object({
-      channel_id: z.string(),
-      message_id: z.string(),
-      emoji: z.string(),
-    }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: { type: "string" },
+        message_id: { type: "string" },
+        emoji: { type: "string" },
+      },
+      required: ["channel_id", "message_id", "emoji"],
+      additionalProperties: false,
+    },
     async execute({ channel_id, message_id, emoji }: { channel_id: string; message_id: string; emoji: string }) {
       const enc = encodeURIComponent(emoji);
       await discordFetch(\`/channels/\${channel_id}/messages/\${message_id}/reactions/\${enc}/@me\`, {
@@ -431,12 +444,17 @@ export function register(api: any) {
   api.registerTool({
     name: "discord_fetch_context",
     description: "Fetch recent messages in a channel or thread — useful for building chat preamble before calling the chat agent.",
-    parameters: z.object({
-      channel_id: z.string(),
-      before: z.string().optional().describe("Message id; fetch messages before this"),
-      limit: z.number().min(1).max(100).default(20),
-    }),
-    async execute({ channel_id, before, limit }: { channel_id: string; before?: string; limit: number }) {
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: { type: "string" },
+        before: { type: "string", description: "Message id; fetch messages before this" },
+        limit: { type: "number", minimum: 1, maximum: 100, default: 20 },
+      },
+      required: ["channel_id"],
+      additionalProperties: false,
+    },
+    async execute({ channel_id, before, limit = 20 }: { channel_id: string; before?: string; limit?: number }) {
       const q = new URLSearchParams({ limit: String(limit) });
       if (before) q.set("before", before);
       const r = await discordFetch(\`/channels/\${channel_id}/messages?\${q}\`);
@@ -447,7 +465,12 @@ export function register(api: any) {
   api.registerTool({
     name: "discord_list_channels",
     description: "List channels the bot can see in a guild.",
-    parameters: z.object({ guild_id: z.string() }),
+    inputSchema: {
+      type: "object",
+      properties: { guild_id: { type: "string" } },
+      required: ["guild_id"],
+      additionalProperties: false,
+    },
     async execute({ guild_id }: { guild_id: string }) {
       const r = await discordFetch(\`/guilds/\${guild_id}/channels\`);
       return await r.json();
@@ -526,7 +549,6 @@ const github: StarterTemplate = {
 // http-webhook-trigger extension + a task that calls into this one when a
 // task actually needs inbound events.
 
-import { z } from "zod";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -566,13 +588,18 @@ export function register(api: any) {
   api.registerTool({
     name: "github_create_issue",
     description: "Open a new issue in a repo. Attach body, labels, assignees as needed.",
-    parameters: z.object({
-      repo: z.string().describe("owner/name, e.g. acme/api"),
-      title: z.string(),
-      body: z.string().optional(),
-      labels: z.array(z.string()).optional(),
-      assignees: z.array(z.string()).optional(),
-    }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "owner/name, e.g. acme/api" },
+        title: { type: "string" },
+        body: { type: "string" },
+        labels: { type: "array", items: { type: "string" } },
+        assignees: { type: "array", items: { type: "string" } },
+      },
+      required: ["repo", "title"],
+      additionalProperties: false,
+    },
     async execute({ repo, title, body, labels, assignees }: { repo: string; title: string; body?: string; labels?: string[]; assignees?: string[] }) {
       return await gh(\`/repos/\${repo}/issues\`, {
         method: "POST",
@@ -584,11 +611,16 @@ export function register(api: any) {
   api.registerTool({
     name: "github_add_comment",
     description: "Add a comment to an existing issue or PR.",
-    parameters: z.object({
-      repo: z.string(),
-      issue_number: z.number(),
-      body: z.string(),
-    }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        issue_number: { type: "number" },
+        body: { type: "string" },
+      },
+      required: ["repo", "issue_number", "body"],
+      additionalProperties: false,
+    },
     async execute({ repo, issue_number, body }: { repo: string; issue_number: number; body: string }) {
       return await gh(\`/repos/\${repo}/issues/\${issue_number}/comments\`, {
         method: "POST",
@@ -600,13 +632,18 @@ export function register(api: any) {
   api.registerTool({
     name: "github_list_issues",
     description: "List issues in a repo filtered by state/labels. Useful for dedup before opening new ones.",
-    parameters: z.object({
-      repo: z.string(),
-      state: z.enum(["open", "closed", "all"]).default("open"),
-      labels: z.string().optional().describe("comma-separated label names"),
-      per_page: z.number().min(1).max(100).default(30),
-    }),
-    async execute({ repo, state, labels, per_page }: { repo: string; state: string; labels?: string; per_page: number }) {
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        state: { type: "string", enum: ["open", "closed", "all"], default: "open" },
+        labels: { type: "string", description: "comma-separated label names" },
+        per_page: { type: "number", minimum: 1, maximum: 100, default: 30 },
+      },
+      required: ["repo"],
+      additionalProperties: false,
+    },
+    async execute({ repo, state = "open", labels, per_page = 30 }: { repo: string; state?: string; labels?: string; per_page?: number }) {
       const q = new URLSearchParams({ state, per_page: String(per_page) });
       if (labels) q.set("labels", labels);
       return await gh(\`/repos/\${repo}/issues?\${q}\`);
@@ -616,12 +653,17 @@ export function register(api: any) {
   api.registerTool({
     name: "github_close_issue",
     description: "Close an issue. Optional reason: completed or not_planned.",
-    parameters: z.object({
-      repo: z.string(),
-      issue_number: z.number(),
-      reason: z.enum(["completed", "not_planned"]).default("completed"),
-    }),
-    async execute({ repo, issue_number, reason }: { repo: string; issue_number: number; reason: string }) {
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        issue_number: { type: "number" },
+        reason: { type: "string", enum: ["completed", "not_planned"], default: "completed" },
+      },
+      required: ["repo", "issue_number"],
+      additionalProperties: false,
+    },
+    async execute({ repo, issue_number, reason = "completed" }: { repo: string; issue_number: number; reason?: string }) {
       return await gh(\`/repos/\${repo}/issues/\${issue_number}\`, {
         method: "PATCH",
         body: JSON.stringify({ state: "closed", state_reason: reason }),

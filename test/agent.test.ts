@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { z } from "zod";
 import { runAgent } from "../src/agent/runtime.ts";
 import type { Completion, CompletionRequest, ContentBlock, Llm } from "../src/llm/types.ts";
 import type { ToolDef } from "../src/extensions/types.ts";
@@ -71,7 +70,11 @@ describe("runAgent", () => {
     const echo: ToolDef<{ msg: string }, string> = {
       name: "echo",
       description: "echo",
-      parameters: z.object({ msg: z.string() }),
+      inputSchema: {
+        type: "object",
+        properties: { msg: { type: "string" } },
+        required: ["msg"],
+      },
       execute: (args) => `echoed:${args.msg}`,
     };
     const r = await runAgent({
@@ -101,7 +104,7 @@ describe("runAgent", () => {
     const boom: ToolDef<Record<string, never>, string> = {
       name: "boom",
       description: "throws",
-      parameters: z.object({}),
+      inputSchema: { type: "object", properties: {} },
       execute: () => {
         throw new Error("kaboom");
       },
@@ -124,7 +127,7 @@ describe("runAgent", () => {
     const noop: ToolDef<Record<string, never>, string> = {
       name: "noop",
       description: "noop",
-      parameters: z.object({}),
+      inputSchema: { type: "object", properties: {} },
       execute: () => "ok",
     };
     const r = await runAgent({
@@ -136,5 +139,119 @@ describe("runAgent", () => {
     });
     expect(r.stopReason).toBe("max_turns");
     expect(llm.calls).toHaveLength(3);
+  });
+
+  it("passes the tool's inputSchema verbatim into the LLM request", async () => {
+    const llm = mockLlm([endTurn("ok")]);
+    const schema = {
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "number" } },
+      required: ["a"],
+      additionalProperties: false,
+    };
+    const tool: ToolDef<{ a: string; b?: number }, string> = {
+      name: "t",
+      description: "t",
+      inputSchema: schema,
+      execute: () => "ok",
+    };
+    await runAgent({
+      llm,
+      toolCtx: ctx,
+      tools: [tool],
+      messages: [{ role: "user", content: "noop" }],
+    });
+    const spec = llm.calls[0]!.tools?.[0];
+    expect(spec?.name).toBe("t");
+    expect(spec?.inputSchema).toBe(schema);
+  });
+
+  it("runs the tool's validate() on LLM-emitted input before execute", async () => {
+    const llm = mockLlm([
+      toolUse("t1", "norm", { n: "  hi  " }),
+      endTurn("done"),
+    ]);
+    const seen: unknown[] = [];
+    const tool: ToolDef<{ n: string }, string> = {
+      name: "norm",
+      description: "normalize",
+      inputSchema: {
+        type: "object",
+        properties: { n: { type: "string" } },
+        required: ["n"],
+      },
+      validate(input) {
+        const { n } = input as { n: string };
+        return { n: n.trim() };
+      },
+      execute(args) {
+        seen.push(args);
+        return args.n;
+      },
+    };
+    await runAgent({
+      llm,
+      toolCtx: ctx,
+      tools: [tool],
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(seen).toEqual([{ n: "hi" }]);
+  });
+
+  it("passes input through unchanged when validate is absent", async () => {
+    const llm = mockLlm([
+      toolUse("t1", "raw", { anything: 42, nested: { x: 1 } }),
+      endTurn("done"),
+    ]);
+    const seen: unknown[] = [];
+    const tool: ToolDef<Record<string, unknown>, string> = {
+      name: "raw",
+      description: "passthrough",
+      inputSchema: { type: "object" },
+      execute(args) {
+        seen.push(args);
+        return "ok";
+      },
+    };
+    await runAgent({
+      llm,
+      toolCtx: ctx,
+      tools: [tool],
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(seen).toEqual([{ anything: 42, nested: { x: 1 } }]);
+  });
+
+  it("surfaces validate() errors as is_error tool_result blocks", async () => {
+    const llm = mockLlm([
+      toolUse("t1", "strict", { n: "nope" }),
+      endTurn("noted"),
+    ]);
+    const tool: ToolDef<{ n: number }, string> = {
+      name: "strict",
+      description: "validates",
+      inputSchema: {
+        type: "object",
+        properties: { n: { type: "number" } },
+        required: ["n"],
+      },
+      validate(input) {
+        const { n } = input as { n: unknown };
+        if (typeof n !== "number") throw new Error("n must be a number");
+        return { n };
+      },
+      execute: (args) => String(args.n),
+    };
+    const seen: string[] = [];
+    await runAgent({
+      llm,
+      toolCtx: ctx,
+      tools: [tool],
+      messages: [{ role: "user", content: "go" }],
+      onStep: (s) => {
+        if (s.kind === "tool_result") seen.push(`${s.isError}:${s.content}`);
+      },
+    });
+    expect(seen).toEqual(["true:n must be a number"]);
   });
 });

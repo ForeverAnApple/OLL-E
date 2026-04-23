@@ -103,7 +103,7 @@ Direct agent-authored task files (proposed via the inbox `register_task` action)
 
 ### Tool
 
-A typed callable capability: `{id, description, parameters (Zod), execute(args, ctx)}`. Tools may request permission gates (ctx.ask) and always carry attribution. Every tool call is logged.
+A typed callable capability: `{name, description, inputSchema (JSON Schema), validate?(input), execute(args, ctx)}`. The host↔extension boundary deliberately crosses plain data (JSON Schema) rather than a shared schema-library instance — extensions may author their `inputSchema` by hand or generate it from whichever library they prefer (Zod, Valibot, ArkType, etc.), keeping cross-module library identity out of the boundary. Tools may request permission gates (ctx.ask) and always carry attribution. Every tool call is logged.
 
 ### Store
 

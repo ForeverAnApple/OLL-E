@@ -7,14 +7,13 @@
 // subscribed event or a direct request.
 
 import type { ToolDef, ToolExecuteContext } from "../extensions/types.ts";
-import {
-  zodToJsonSchema,
-  type CompletionRequest,
-  type ContentBlock,
-  type Llm,
-  type Message,
-  type ToolSpec,
-  type Usage,
+import type {
+  CompletionRequest,
+  ContentBlock,
+  Llm,
+  Message,
+  ToolSpec,
+  Usage,
 } from "../llm/index.ts";
 
 export interface AgentRunOptions {
@@ -29,6 +28,15 @@ export interface AgentRunOptions {
   temperature?: number;
   /** Hook for streaming step visibility into the event bus. */
   onStep?: (step: AgentStep) => void;
+  /** Permission gate. Called before every tool.execute. Returning
+   *  `{ ok: false, reason }` surfaces the reason to the model as an
+   *  is_error tool_result and (if provided) onDenied fires so the caller
+   *  can post a grant_scope proposal. Omit to allow all. */
+  authorize?: (tool: ToolDef) => { ok: true } | { ok: false; reason: string };
+  /** Side-effect hook fired on a denied call. Caller uses this to drop a
+   *  grant_scope proposal on the inbox per the vision "constraints feel
+   *  like physics" clause. */
+  onDenied?: (info: { tool: ToolDef; reason: string; input: unknown }) => void;
 }
 
 export type AgentStep =
@@ -105,8 +113,29 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
         opts.onStep?.({ kind: "tool_result", id: block.id, name: block.name, content: msg, isError: true });
         continue;
       }
+      if (opts.authorize) {
+        const gate = opts.authorize(tool);
+        if (!gate.ok) {
+          const msg = `permission denied: ${gate.reason}`;
+          opts.onDenied?.({ tool, reason: gate.reason, input: block.input });
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: msg,
+            is_error: true,
+          });
+          opts.onStep?.({
+            kind: "tool_result",
+            id: block.id,
+            name: block.name,
+            content: msg,
+            isError: true,
+          });
+          continue;
+        }
+      }
       try {
-        const args = tool.parameters.parse(block.input);
+        const args = tool.validate ? tool.validate(block.input) : block.input;
         const result = await tool.execute(args, opts.toolCtx);
         const rendered = typeof result === "string" ? result : JSON.stringify(result);
         toolResults.push({ type: "tool_result", tool_use_id: block.id, content: rendered });
@@ -133,6 +162,6 @@ function toToolSpec(t: ToolDef): ToolSpec {
   return {
     name: t.name,
     description: t.description,
-    inputSchema: zodToJsonSchema(t.parameters),
+    inputSchema: t.inputSchema,
   };
 }

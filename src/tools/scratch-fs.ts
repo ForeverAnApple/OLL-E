@@ -12,7 +12,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
-import { z } from "zod";
 import type { ToolDef } from "../extensions/types.ts";
 
 export interface ScratchOptions {
@@ -47,14 +46,27 @@ export function buildScratchTools(opts: ScratchOptions): ToolDef[] {
   const readTool: ToolDef<{ path: string }, string> = {
     name: "scratch_read",
     description: "Read a text file from the task's scratch directory.",
-    parameters: z.object({ path: z.string() }),
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      additionalProperties: false,
+    },
     execute: ({ path }) => readFileSync(safeResolve(base, path), "utf8"),
   };
 
   const writeTool: ToolDef<{ path: string; content: string }, string> = {
     name: "scratch_write",
     description: "Write a text file into the task's scratch directory; creates parents.",
-    parameters: z.object({ path: z.string(), content: z.string() }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" },
+      },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
     execute: ({ path, content }) => {
       const abs = safeResolve(base, path);
       mkdirSync(dirname(abs), { recursive: true });
@@ -66,7 +78,11 @@ export function buildScratchTools(opts: ScratchOptions): ToolDef[] {
   const listTool: ToolDef<{ path?: string }, string[]> = {
     name: "scratch_list",
     description: "List entries in a scratch subdirectory.",
-    parameters: z.object({ path: z.string().optional() }),
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      additionalProperties: false,
+    },
     execute: ({ path = "." }) => {
       const abs = safeResolve(base, path);
       if (!existsSync(abs)) return [];
@@ -83,7 +99,12 @@ export function buildScratchTools(opts: ScratchOptions): ToolDef[] {
   const deleteTool: ToolDef<{ path: string }, string> = {
     name: "scratch_delete",
     description: "Delete a file or subdir under the task's scratch dir.",
-    parameters: z.object({ path: z.string() }),
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      additionalProperties: false,
+    },
     execute: ({ path }) => {
       const abs = safeResolve(base, path);
       rmSync(abs, { recursive: true, force: true });

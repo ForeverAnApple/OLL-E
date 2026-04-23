@@ -12,6 +12,11 @@ import type { Ledger } from "../ledger/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
 import type { Llm, Message } from "../llm/index.ts";
 import type { ToolDef } from "../extensions/types.ts";
+import { askUp, type Inbox } from "../inbox/index.ts";
+import { checkTool } from "../permissions/index.ts";
+import type { AgentScope } from "../store/schema.ts";
+import { tables } from "../store/index.ts";
+import { eq } from "drizzle-orm";
 import { runAgent, type AgentStep } from "./runtime.ts";
 
 export interface ChatAgentOptions {
@@ -29,8 +34,11 @@ export interface ChatAgentOptions {
   coreTools?: ToolDef[];
   /** Optional ledger for spend accounting. */
   ledger?: Ledger;
-  /** Principal id for budget enforcement. */
+  /** Principal id for budget enforcement + inbox routing on denied calls. */
   principalId?: string;
+  /** Inbox used when a tool call is denied by scope — we auto-propose a
+   *  grant_scope via askUp. Omit to just return the denial to the model. */
+  inbox?: Inbox;
   /** Model override. */
   model?: string;
 }
@@ -76,6 +84,8 @@ export function startChatAgent(opts: ChatAgentOptions): ChatAgent {
 
     try {
       const tools = collectTools(opts);
+      const scope = loadAgentScope(opts.store, opts.agentId);
+      const grantProposed = new Set<string>();
       const result = await runAgent({
         llm: opts.llm,
         model: opts.model,
@@ -90,6 +100,43 @@ export function startChatAgent(opts: ChatAgentOptions): ChatAgent {
         },
         messages: session.messages,
         onStep: (step) => emitStep(opts, session!.id, ev, step),
+        authorize: (tool) =>
+          checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),
+        onDenied: ({ tool, reason }) => {
+          opts.bus.publish({
+            type: "tool.denied",
+            hostId: opts.hostId,
+            actorId: opts.agentId,
+            parentEventId: ev.id,
+            durable: true,
+            payload: {
+              sessionId: session!.id,
+              tool: tool.name,
+              tier: tool.tier ?? "operational",
+              reason,
+            },
+          });
+          // Debounce: one grant_scope proposal per tool per session turn.
+          if (!opts.inbox || !opts.principalId) return;
+          if (grantProposed.has(tool.name)) return;
+          grantProposed.add(tool.name);
+          askUp(
+            { bus: opts.bus, store: opts.store, hostId: opts.hostId, inbox: opts.inbox },
+            {
+              proposingAgentId: opts.agentId,
+              principalId: opts.principalId,
+              tier: "strategic",
+              summary: `grant ${opts.agentId} permission to call ${tool.name}`,
+              payload: {
+                action: "grant_scope",
+                agentId: opts.agentId,
+                tool: tool.name,
+                tier: tool.tier ?? "operational",
+                reason,
+              },
+            },
+          );
+        },
       });
       session.messages = result.messages;
       if (opts.ledger && result.totalUsage.totalTokens > 0) {
@@ -141,6 +188,11 @@ function collectTools(opts: ChatAgentOptions): ToolDef[] {
     for (const { tool } of opts.extensions.tools()) tools.push(tool);
   }
   return tools;
+}
+
+function loadAgentScope(store: Store, agentId: string): AgentScope {
+  const row = store.select().from(tables.agents).where(eq(tables.agents.id, agentId)).all()[0];
+  return (row?.scope as AgentScope) ?? {};
 }
 
 function emitStep(

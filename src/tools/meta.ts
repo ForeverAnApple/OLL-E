@@ -11,7 +11,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { z } from "zod";
 import type { ExtensionHost, ToolDef } from "../extensions/index.ts";
 import {
   commitSubtree,
@@ -38,13 +37,22 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     { commit: string | null }
   > = {
     name: "write_extension",
+    tier: "strategic",
     description:
       "Write files into an extension directory and git-commit the subtree. Files is a map of relative path → content. Creates the extension dir if needed.",
-    parameters: z.object({
-      name: z.string(),
-      files: z.record(z.string(), z.string()),
-      commitMessage: z.string().optional(),
-    }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        files: {
+          type: "object",
+          additionalProperties: { type: "string" },
+        },
+        commitMessage: { type: "string" },
+      },
+      required: ["name", "files"],
+      additionalProperties: false,
+    },
     execute: async ({ name, files, commitMessage }) => {
       if (!/^[a-z0-9][a-z0-9-_]*$/.test(name)) {
         throw new Error(`write_extension: invalid name "${name}"`);
@@ -77,8 +85,14 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
 
   const runSmoke: ToolDef<{ name: string }, { ok: true } | { ok: false; error: string }> = {
     name: "run_smoke_test",
+    tier: "operational",
     description: "Run an extension's smoke test without activating it.",
-    parameters: z.object({ name: z.string() }),
+    inputSchema: {
+      type: "object",
+      properties: { name: { type: "string" } },
+      required: ["name"],
+      additionalProperties: false,
+    },
     execute: async ({ name }) => {
       const smokePath = join(extensionsDir, name, "smoke.ts");
       if (!existsSync(smokePath)) return { ok: true } as const;
@@ -103,8 +117,14 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     { status: string; failures: number }
   > = {
     name: "register_extension",
+    tier: "strategic",
     description: "Load (or reload) a named extension. Smoke gate runs first.",
-    parameters: z.object({ name: z.string() }),
+    inputSchema: {
+      type: "object",
+      properties: { name: { type: "string" } },
+      required: ["name"],
+      additionalProperties: false,
+    },
     execute: async ({ name }) => {
       const existing = extensions.get(name);
       const ext = existing ? await extensions.reload(name) : await extensions.load(name);
@@ -117,8 +137,17 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     { commit: string | null; status: string }
   > = {
     name: "revert_extension",
+    tier: "strategic",
     description: "Revert an extension to a prior git sha and reload it.",
-    parameters: z.object({ name: z.string(), sha: z.string() }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        sha: { type: "string" },
+      },
+      required: ["name", "sha"],
+      additionalProperties: false,
+    },
     execute: async ({ name, sha }) => {
       const commit = revertSubtree(extensionsDir, name, sha, authorName);
       const ext = await extensions.reload(name);
@@ -131,15 +160,25 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     Array<{ sha: string; author: string; date: number; subject: string }>
   > = {
     name: "extension_history",
+    tier: "operational",
     description: "List recent commits touching the given extension.",
-    parameters: z.object({ name: z.string(), limit: z.number().optional() }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        limit: { type: "number" },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
     execute: async ({ name, limit }) => gitHistory(extensionsDir, name, limit ?? 20),
   };
 
   const listStartersT: ToolDef<Record<string, never>, Array<{ name: string; description: string }>> = {
     name: "list_starters",
+    tier: "operational",
     description: "List the starter extension templates shipped with the binary.",
-    parameters: z.object({}),
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
     execute: async () => listStarters().map(({ name, description }) => ({ name, description })),
   };
 
@@ -148,9 +187,18 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     { name: string; filesWritten: number; alreadyExisted: boolean; commit: string | null }
   > = {
     name: "install_starter",
+    tier: "strategic",
     description:
       "Copy a named starter template into the extensions directory and git-commit it. Does not register.",
-    parameters: z.object({ name: z.string(), overwrite: z.boolean().optional() }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        overwrite: { type: "boolean" },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
     execute: async ({ name, overwrite }) => {
       const r = installStarter({
         name,
