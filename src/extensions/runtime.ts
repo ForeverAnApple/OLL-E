@@ -99,6 +99,9 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   const loaded = new Map<string, LoadedExtension>();
   const subs = new Map<string, Unsubscribe[]>();
   const toolsByExt = new Map<string, RegisteredToolEntry[]>();
+  // Name→entry index so collision checks and cross-extension callTool
+  // resolution are O(1). Kept in sync with toolsByExt.
+  const toolsByName = new Map<string, RegisteredToolEntry>();
   const triggersByExt = new Map<string, RegisteredTriggerEntry[]>();
   const tasksByExt = new Map<string, RegisteredTaskEntry[]>();
   const failureLog = new Map<string, number[]>();
@@ -171,30 +174,15 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     unsubs: Unsubscribe[];
   } {
     const unsubs: Unsubscribe[] = [];
-    const resolved: Record<string, string> = {};
-    if (manifest.secrets && opts.secrets) {
-      for (const s of manifest.secrets) {
-        const v = opts.secrets(s, manifest.name);
-        if (v != null) resolved[s] = v;
-      }
-    }
+    const resolved = resolveManifestSecrets(manifest);
     const scratchDir = join(extDir, ".scratch");
     mkdirSync(scratchDir, { recursive: true });
 
-    // Fresh resolver for this extension's own secrets; captured into each
-    // tool entry so cross-extension callTool sees target's secrets, never
-    // caller's. Re-reads from opts.secrets on each call so rotation
-    // eventually propagates without a full extension reload.
-    const resolveOwnSecrets = (): Record<string, string> => {
-      const out: Record<string, string> = {};
-      if (manifest.secrets && opts.secrets) {
-        for (const s of manifest.secrets) {
-          const v = opts.secrets(s, manifest.name);
-          if (v != null) out[s] = v;
-        }
-      }
-      return out;
-    };
+    // Fresh resolver captured into each tool entry so cross-extension
+    // callTool sees target's own secrets, never the caller's. Re-reads
+    // from opts.secrets on each call so rotation eventually propagates
+    // without a full extension reload.
+    const resolveOwnSecrets = () => resolveManifestSecrets(manifest);
 
     const callerAllowlist = new Set(manifest.callsTools ?? []);
     const callerName = manifest.name;
@@ -209,34 +197,29 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       registerTool(tool) {
         let list = toolsByExt.get(extensionId);
         if (!list) toolsByExt.set(extensionId, (list = []));
-        // Warn on name collision across extensions — callTool walks
-        // toolsByExt by name and returns first match, so duplicates
-        // create a routing ambiguity the caller can't see.
-        for (const [otherId, entries] of toolsByExt) {
-          if (otherId === extensionId) continue;
-          for (const e of entries) {
-            if (e.tool.name === tool.name) {
-              console.warn(
-                `[extensions] tool name "${tool.name}" registered by both "${e.extensionName}" and "${callerName}" — callTool resolution is ambiguous`,
-              );
-            }
-          }
+        const prior = toolsByName.get(tool.name);
+        if (prior && prior.extensionId !== extensionId) {
+          console.warn(
+            `[extensions] tool name "${tool.name}" registered by both "${prior.extensionName}" and "${callerName}" — callTool resolution is ambiguous`,
+          );
         }
-        // Defense against stale / malformed extensions: LLM vendors
-        // reject tool specs without a JSON Schema. If an extension
-        // forgets inputSchema (or ships an old zod-based shape), fall
-        // back to an empty-object schema and warn loudly. Better to
-        // expose a broken tool than to 400 every chat turn.
-        const guarded: typeof tool =
-          tool.inputSchema && typeof tool.inputSchema === "object"
-            ? tool
-            : (() => {
-                console.warn(
-                  `[extensions] tool "${tool.name}" from "${callerName}" has no inputSchema — defaulting to { type: "object" }; please update the extension to declare a JSON Schema`,
-                );
-                return { ...tool, inputSchema: { type: "object" } };
-              })();
-        list.push({ extensionId, extensionName: callerName, tool: guarded, resolveSecrets: resolveOwnSecrets });
+        // LLM vendors reject tool specs without a JSON Schema; fall back
+        // to an empty-object schema rather than 400 every chat turn.
+        let guarded = tool;
+        if (!tool.inputSchema || typeof tool.inputSchema !== "object") {
+          console.warn(
+            `[extensions] tool "${tool.name}" from "${callerName}" has no inputSchema — defaulting to { type: "object" }; please update the extension to declare a JSON Schema`,
+          );
+          guarded = { ...tool, inputSchema: { type: "object" } };
+        }
+        const entry: RegisteredToolEntry = {
+          extensionId,
+          extensionName: callerName,
+          tool: guarded,
+          resolveSecrets: resolveOwnSecrets,
+        };
+        list.push(entry);
+        toolsByName.set(tool.name, entry);
       },
       registerTrigger(trigger) {
         let list = triggersByExt.get(extensionId);
@@ -322,16 +305,8 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
             `extensions: "${callerName}" cannot callTool("${name}") — add it to manifest.callsTools`,
           );
         }
-        // Gate 2: tool exists. Walk all registered tools; first name
-        // match wins. Collisions already warned at registerTool time.
-        let target: RegisteredToolEntry | undefined;
-        for (const list of toolsByExt.values()) {
-          const hit = list.find((e) => e.tool.name === name);
-          if (hit) {
-            target = hit;
-            break;
-          }
-        }
+        // Gate 2: tool exists. Collisions already warned at registerTool.
+        const target = toolsByName.get(name);
         if (!target) {
           throw new Error(`extensions: callTool("${name}") — tool not registered`);
         }
@@ -447,17 +422,9 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
           actorId: extensionId,
           durable: true,
         });
-      const resolved: Record<string, string> = {};
-      if (manifest.secrets && opts.secrets) {
-        for (const s of manifest.secrets) {
-          const v = opts.secrets(s, manifest.name);
-          if (v != null) resolved[s] = v;
-        }
-      }
+      const resolved = resolveManifestSecrets(manifest);
       await entry.trigger.start(emit, { hostId: opts.hostId, extensionId, secrets: resolved });
       entry.stop = entry.trigger.stop?.bind(entry.trigger);
-      // store reference for stop
-      // (already mutated entry in place)
       void extDir; // keep for future scratch paths
     }
   }
@@ -516,14 +483,23 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     if (!record) return;
     for (const un of subs.get(name) ?? []) un();
     subs.delete(name);
-    for (const entry of triggersByExt.get(record.id) ?? []) {
-      if (entry.stop) await entry.stop();
-    }
+    // Stop triggers in parallel — a hung stop on one trigger shouldn't
+    // block the rest (e.g. Discord gateway + poll on the same extension).
+    await Promise.allSettled(
+      (triggersByExt.get(record.id) ?? []).map((e) => (e.stop ? e.stop() : undefined)),
+    );
     for (const entry of tasksByExt.get(record.id) ?? []) {
       try {
         entry.unregister();
       } catch {
         /* best-effort */
+      }
+    }
+    for (const entry of toolsByExt.get(record.id) ?? []) {
+      // Only evict if we still own the name — a reload races register
+      // before unload, so a newer entry may have taken the slot.
+      if (toolsByName.get(entry.tool.name) === entry) {
+        toolsByName.delete(entry.tool.name);
       }
     }
     tasksByExt.delete(record.id);

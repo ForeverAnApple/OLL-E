@@ -16,6 +16,7 @@ import { buildMetaTools } from "../tools/meta.ts";
 import { createInbox, type Inbox } from "../inbox/index.ts";
 import { ulid } from "../id/index.ts";
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 
 export interface StartDaemonOptions {
@@ -266,10 +267,8 @@ function checkNotRunning(paths: OllePaths): void {
 }
 
 function ensureHostRow(store: Store): string {
-  const existing = store.raw
-    .query<{ id: string }, []>("SELECT id FROM hosts LIMIT 1")
-    .get();
-  if (existing) return existing.id;
+  const existing = store.select().from(tables.hosts).limit(1).all();
+  if (existing.length > 0) return existing[0]!.id;
   const id = ulid();
   store
     .insert(tables.hosts)
@@ -303,10 +302,9 @@ function ensureAgentRow(store: Store, hostId: string, name: string): string {
 }
 
 function ensurePrincipalRow(store: Store, display: string): string {
-  const existing = store.raw
-    .query<{ id: string }, []>("SELECT id FROM principals LIMIT 1")
-    .get();
-  if (existing) return existing.id;
+  // v0 is single-principal: pick the first row if any, otherwise seed one.
+  const existing = store.select().from(tables.principals).limit(1).all();
+  if (existing.length > 0) return existing[0]!.id;
   const id = ulid();
   store
     .insert(tables.principals)
@@ -317,10 +315,7 @@ function ensurePrincipalRow(store: Store, display: string): string {
 
 function readSecret(secretsDir: string, name: string): string | undefined {
   try {
-    const fs = require("node:fs") as typeof import("node:fs");
-    const p = require("node:path").join(secretsDir, name) as string;
-    if (!fs.existsSync(p)) return process.env[name];
-    return fs.readFileSync(p, "utf8").trim();
+    return readFileSync(join(secretsDir, name), "utf8").trim();
   } catch {
     return process.env[name];
   }

@@ -80,15 +80,10 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
     });
 
   function persistTask(task: TaskDef): void {
-    // Idempotent: skip if a row with this id already exists. Tests share
-    // task ids across rigs; production wires unique ulids.
+    // Idempotent: onConflictDoNothing handles both re-registrations and
+    // shared task ids across test rigs. Outer try swallows FK misses in
+    // tests where agent rows aren't seeded.
     try {
-      const existing = opts.store
-        .select()
-        .from(tables.tasks)
-        .where(eq(tables.tasks.id, task.id))
-        .all();
-      if (existing.length > 0) return;
       opts.store
         .insert(tables.tasks)
         .values({
@@ -101,6 +96,7 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
           tokenEst: task.tokenEst ?? 0,
           createdAt: Date.now(),
         })
+        .onConflictDoNothing()
         .run();
     } catch {
       /* FK miss in test scaffolding — ignore */
@@ -262,12 +258,12 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
         )
         .all();
       if (stale.length === 0) return 0;
+      opts.store
+        .update(tables.taskRuns)
+        .set({ status: "lost", endedAt: nowMs, error: "daemon restart" })
+        .where(and(eq(tables.taskRuns.hostId, opts.hostId), eq(tables.taskRuns.status, "running")))
+        .run();
       for (const r of stale) {
-        opts.store
-          .update(tables.taskRuns)
-          .set({ status: "lost", endedAt: nowMs, error: "daemon restart" })
-          .where(eq(tables.taskRuns.id, r.id))
-          .run();
         opts.bus.publish({
           type: `task.${r.taskId}.failed`,
           payload: { taskId: r.taskId, runId: r.id, eventId: r.eventId, error: "lost" },

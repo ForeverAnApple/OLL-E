@@ -93,6 +93,14 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
     }
 
     const toolResults: ContentBlock[] = [];
+    const pushResult = (id: string, name: string, content: string, isError: boolean) => {
+      toolResults.push(
+        isError
+          ? { type: "tool_result", tool_use_id: id, content, is_error: true }
+          : { type: "tool_result", tool_use_id: id, content },
+      );
+      opts.onStep?.({ kind: "tool_result", id, name, content, isError });
+    };
     for (const block of completion.content) {
       if (block.type !== "tool_use") continue;
       opts.onStep?.({
@@ -103,34 +111,14 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
       });
       const tool = toolByName.get(block.name);
       if (!tool) {
-        const msg = `unknown tool: ${block.name}`;
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: msg,
-          is_error: true,
-        });
-        opts.onStep?.({ kind: "tool_result", id: block.id, name: block.name, content: msg, isError: true });
+        pushResult(block.id, block.name, `unknown tool: ${block.name}`, true);
         continue;
       }
       if (opts.authorize) {
         const gate = opts.authorize(tool);
         if (!gate.ok) {
-          const msg = `permission denied: ${gate.reason}`;
           opts.onDenied?.({ tool, reason: gate.reason, input: block.input });
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: msg,
-            is_error: true,
-          });
-          opts.onStep?.({
-            kind: "tool_result",
-            id: block.id,
-            name: block.name,
-            content: msg,
-            isError: true,
-          });
+          pushResult(block.id, block.name, `permission denied: ${gate.reason}`, true);
           continue;
         }
       }
@@ -138,18 +126,10 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
         const args = tool.validate ? tool.validate(block.input) : block.input;
         const result = await tool.execute(args, opts.toolCtx);
         const rendered = typeof result === "string" ? result : JSON.stringify(result);
-        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: rendered });
-        opts.onStep?.({
-          kind: "tool_result",
-          id: block.id,
-          name: block.name,
-          content: rendered,
-          isError: false,
-        });
+        pushResult(block.id, block.name, rendered, false);
       } catch (err) {
         const msg = (err as Error).message ?? String(err);
-        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: msg, is_error: true });
-        opts.onStep?.({ kind: "tool_result", id: block.id, name: block.name, content: msg, isError: true });
+        pushResult(block.id, block.name, msg, true);
       }
     }
     messages.push({ role: "user", content: toolResults });
