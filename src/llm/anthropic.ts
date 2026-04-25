@@ -23,15 +23,24 @@ export interface AnthropicAdapterOptions {
   pricePerMTokOut?: number;
   /** Inject a client for tests. */
   client?: Anthropic;
+  /**
+   * How many times the SDK retries transient errors (408/409/429/5xx)
+   * before throwing. Default 8 — sustained overload windows can run
+   * a couple minutes; the agent should ride them out, not crash.
+   */
+  maxRetries?: number;
 }
 
 export const DEFAULT_MODEL = "claude-opus-4-7";
+const DEFAULT_MAX_RETRIES = 8;
 
 export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm {
+  const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
   const client =
     opts.client ??
     new Anthropic({
       apiKey: opts.apiKey ?? process.env.ANTHROPIC_API_KEY,
+      maxRetries,
     });
 
   return {
@@ -39,14 +48,19 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
     defaultModel: opts.model ?? DEFAULT_MODEL,
 
     async complete(req: CompletionRequest): Promise<Completion> {
-      const resp = await client.messages.create({
-        model: req.model,
-        max_tokens: req.maxTokens,
-        temperature: req.temperature,
-        system: buildSystem(req.system),
-        messages: req.messages.map(toAnthropicMessage),
-        tools: req.tools?.length ? req.tools.map(toAnthropicTool) : undefined,
-      } as Anthropic.Messages.MessageCreateParamsNonStreaming);
+      let resp: Anthropic.Messages.Message;
+      try {
+        resp = await client.messages.create({
+          model: req.model,
+          max_tokens: req.maxTokens,
+          temperature: req.temperature,
+          system: buildSystem(req.system),
+          messages: req.messages.map(toAnthropicMessage),
+          tools: req.tools?.length ? req.tools.map(toAnthropicTool) : undefined,
+        } as Anthropic.Messages.MessageCreateParamsNonStreaming);
+      } catch (err) {
+        throw rewrapTransient(err, maxRetries);
+      }
 
       const content: ContentBlock[] = resp.content.map(fromAnthropicBlock);
       const usage: Usage = {
@@ -64,6 +78,35 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
       };
     },
   };
+}
+
+/**
+ * After the SDK has burned its retry budget on a transient error, the
+ * raw `APIError` surfaces as a stack-shaped string in chat. Translate
+ * the common transient codes into a clean Error message so the agent
+ * (and any human watching the thread) reads it as "API was busy" not
+ * "the runtime crashed".
+ */
+function rewrapTransient(err: unknown, maxRetries: number): Error {
+  if (err instanceof Anthropic.APIError) {
+    const status = err.status;
+    if (status === 529 || status === 503) {
+      return new Error(
+        `Anthropic API overloaded (HTTP ${status}) after ${maxRetries} retries — try again shortly`,
+      );
+    }
+    if (status === 429) {
+      return new Error(
+        `Anthropic rate limit hit (HTTP 429) after ${maxRetries} retries — back off and retry`,
+      );
+    }
+    if (status && status >= 500) {
+      return new Error(
+        `Anthropic server error (HTTP ${status}) after ${maxRetries} retries: ${err.message}`,
+      );
+    }
+  }
+  return err instanceof Error ? err : new Error(String(err));
 }
 
 function buildSystem(

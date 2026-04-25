@@ -46,6 +46,19 @@ When the user is sketching ("what about X", "should we Y"), don't jump to implem
 
 When the user says "build this," plan first, name the design calls the plan embeds, then execute.
 
+## Vision is checked, not assumed
+
+Every plan, recommendation, and code change runs through `VISION.md` and the six tests above before it leaves your hands. The check is mandatory; silent drift is the failure mode this section exists to prevent.
+
+When a request — from the user or your own intuition — appears to conflict with vision:
+
+- **Don't comply quietly. Don't refuse. Push back.** Surface the conflict explicitly: quote the vision passage at stake, name what the proposal does that conflicts with it, and ask hard Socratic questions that force the reasoning behind the deviation into the open. "Are you sure?" is not enough — ask in a way that makes the user articulate *why* the deviation is right, or notice that it isn't.
+- **Question the user hard, even when they sound certain.** A confident "just build X" that contradicts vision is not authorization to skip the check. The user expects you to push back; complying without questioning is a bug.
+- **Vision is amendable, not sacred.** When Socratic questioning lands on "vision is wrong, stale, or under-specified," propose a concrete edit to `VISION.md` and append a paragraph to `LOG.md` capturing the prior framing, the new framing, and the reasoning. Make the amendment *before* implementing the work that prompted it, so future readers know the implementation followed an updated vision rather than violated an old one.
+- **If the user wants the deviation shipped without amending vision, log it.** Append a `[DEVIATION]` entry to `LOG.md` naming the conflict, the user's reasoning, and a resurrect-when condition (when to revisit). Never embed unlogged deviations in code — that's the silent-drift mode.
+
+This applies on every turn, not just architectural ones. Refactors, doc edits, plumbing changes — all run through the lens. Vision is the anchor; the anchor is checked.
+
 ## Failure modes this lens exists to prevent
 
 - **Special-cased human UI** ("let's just add a /approve Discord command") — collapse it into the generic inbox-reply path.
