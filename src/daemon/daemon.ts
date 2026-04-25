@@ -13,6 +13,7 @@ import {
   type AgentManager,
 } from "../agent/index.ts";
 import { buildMetaTools } from "../tools/meta.ts";
+import { buildObservabilityTools } from "../tools/observability.ts";
 import {
   buildMemoryTools,
   startMemoryProjector,
@@ -153,6 +154,10 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         agentManager,
       }),
       ...buildMemoryTools({ bus, store, hostId }),
+      // World legibility — agents read their own ledger, runs, threads,
+      // budget, and self-state through these. Same query layer the CLI
+      // uses (no privileged human read surface).
+      ...buildObservabilityTools({ store }),
     ];
     // Children inherit the same tool set so they can themselves spawn,
     // read extension files, etc. Scope still gates what they get to use.
@@ -183,6 +188,11 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         "conversation; never block a human waiting for a slow task, delegate. " +
         "Mailbox awareness: the sidebar each turn shows your active threads; " +
         "call mail_list for a durable view (e.g. to check on children's progress). " +
+        "Self-audit: query_my_usage / query_my_budget / query_my_runs / " +
+        "query_my_threads / query_self / query_events let you read your own " +
+        "world — token cost, cache hit rate, recent failures, your own scope " +
+        "and tools. When something feels off, look first; when caching seems " +
+        "wasteful, propose a strategy revision through the inbox. " +
         "Be concise.",
     });
     agentManager.register(chatAgentId, chat);
