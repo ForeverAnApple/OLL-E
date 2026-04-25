@@ -135,7 +135,9 @@ decisions     (id, principal_id, proposing_agent_id, tier, summary, payload, sta
 approvals     (decision_id, actor_id, vote, message, at)     -- for quorum/ask-up chains
 
 budgets       (id, principal_id, agent_id, period, cap_tokens, cap_usd, spent, updated_at)
-ledger        (id, hlc, host_id, actor_id, provider, model, tokens, usd, tool_call_id)
+ledger        (id, hlc, host_id, actor_id, thread_id, provider, model,
+               input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tool_call_id)
+              -- tokens-only by design (LOG 2026-04-24); USD is computed from current prices
 
 memories      (id, hlc, host_id, actor_id, scope, title, body_md, tags)  -- scope ∈ {private,team,scratch}
 memory_reads  (memory_id, reader_actor_id, at)
@@ -199,11 +201,38 @@ Agents never block waiting. Every inbox-originated task continues other work whi
 
 ## Budget and token ledger
 
-Budget is owned by **principals**. Principals allocate portions to **agents**. Every LLM call and paid tool operation writes a `ledger` row and decrements `budgets.spent`. Thresholds (80%, 100%) auto-post inbox items. Exceeding cap → agent pauses spending, continues non-paid work.
+Budget is owned by **principals**. Principals allocate portions to **agents**. Every LLM call (and, eventually, paid tool operation) writes a `ledger` row carrying token counts. Thresholds (80%, 100%) auto-post inbox items. Exceeding cap → agent pauses spending, continues non-paid work.
 
 Budget allocation (raising cap, creating new allocation) is always an inbox decision — never self-authorized by the agent.
 
-Ledger is keyed `(principal_id, agent_id, provider, model, period)` so team-level or mesh-level rollups in v1+ are schema-free.
+**Tokens-only ledger; USD as derivation** (LOG 2026-04-24). Ledger rows store `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, and `thread_id`. They do **not** store USD. Per-row USD would be a snapshot at insert time — provider prices change, snapshots rot, and an agent reading its own ledger would see false physics. The physical unit is tokens; USD is computed from current prices via `src/llm/pricing.ts`, which is the single source of truth and gets updated when providers change rates.
+
+Budgets stay USD-denominated because principals back them with real money. The asymmetry resolves at decrement time: the ledger module computes USD via `priceTokens(model, usage)` and accumulates into `budgets.spent_usd`, snapshotting USD into the *budget* (one number per agent×period) instead of every ledger row. The cap-comparison stays meaningful even when prices later shift; agents see cost as physics; nobody is lying to anybody.
+
+Ledger is keyed `(principal_id, agent_id, provider, model, period)` so team-level or mesh-level rollups in v1+ are schema-free; the new `(actor_id, at)` and `(thread_id, at)` indexes serve the observability layer.
+
+## Caching
+
+Prompt caching is on by default through the Anthropic adapter (`src/llm/anthropic.ts`). Four ephemeral cache breakpoints, all dumb-but-effective:
+
+- **Stable system segments** — caller passes a `SystemSegment[]` and marks which segments get `cache_control`. The chat loop uses this form to keep the stable identity + principles cached while the volatile mailbox sidebar sits *after* the breakpoint and never invalidates the prefix.
+- **Last tool** — caches the entire tools block as one unit. Tools change less often than the conversation.
+- **Last user message** — caches the conversation prefix through that point. Subsequent turns' append-only growth reads through the cache.
+
+Strategy lives in core for v0; revisions flow through the standard propose-up loop (agent observes inefficiency in its own ledger via `query_my_usage`, files an inbox proposal, ask-up chain reaches the principal who edits the strategy and ships a new binary). A hot-loadable cache-strategy extension is `[DEFERRED-to-v0.1]` until enough proposals to justify the abstraction land.
+
+Self-modification thrashes the cache by design — when an agent rewrites its identity or principles, the prefix invalidates. Intra-thread hit rates will be high; cross-self-modification rates lower. That's the cost of being a habitat where inhabitants reshape themselves.
+
+## Observability
+
+`src/observability/` exports six pure query functions: `usageStats`, `budgetStatus`, `runHistory`, `threadInventory`, `agentSelf`, `recentEvents`. Both surfaces below call into this layer, so they see the same numbers.
+
+- **Agent-callable core tools** (`src/tools/observability.ts`): `query_my_usage`, `query_my_budget`, `query_my_runs`, `query_my_threads`, `query_self`, `query_events`. Defaults are scoped to the calling agent (`ctx.actorId`) so vague queries never leak unrelated data.
+- **CLI subcommands** (`src/cli/run.ts`): `olle stats`, `olle cache`, `olle runs`, `olle threads`, `olle events`, `olle inspect agent <id>`. Thin wrappers over the same `observability.*` IPC methods.
+
+**Rule (AGENTS.md vision-check):** every CLI command has a parallel core tool. The CLI is the human's tool surface, parallel to an agent's tool surface — never a privileged read path. "Humans are events" governs the write side; the analogous read-side rule is "no privileged human dashboard."
+
+Cache fields ride on `chat.usage` and `chat.turn-end` event payloads turn-by-turn so subscribers (CLI tail, future bridges, downstream observability dashboards) see cache stats live without polling the ledger.
 
 ## Memory tiers
 
@@ -238,11 +267,13 @@ The unified flow for adding capabilities — channels, tools, trigger types, any
 ### Core bundle (shipped in binary, not an extension)
 
 - LLM provider adapters (Anthropic, OpenAI) via API key config
+- Pricing config (`src/llm/pricing.ts`) — single source of truth for token prices, USD computed on read
 - Store / event bus / scheduler
 - Decision-inbox router
 - CLI chat handler (channel-of-first-contact)
 - Scratch filesystem tool
 - Meta-tools: `write-extension`, `run-smoke-test`, `register-extension`, `revert-extension`
+- Observability tools: `query_my_usage`, `query_my_budget`, `query_my_runs`, `query_my_threads`, `query_self`, `query_events` — agents read their own world; CLI uses the same query layer
 
 ### Starter templates (shipped read-only; agents clone and modify)
 
@@ -315,10 +346,18 @@ olle extension list|history|revert|disable|enable
 olle secret set|list|remove
 olle budget show|set
 
+# Observability — same query layer agents use via query_my_*
+olle stats   [--agent X] [--thread X] [--since 1h]   # token + USD rollup
+olle cache   [--agent X] [--thread X] [--since 1h]   # cache hit ratio rollup
+olle runs    [--agent X] [--status X] [--since 1h]   # task_run history
+olle threads [--agent X] [--limit N]                 # threads per mailbox
+olle events  [--agent X] [--type T] [--thread X]     # one-shot event query
+olle inspect agent <id>                              # agent identity surface
+
 olle upgrade                # pull new binary, run migrations
 ```
 
-All commands are thin RPC wrappers over the daemon's IPC endpoint.
+All commands are thin RPC wrappers over the daemon's IPC endpoint. Every observability subcommand has a parallel agent-callable core tool — the CLI is the human's tool surface, never a privileged read path.
 
 ## Safety and observability
 
