@@ -8,7 +8,7 @@
 // as spawn_agent fires. Killing an agent stops its loop but leaves the
 // agents row intact so history (parent chain, past events) stays auditable.
 
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import type { EventBus } from "../bus/index.ts";
 import type { Store } from "../store/db.ts";
 import type { Ledger } from "../ledger/index.ts";
@@ -19,6 +19,7 @@ import type { ToolDef } from "../extensions/types.ts";
 import type { AgentScope } from "../store/schema.ts";
 import { tables } from "../store/index.ts";
 import { ulid } from "../id/index.ts";
+import { MEMORY_WROTE, type MemoryScope, type MemoryWrotePayload } from "../memory/events.ts";
 import { narrowsScope } from "../permissions/index.ts";
 import { startAgentLoop, type AgentLoop } from "./chat.ts";
 
@@ -66,6 +67,13 @@ export interface SpawnOptions {
    *  (e.g. root DMing a human is thread X, spawns a researcher for X),
    *  link back so observers can correlate. */
   parentThreadId?: string;
+  /** Optional additional memory ids on the parent to seed into the
+   *  child alongside the auto-passed principles. Only memories the
+   *  parent actually owns (actor_id == parentAgentId) are passed;
+   *  others are silently skipped. Use for specialized spawns where
+   *  a particular skill / knowledge / goal memory should travel with
+   *  the child at birth. Principles auto-pass regardless. */
+  seedMemoryIds?: string[];
 }
 
 export interface SpawnResult {
@@ -168,6 +176,21 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
         createdAt: Date.now(),
       })
       .run();
+
+    // Cultural pass-on (LOG 2026-04-24): every role=principle memory the
+    // parent owns lands in the child's private memory at birth with
+    // attribution preserved. `seedMemoryIds` augments with specialized
+    // non-principle seeds (skill/knowledge/goal). These arrive *before*
+    // the child's loop starts draining its mailbox so its first turn
+    // sees the inherited principles injected via the SOUL path.
+    passOnCulture({
+      store: deps.store,
+      bus: deps.bus,
+      hostId: deps.hostId,
+      parentAgentId: opts.parentAgentId,
+      childId,
+      extraMemoryIds: opts.seedMemoryIds ?? [],
+    });
 
     const threadId = opts.threadId ?? ulid();
 
@@ -327,4 +350,82 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
 // the manager itself in the emitted event.
 function agentFromCall(): string | undefined {
   return undefined;
+}
+
+interface PassOnArgs {
+  store: Store;
+  bus: EventBus;
+  hostId: string;
+  parentAgentId: string;
+  childId: string;
+  extraMemoryIds: string[];
+}
+
+/** Cultural pass-on: emit memory.wrote events so the parent's
+ *  principles (plus any explicit extras) land as seeds in the child's
+ *  private memory. Attribution: actor_id=childId (it's the child's
+ *  identity now), authored_by=parentId, seeded_from=<parent memory id>.
+ *  Depth preserved — a strict parent produces strict-by-default children
+ *  without compounding weight up the lineage. */
+function passOnCulture(args: PassOnArgs): void {
+  const { store, bus, hostId, parentAgentId, childId, extraMemoryIds } = args;
+  // Auto-pass: every role=principle memory the parent owns in private
+  // scope. We don't propagate team/scratch — team is peer evidence, not
+  // inheritance; scratch is task-ephemeral.
+  const autoSeeds = store
+    .select()
+    .from(tables.memories)
+    .where(
+      and(
+        eq(tables.memories.actorId, parentAgentId),
+        eq(tables.memories.scope, "private"),
+        eq(tables.memories.role, "principle"),
+      ),
+    )
+    .all();
+
+  const extras =
+    extraMemoryIds.length > 0
+      ? store
+          .select()
+          .from(tables.memories)
+          .where(
+            and(
+              eq(tables.memories.actorId, parentAgentId),
+              inArray(tables.memories.id, extraMemoryIds),
+            ),
+          )
+          .all()
+      : [];
+
+  const seen = new Set<string>();
+  const seeds = [...autoSeeds, ...extras].filter((m) => {
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
+
+  for (const seed of seeds) {
+    const newId = ulid();
+    const payload: MemoryWrotePayload = {
+      id: newId,
+      actorId: childId,
+      scope: "private" as MemoryScope,
+      scopeRef: childId,
+      role: seed.role,
+      title: seed.title,
+      bodyMd: seed.bodyMd,
+      tags: (seed.tags as string[]) ?? [],
+      depth: seed.depth,
+      authoredBy: parentAgentId,
+      seededFrom: seed.id,
+    };
+    bus.publish({
+      type: MEMORY_WROTE,
+      hostId,
+      actorId: parentAgentId,
+      durable: true,
+      payload,
+    });
+  }
 }

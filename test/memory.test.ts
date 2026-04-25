@@ -34,10 +34,12 @@ function makeCtx(actorId: string, hostId: string) {
   };
 }
 
-function getTool(tools: ReturnType<typeof buildMemoryTools>, name: string) {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type LooseTool = { name: string; execute: (args: any, ctx: any) => Promise<any> };
+function getTool(tools: ReturnType<typeof buildMemoryTools>, name: string): LooseTool {
   const t = tools.find((x) => x.name === name);
   if (!t) throw new Error(`tool missing: ${name}`);
-  return t;
+  return t as unknown as LooseTool;
 }
 
 describe("memory projector", () => {
@@ -300,8 +302,8 @@ describe("memory tools", () => {
       { title: "bob secret", bodyMd: "mine too", role: "knowledge" },
       makeCtx("bob", s.hostId),
     );
-    const aHits = await search.execute({}, makeCtx("alice", s.hostId));
-    const bHits = await search.execute({}, makeCtx("bob", s.hostId));
+    const aHits: Array<{ title: string }> = await search.execute({}, makeCtx("alice", s.hostId));
+    const bHits: Array<{ title: string }> = await search.execute({}, makeCtx("bob", s.hostId));
     expect(aHits.map((h) => h.title)).toEqual(["alice secret"]);
     expect(bHits.map((h) => h.title)).toEqual(["bob secret"]);
     s.stop();

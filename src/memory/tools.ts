@@ -446,5 +446,112 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
     },
   };
 
-  return [write, read, search, promote, forget];
+  interface LineageArgs {
+    /** Filter to a specific posture. Default: `principle`. */
+    role?: string;
+    /** Max hops up the parent chain. Default: unlimited. */
+    depth?: number;
+    /** Stop at (and include) this many matching memories. Default 50. */
+    limit?: number;
+  }
+
+  interface LineageHit {
+    id: string;
+    actorId: string;
+    hopsFromCaller: number;
+    role: string;
+    title: string;
+    bodyMd: string;
+    depth: number;
+  }
+
+  const lineage: ToolDef<LineageArgs, LineageHit[]> = {
+    name: "memory_lineage",
+    tier: "operational",
+    description:
+      "Walk up your parent chain and surface ancestors' live memories for a given role (default: principle). This is the 'passive read access to the parent's ongoing culture' half of the pass-on model — seed principles are copied into your private memory at birth, but ancestors keep writing, and this tool lets you see what they're currently committed to. Read-only; emits memory.read per hit for audit. Respects strictly-solo private — ancestors' private memories are NEVER returned; only memories they've promoted to team (where you're a fellow member) appear. Use when you're weighing evidence you received against what the lineage holds; use memory_search first if you want to check your own seeded copies.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        role: { type: "string", description: "Posture filter; default `principle`." },
+        depth: {
+          type: "number",
+          description: "Max hops up the parent chain (ancestors). Omit for unlimited.",
+        },
+        limit: { type: "number", description: "Max matching memories returned. Default 50." },
+      },
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const role = args.role ?? "principle";
+      const limit = Math.max(1, Math.min(args.limit ?? 50, 200));
+      const maxHops =
+        args.depth != null && Number.isFinite(args.depth) ? Math.max(0, Math.floor(args.depth)) : Infinity;
+
+      // Walk up parent_agent_id from the caller. Guard against cycles
+      // (shouldn't happen — agents row parent_agent_id is immutable at
+      // spawn — but cheap to enforce).
+      const ancestors: Array<{ id: string; hops: number }> = [];
+      const seen = new Set<string>([ctx.actorId]);
+      let cursor: string | null = ctx.actorId;
+      let hops = 0;
+      while (cursor && hops < maxHops) {
+        const row: { parent: string | null } | undefined = store
+          .select({ parent: tables.agents.parentAgentId })
+          .from(tables.agents)
+          .where(eq(tables.agents.id, cursor))
+          .all()[0];
+        if (!row || !row.parent) break;
+        if (seen.has(row.parent)) break;
+        seen.add(row.parent);
+        hops += 1;
+        ancestors.push({ id: row.parent, hops });
+        cursor = row.parent;
+      }
+      if (ancestors.length === 0) return [];
+
+      // One query per ancestor keeps the result order deterministic by
+      // hops-ascending (near-lineage before far). Private memories from
+      // the ancestor are excluded at query time — strictly-solo holds.
+      const hits: LineageHit[] = [];
+      for (const anc of ancestors) {
+        if (hits.length >= limit) break;
+        const rows = store
+          .select()
+          .from(tables.memories)
+          .where(and(eq(tables.memories.actorId, anc.id), eq(tables.memories.role, role)))
+          .orderBy(desc(tables.memories.depth))
+          .all();
+        for (const row of rows) {
+          if (hits.length >= limit) break;
+          const scope = row.scope as MemoryScope;
+          if (scope === "private") continue; // strictly-solo — never leaked up
+          if (scope === "scratch") continue; // task-ephemeral, not culture
+          if (scope === "team") {
+            if (!row.scopeRef) continue;
+            if (!isTeamMember(row.scopeRef, ctx.actorId)) continue;
+          }
+          hits.push({
+            id: row.id,
+            actorId: row.actorId,
+            hopsFromCaller: anc.hops,
+            role: row.role,
+            title: row.title,
+            bodyMd: row.bodyMd,
+            depth: row.depth,
+          });
+          bus.publish({
+            type: MEMORY_READ,
+            hostId,
+            actorId: ctx.actorId,
+            durable: true,
+            payload: { id: row.id, readerActorId: ctx.actorId },
+          });
+        }
+      }
+      return hits;
+    },
+  };
+
+  return [write, read, search, promote, forget, lineage];
 }
