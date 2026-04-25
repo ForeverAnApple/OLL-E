@@ -12,6 +12,7 @@ import type {
   ContentBlock,
   Llm,
   Message,
+  RetryInfo,
   SystemSegment,
   ToolSpec,
   Usage,
@@ -46,9 +47,11 @@ export interface AgentRunOptions {
 
 export type AgentStep =
   | { kind: "assistant"; content: ContentBlock[] }
+  | { kind: "assistant_delta"; text: string }
   | { kind: "tool_use"; id: string; name: string; input: Record<string, unknown> }
   | { kind: "tool_result"; id: string; name: string; content: string; isError: boolean }
-  | { kind: "usage"; usage: Usage };
+  | { kind: "usage"; usage: Usage }
+  | { kind: "retry"; info: RetryInfo };
 
 export interface AgentResult {
   messages: Message[];
@@ -81,6 +84,8 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
       temperature: opts.temperature,
     };
     if (toolSpecs && toolSpecs.length > 0) req.tools = toolSpecs;
+    req.onRetry = (info) => opts.onStep?.({ kind: "retry", info });
+    req.onTextDelta = (delta) => opts.onStep?.({ kind: "assistant_delta", text: delta });
     const completion = await opts.llm.complete(req);
     total.inputTokens += completion.usage.inputTokens;
     total.outputTokens += completion.usage.outputTokens;

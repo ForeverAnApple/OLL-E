@@ -45,6 +45,18 @@ export interface SystemSegment {
   cache?: "ephemeral";
 }
 
+export interface RetryInfo {
+  /** 1-indexed attempt that just failed (so retry #1 means the first call
+   *  errored and we're about to make a second). */
+  attempt: number;
+  /** HTTP status if the failure was an APIError. */
+  status?: number;
+  /** Wall-clock ms we'll sleep before the next attempt. */
+  waitMs: number;
+  /** Provider/error message, for display. */
+  message?: string;
+}
+
 export interface CompletionRequest {
   model: string;
   /** Either a single string (the whole system prompt; cached as one block)
@@ -54,6 +66,16 @@ export interface CompletionRequest {
   tools?: ToolSpec[];
   maxTokens: number;
   temperature?: number;
+  /** Fired by the adapter when a transient failure (overload, rate limit,
+   *  5xx) is about to be retried. Lets the surrounding loop emit a visible
+   *  "API busy, retrying..." status so the user sees the agent waiting on
+   *  physics rather than crashing. */
+  onRetry?: (info: RetryInfo) => void;
+  /** Fired with each text delta as it streams in from the provider. The
+   *  adapter still returns the assembled Completion; this is purely a
+   *  visibility hook for surfaces (CLI, future bridges) that want to
+   *  render tokens as they arrive instead of waiting for the full block. */
+  onTextDelta?: (delta: string) => void;
 }
 
 export interface Usage {

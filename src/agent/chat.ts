@@ -442,6 +442,11 @@ function emitStep(
       .map((b) => b.text)
       .join("");
     if (text) {
+      // Authoritative full-text event — durable, persisted, and what
+      // memory/observability subscribers reconstruct conversations from.
+      // Streaming consumers (CLI) prefer chat.assistant-delta and ignore
+      // this; non-streaming consumers (history snapshots) get the whole
+      // block here in one shot.
       opts.bus.publish({
         type: "chat.assistant-text",
         hostId: opts.hostId,
@@ -452,6 +457,20 @@ function emitStep(
         payload: { text },
       });
     }
+  } else if (step.kind === "assistant_delta") {
+    if (!step.text) return;
+    // Live token-by-token feed for surfaces that want to render
+    // progressively. Marked non-durable: deltas are visualization, not
+    // history. The full chat.assistant-text below is the canonical record.
+    opts.bus.publish({
+      type: "chat.assistant-delta",
+      hostId: opts.hostId,
+      actorId: opts.agentId,
+      parentEventId: origin.id,
+      threadId,
+      durable: false,
+      payload: { text: step.text },
+    });
   } else if (step.kind === "tool_use") {
     const fields = redactions.get(step.name);
     const input = fields ? redactInput(step.input, fields) : step.input;
@@ -491,6 +510,19 @@ function emitStep(
       threadId,
       durable: false,
       payload: { ...step.usage },
+    });
+  } else if (step.kind === "retry") {
+    // Surface adapter-level transient retries (overload, rate limit, 5xx)
+    // so the UI can render "API busy, waiting…" instead of leaving the
+    // user staring at an unmoving prompt while the SDK rides it out.
+    opts.bus.publish({
+      type: "chat.api-retry",
+      hostId: opts.hostId,
+      actorId: opts.agentId,
+      parentEventId: origin.id,
+      threadId,
+      durable: false,
+      payload: { ...step.info },
     });
   }
 }

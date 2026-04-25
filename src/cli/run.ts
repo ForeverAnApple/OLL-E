@@ -312,26 +312,47 @@ async function cmdChat(): Promise<void> {
   const threadId = `cli:${Math.random().toString(36).slice(2, 10)}`;
   const sub = client.stream("tail", { type: "*" });
 
+  const ui = createChatUI({ agentId: rootAgentId, threadId });
+  ui.banner();
+
   let turnBusy = false;
   let prompt = () => undefined as void;
+
   (async () => {
     for await (const ev of sub.events) {
       if (ev.threadId !== threadId) continue;
-      const p = ev.payload as { text?: string; name?: string; input?: unknown; error?: string };
-      if (ev.type === "chat.assistant-text") {
-        process.stdout.write(p.text ?? "");
+      const p = ev.payload as Record<string, unknown>;
+      if (ev.type === "chat.assistant-delta") {
+        ui.assistantDelta(String(p.text ?? ""));
+      } else if (ev.type === "chat.assistant-text") {
+        // Authoritative full text arrives after the deltas finish. We've
+        // already streamed it; just close the assistant block so the next
+        // tool/turn-end lands cleanly.
+        ui.assistantClose();
       } else if (ev.type === "chat.tool-call") {
-        process.stdout.write(`\n[tool] ${p.name}(${JSON.stringify(p.input)})\n`);
+        ui.toolCall(String(p.name ?? "?"), p.input);
       } else if (ev.type === "chat.tool-result") {
-        const payload = ev.payload as { isError?: boolean; content?: string };
-        const tag = payload.isError ? "tool-error" : "tool-ok";
-        process.stdout.write(`[${tag}] ${payload.content}\n`);
+        ui.toolResult(String(p.content ?? ""), Boolean(p.isError));
+      } else if (ev.type === "chat.api-retry") {
+        ui.retry({
+          attempt: numFrom(p.attempt),
+          status: typeof p.status === "number" ? p.status : undefined,
+          waitMs: numFrom(p.waitMs),
+          message: typeof p.message === "string" ? p.message : undefined,
+        });
       } else if (ev.type === "chat.turn-end") {
-        process.stdout.write("\n");
+        ui.turnEnd({
+          inputTokens: numFrom(p.inputTokens),
+          outputTokens: numFrom(p.outputTokens),
+          cacheReadTokens: numFrom(p.cacheReadTokens),
+          cacheCreationTokens: numFrom(p.cacheCreationTokens),
+          usdMicros: numFrom(p.usdMicros),
+          stopReason: String(p.stopReason ?? ""),
+        });
         turnBusy = false;
         prompt();
       } else if (ev.type === "chat.error") {
-        process.stderr.write(`\n[error] ${p.error}\n`);
+        ui.error(String(p.error ?? ""));
         turnBusy = false;
         prompt();
       }
@@ -351,7 +372,7 @@ async function cmdChat(): Promise<void> {
   });
   prompt = () => {
     if (turnBusy) return;
-    rl.setPrompt("> ");
+    rl.setPrompt(ui.promptString());
     rl.prompt();
   };
   prompt();
@@ -366,6 +387,7 @@ async function cmdChat(): Promise<void> {
       return;
     }
     turnBusy = true;
+    ui.afterUserInput();
     await client.call("publish", {
       type: "chat.input",
       payload: { text },
@@ -376,6 +398,232 @@ async function cmdChat(): Promise<void> {
     });
   });
   rl.on("close", stop);
+}
+
+function numFrom(v: unknown): number {
+  return typeof v === "number" ? v : 0;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Chat UI — light ANSI dressing for `olle chat`. No TUI framework, no
+// alternate screen; just a vocabulary of styled lines so the agent's
+// turn structure is legible. Inspiration taken from pi-mono's interactive
+// mode (role headers, dim tool execution, footer status line) without
+// pulling in the framework that drives them.
+// ───────────────────────────────────────────────────────────────────────
+
+const ANSI = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  yellow: "\x1b[33m",
+  cyan: "\x1b[36m",
+  gray: "\x1b[90m",
+};
+
+function color(code: string, s: string): string {
+  // Skip styling when stdout is piped — keeps `olle chat | tee` clean.
+  if (!process.stdout.isTTY) return s;
+  return `${code}${s}${ANSI.reset}`;
+}
+
+function termWidth(): number {
+  const w = process.stdout.columns;
+  return w && w > 20 ? w : 80;
+}
+
+function shortAgent(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-3)}` : id;
+}
+
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+function formatUsd(usdMicros: number): string {
+  const usd = usdMicros / 1_000_000;
+  if (usd < 0.001) return `$${usd.toFixed(5)}`;
+  if (usd < 1) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+function summarizeInput(input: unknown): string {
+  let s: string;
+  try {
+    s = typeof input === "string" ? input : JSON.stringify(input);
+  } catch {
+    s = String(input);
+  }
+  const max = Math.max(20, termWidth() - 16);
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+function summarizeResult(content: string): string {
+  const oneLine = content.replace(/\s+/g, " ").trim();
+  const max = Math.max(20, termWidth() - 8);
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
+/** Visible length, ignoring ANSI escape sequences. */
+function visibleLen(s: string): number {
+  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+interface ChatUIOpts {
+  agentId: string;
+  threadId: string;
+}
+
+function createChatUI(opts: ChatUIOpts) {
+  const out = process.stdout;
+  // Track open assistant block so consecutive deltas/chunks land under
+  // one "◆ olle" header instead of restamping it each time. Also tracks
+  // whether the last byte we wrote ended on a newline — important for
+  // streaming deltas, which can arrive mid-line and need a leading "  "
+  // indent only at the start of a fresh line.
+  let assistantOpen = false;
+  let atLineStart = true;
+
+  function ensureAssistantHeader(): void {
+    if (assistantOpen) return;
+    out.write(color(`${ANSI.bold}${ANSI.cyan}`, "◆ olle") + "\n");
+    out.write("  "); // first-line indent
+    assistantOpen = true;
+    atLineStart = false;
+  }
+
+  function closeAssistant(): void {
+    if (!assistantOpen) return;
+    if (!atLineStart) out.write("\n");
+    assistantOpen = false;
+    atLineStart = true;
+    out.write("\n");
+  }
+
+  function padLine(s: string, w: number): string {
+    return s + " ".repeat(Math.max(0, w - visibleLen(s)));
+  }
+
+  return {
+    banner(): void {
+      const w = Math.min(72, termWidth());
+      const inner = w - 2;
+      const top = color(ANSI.cyan, `╭${"─".repeat(inner)}╮`);
+      const bot = color(ANSI.cyan, `╰${"─".repeat(inner)}╯`);
+      const side = color(ANSI.cyan, "│");
+      const title = `${ANSI.bold}olle chat${ANSI.reset}`;
+      const meta = `${color(ANSI.dim, "agent")} ${shortAgent(opts.agentId)}  ${color(ANSI.dim, "thread")} ${opts.threadId}`;
+      const hint = color(ANSI.dim, "/exit to quit · Ctrl-C to interrupt");
+      const row = (s: string) => `${side} ${padLine(s, inner - 2)} ${side}\n`;
+      out.write(`${top}\n`);
+      out.write(row(title));
+      out.write(row(meta));
+      out.write(row(hint));
+      out.write(`${bot}\n\n`);
+    },
+
+    promptString(): string {
+      return color(`${ANSI.bold}${ANSI.cyan}`, "❯ ");
+    },
+
+    /** Called right after the user submits a line. Readline already
+     *  echoed the input next to the prompt, so we just drop a separator
+     *  before the assistant block lands. */
+    afterUserInput(): void {
+      out.write("\n");
+    },
+
+    /** Stream a chunk of assistant text. Maintains a running "is the
+     *  cursor at the start of a fresh line?" so we only emit the "  "
+     *  indent at line breaks — important when the model emits a single
+     *  word at a time. */
+    assistantDelta(text: string): void {
+      if (!text) return;
+      ensureAssistantHeader();
+      // Walk the chunk char-by-char on newlines so multi-line deltas
+      // get re-indented; everything else writes through unchanged.
+      const parts = text.split("\n");
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i]!;
+        if (atLineStart && part.length > 0) {
+          out.write("  ");
+          atLineStart = false;
+        }
+        if (part.length > 0) out.write(part);
+        if (i < parts.length - 1) {
+          out.write("\n");
+          atLineStart = true;
+        }
+      }
+    },
+
+    /** Called when the authoritative chat.assistant-text arrives — the
+     *  stream is done, flush any trailing newline + visual gap. */
+    assistantClose(): void {
+      closeAssistant();
+    },
+
+    toolCall(name: string, input: unknown): void {
+      closeAssistant();
+      const head = color(ANSI.gray, "  ⏵ ");
+      const body = color(ANSI.dim, `${name}(${summarizeInput(input)})`);
+      out.write(`${head}${body}\n`);
+    },
+
+    toolResult(content: string, isError: boolean): void {
+      closeAssistant();
+      const c = isError ? ANSI.red : ANSI.gray;
+      const bodyColor = isError ? ANSI.red : ANSI.dim;
+      const head = color(c, "  ⏷ ");
+      const body = color(bodyColor, summarizeResult(content) || "(empty)");
+      out.write(`${head}${body}\n`);
+    },
+
+    retry(info: { attempt: number; status?: number; waitMs: number; message?: string }): void {
+      closeAssistant();
+      const waitS = (info.waitMs / 1000).toFixed(1);
+      const statusStr = info.status ? ` HTTP ${info.status}` : "";
+      const reason =
+        info.status === 529 || info.status === 503
+          ? "API overloaded"
+          : info.status === 429
+            ? "rate limited"
+            : "API hiccup";
+      const line = `  ⟳ ${reason}${statusStr} — retrying in ${waitS}s (attempt ${info.attempt + 1})`;
+      out.write(color(ANSI.yellow, line) + "\n");
+    },
+
+    error(msg: string): void {
+      closeAssistant();
+      out.write(color(ANSI.red, `  ⚠ ${msg}`) + "\n\n");
+    },
+
+    turnEnd(stats: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+      usdMicros: number;
+      stopReason: string;
+    }): void {
+      closeAssistant();
+      const parts: string[] = [];
+      if (stats.inputTokens) parts.push(`↑${formatTokens(stats.inputTokens)}`);
+      if (stats.outputTokens) parts.push(`↓${formatTokens(stats.outputTokens)}`);
+      if (stats.cacheReadTokens) parts.push(`R${formatTokens(stats.cacheReadTokens)}`);
+      if (stats.cacheCreationTokens) parts.push(`W${formatTokens(stats.cacheCreationTokens)}`);
+      if (stats.usdMicros) parts.push(formatUsd(stats.usdMicros));
+      if (stats.stopReason && stats.stopReason !== "end_turn") parts.push(stats.stopReason);
+      const inner = parts.length ? `  ${parts.join("  ")}  ` : "  · ";
+      const w = termWidth();
+      const tail = "─".repeat(Math.max(2, w - inner.length - 2));
+      out.write(color(ANSI.dim, `─${inner}${tail}`) + "\n");
+    },
+  };
 }
 
 // --- Observability subcommands. All wrap the same observability.* IPC

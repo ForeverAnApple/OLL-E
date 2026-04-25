@@ -32,6 +32,7 @@ import type {
   ContentBlock,
   Llm,
   Message,
+  RetryInfo,
   SystemSegment,
   ToolSpec,
   Usage,
@@ -43,30 +44,47 @@ export interface AnthropicAdapterOptions {
   model?: string;
   /** Inject a client for tests. */
   client?: Anthropic;
+  /** How many transient-failure retries we'll attempt before giving up.
+   *  Default 12, which with the capped backoff below buys ~5–6 minutes
+   *  of ride-out — enough to coast through Anthropic's typical overload
+   *  windows without surfacing a crash to the user. */
+  maxRetries?: number;
+  /** Initial backoff in ms (doubled with jitter on each retry). */
+  retryInitialMs?: number;
+  /** Cap on per-retry sleep. Backoff plateaus here so we don't sit idle
+   *  for minutes on a single attempt. */
+  retryMaxMs?: number;
+  /** Override the sleeper (tests inject a synchronous one). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export const DEFAULT_MODEL = "claude-opus-4-7";
+const DEFAULT_MAX_RETRIES = 12;
+const DEFAULT_RETRY_INITIAL_MS = 1000;
+const DEFAULT_RETRY_MAX_MS = 30_000;
 
 export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm {
+  // We own the retry loop; disable the SDK's so the two layers don't compound.
   const client =
     opts.client ??
     new Anthropic({
       apiKey: opts.apiKey ?? process.env.ANTHROPIC_API_KEY,
+      maxRetries: 0,
     });
+  const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
+  const initialMs = opts.retryInitialMs ?? DEFAULT_RETRY_INITIAL_MS;
+  const maxMs = opts.retryMaxMs ?? DEFAULT_RETRY_MAX_MS;
+  const sleep = opts.sleep ?? defaultSleep;
 
   return {
     provider: "anthropic",
     defaultModel: opts.model ?? DEFAULT_MODEL,
 
     async complete(req: CompletionRequest): Promise<Completion> {
-      const resp = await client.messages.create({
-        model: req.model,
-        max_tokens: req.maxTokens,
-        temperature: req.temperature,
-        system: buildSystem(req.system),
-        messages: buildMessages(req.messages),
-        tools: req.tools?.length ? buildTools(req.tools) : undefined,
-      } as Anthropic.Messages.MessageCreateParamsNonStreaming);
+      const resp = await callWithRetry(
+        () => runStream(client, req),
+        { maxRetries, initialMs, maxMs, sleep, onRetry: req.onRetry },
+      );
 
       const content: ContentBlock[] = resp.content.map(fromAnthropicBlock);
       const cacheRead = readCacheField(resp.usage, "cache_read_input_tokens");
@@ -93,6 +111,41 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
       };
     },
   };
+}
+
+/**
+ * Stream a completion. The SDK's streaming surface still returns the
+ * fully assembled message at the end (`finalMessage()`), so we pipe
+ * text deltas to `onTextDelta` for live UI and then return the same
+ * non-streaming-shaped response the adapter would otherwise build.
+ *
+ * Why always stream, even if no one's listening? It keeps the request
+ * path single-shaped (one HTTP path, one place where transient errors
+ * surface), and the cost of streaming when no delta callback is set is
+ * essentially zero — we just discard the deltas.
+ */
+async function runStream(
+  client: Anthropic,
+  req: CompletionRequest,
+): Promise<Anthropic.Messages.Message> {
+  const stream = client.messages.stream({
+    model: req.model,
+    max_tokens: req.maxTokens,
+    temperature: req.temperature,
+    system: buildSystem(req.system),
+    messages: buildMessages(req.messages),
+    tools: req.tools?.length ? buildTools(req.tools) : undefined,
+  } as Anthropic.Messages.MessageCreateParamsStreaming);
+  if (req.onTextDelta) {
+    stream.on("text", (delta: string) => {
+      try {
+        req.onTextDelta?.(delta);
+      } catch {
+        // A misbehaving subscriber must not blow up the LLM call.
+      }
+    });
+  }
+  return await stream.finalMessage();
 }
 
 function buildSystem(
@@ -244,4 +297,77 @@ function readCacheField(
 ): number {
   const raw = (usage as unknown as Record<string, unknown>)[field];
   return typeof raw === "number" ? raw : 0;
+}
+
+interface RetryOpts {
+  maxRetries: number;
+  initialMs: number;
+  maxMs: number;
+  sleep: (ms: number) => Promise<void>;
+  onRetry?: (info: RetryInfo) => void;
+}
+
+/**
+ * Retries `fn` on transient Anthropic failures (overload, rate limit, 5xx)
+ * with exponential backoff capped at `maxMs`. Surfaces every retry through
+ * the optional `onRetry` so the surrounding loop can show "API busy" status
+ * instead of letting the user stare at a frozen prompt.
+ *
+ * Non-transient errors (4xx other than 408/409/429) bypass retry entirely.
+ * On exhaustion we rewrap the last error into a clean message — the raw
+ * APIError's stack-shaped string is hostile in chat output.
+ */
+async function callWithRetry<T>(fn: () => Promise<T>, opts: RetryOpts): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= opts.maxRetries + 1; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransient(err) || attempt > opts.maxRetries) break;
+      // Decorrelated jitter: pick uniformly in [initial, prev*3], cap at maxMs.
+      // Smooths the herd if many requests hit overload at once.
+      const base = Math.min(opts.maxMs, opts.initialMs * 2 ** (attempt - 1));
+      const waitMs = Math.min(opts.maxMs, opts.initialMs + Math.random() * base);
+      const status = err instanceof Anthropic.APIError ? err.status : undefined;
+      const message =
+        err instanceof Error ? err.message : typeof err === "string" ? err : undefined;
+      opts.onRetry?.({ attempt, status, waitMs, message });
+      await opts.sleep(waitMs);
+    }
+  }
+  throw rewrapTransient(lastErr, opts.maxRetries);
+}
+
+function isTransient(err: unknown): boolean {
+  if (!(err instanceof Anthropic.APIError)) return false;
+  const s = err.status;
+  if (!s) return true; // network-level failure with no HTTP status — worth retrying
+  return s === 408 || s === 409 || s === 429 || s >= 500;
+}
+
+function rewrapTransient(err: unknown, maxRetries: number): Error {
+  if (err instanceof Anthropic.APIError) {
+    const s = err.status;
+    if (s === 529 || s === 503) {
+      return new Error(
+        `Anthropic API overloaded (HTTP ${s}) after ${maxRetries} retries — try again shortly`,
+      );
+    }
+    if (s === 429) {
+      return new Error(
+        `Anthropic rate limit hit (HTTP 429) after ${maxRetries} retries — back off and retry`,
+      );
+    }
+    if (s && s >= 500) {
+      return new Error(
+        `Anthropic server error (HTTP ${s}) after ${maxRetries} retries: ${err.message}`,
+      );
+    }
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
