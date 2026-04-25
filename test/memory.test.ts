@@ -755,8 +755,13 @@ describe("principle injection", () => {
         return {
           content: [{ type: "text", text: "ok" }],
           stopReason: "end_turn",
-          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-          usdMicros: 0,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            totalTokens: 2,
+          },
         };
       },
     };
@@ -784,7 +789,13 @@ describe("principle injection", () => {
     await done;
 
     expect(captured.length).toBeGreaterThan(0);
-    const sys = captured[0]!.system ?? "";
+    // System is now structured segments (LOG 2026-04-24) — flatten the
+    // text for the "everything got injected" assertion.
+    const rawSys = captured[0]!.system;
+    const sys =
+      typeof rawSys === "string"
+        ? rawSys
+        : (rawSys ?? []).map((s) => s.text).join("\n");
     expect(sys).toContain("you are a helper");
     expect(sys).toContain("Your principles");
     expect(sys).toContain("honesty");

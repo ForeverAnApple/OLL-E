@@ -170,6 +170,7 @@ export const events = sqliteTable(
     byParent: index("events_parent").on(t.parentEventId),
     byMailbox: index("events_mailbox").on(t.toAgentId, t.hlc),
     byThread: index("events_thread").on(t.threadId, t.hlc),
+    byActorHlc: index("events_actor_hlc").on(t.actorId, t.hlc),
   }),
 );
 
@@ -219,6 +220,7 @@ export const taskRuns = sqliteTable(
     byTask: index("task_runs_task").on(t.taskId),
     byStatus: index("task_runs_status").on(t.status),
     byEvent: index("task_runs_event").on(t.eventId),
+    byAgentStarted: index("task_runs_agent_started").on(t.agentId, t.startedAt),
   }),
 );
 
@@ -302,6 +304,12 @@ export const budgets = sqliteTable(
   }),
 );
 
+// Tokens-only ledger (LOG 2026-04-24). USD is a derivation: it's what
+// these tokens would cost at current prices (see src/llm/pricing.ts).
+// Storing per-row USD created false physics — prices change, snapshots
+// rot. Budgets snapshot USD at decrement time into budgets.spent_usd
+// because real-money caps need a number to compare against; the ledger
+// just records what physically happened.
 export const ledger = sqliteTable(
   "ledger",
   {
@@ -311,16 +319,21 @@ export const ledger = sqliteTable(
       .notNull()
       .references(() => hosts.id),
     actorId: text("actor_id").notNull(),
+    threadId: text("thread_id"),
     provider: text("provider").notNull(),
     model: text("model").notNull(),
-    tokens: integer("tokens").notNull(),
-    usd: integer("usd").notNull(), // micro-USD
+    inputTokens: integer("input_tokens").notNull().default(0),
+    outputTokens: integer("output_tokens").notNull().default(0),
+    cacheReadTokens: integer("cache_read_tokens").notNull().default(0),
+    cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
     toolCallId: text("tool_call_id").references(() => toolCalls.id),
     at: integer("at").notNull(),
   },
   (t) => ({
     byActor: index("ledger_actor").on(t.actorId),
     byModel: index("ledger_model").on(t.provider, t.model),
+    byActorAt: index("ledger_actor_at").on(t.actorId, t.at),
+    byThreadAt: index("ledger_thread_at").on(t.threadId, t.at),
   }),
 );
 

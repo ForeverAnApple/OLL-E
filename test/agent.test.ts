@@ -24,8 +24,13 @@ function endTurn(text: string): Completion {
   return {
     content: [{ type: "text", text }],
     stopReason: "end_turn",
-    usage: { inputTokens: 10, outputTokens: text.length, totalTokens: 10 + text.length },
-    usdMicros: 0,
+    usage: {
+      inputTokens: 10,
+      outputTokens: text.length,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      totalTokens: 10 + text.length,
+    },
   };
 }
 
@@ -34,8 +39,13 @@ function toolUse(id: string, name: string, input: Record<string, unknown>): Comp
   return {
     content,
     stopReason: "tool_use",
-    usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
-    usdMicros: 0,
+    usage: {
+      inputTokens: 5,
+      outputTokens: 5,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      totalTokens: 10,
+    },
   };
 }
 

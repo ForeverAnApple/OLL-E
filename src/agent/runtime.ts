@@ -12,6 +12,7 @@ import type {
   ContentBlock,
   Llm,
   Message,
+  SystemSegment,
   ToolSpec,
   Usage,
 } from "../llm/index.ts";
@@ -19,7 +20,11 @@ import type {
 export interface AgentRunOptions {
   llm: Llm;
   model?: string;
-  system?: string;
+  /** A plain string is sent as a single cached system block. A
+   *  SystemSegment[] lets the caller place the cache breakpoint between
+   *  stable and volatile content (chat loop uses this for the mailbox
+   *  sidebar). */
+  system?: string | SystemSegment[];
   tools?: ToolDef[];
   toolCtx: ToolExecuteContext;
   messages: Message[];
@@ -43,13 +48,12 @@ export type AgentStep =
   | { kind: "assistant"; content: ContentBlock[] }
   | { kind: "tool_use"; id: string; name: string; input: Record<string, unknown> }
   | { kind: "tool_result"; id: string; name: string; content: string; isError: boolean }
-  | { kind: "usage"; usage: Usage; usdMicros: number };
+  | { kind: "usage"; usage: Usage };
 
 export interface AgentResult {
   messages: Message[];
   stopReason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "refusal" | "max_turns";
   totalUsage: Usage;
-  totalUsdMicros: number;
 }
 
 export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
@@ -60,8 +64,13 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   for (const t of opts.tools ?? []) toolByName.set(t.name, t);
 
   const messages: Message[] = [...opts.messages];
-  const total: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-  let totalUsd = 0;
+  const total: Usage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    totalTokens: 0,
+  };
 
   for (let turn = 0; turn < maxTurns; turn++) {
     const req: CompletionRequest = {
@@ -75,11 +84,12 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
     const completion = await opts.llm.complete(req);
     total.inputTokens += completion.usage.inputTokens;
     total.outputTokens += completion.usage.outputTokens;
+    total.cacheReadInputTokens += completion.usage.cacheReadInputTokens;
+    total.cacheCreationInputTokens += completion.usage.cacheCreationInputTokens;
     total.totalTokens += completion.usage.totalTokens;
-    totalUsd += completion.usdMicros;
 
     opts.onStep?.({ kind: "assistant", content: completion.content });
-    opts.onStep?.({ kind: "usage", usage: completion.usage, usdMicros: completion.usdMicros });
+    opts.onStep?.({ kind: "usage", usage: completion.usage });
 
     messages.push({ role: "assistant", content: completion.content });
 
@@ -88,7 +98,6 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
         messages,
         stopReason: completion.stopReason,
         totalUsage: total,
-        totalUsdMicros: totalUsd,
       };
     }
 
@@ -135,7 +144,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
     messages.push({ role: "user", content: toolResults });
   }
 
-  return { messages, stopReason: "max_turns", totalUsage: total, totalUsdMicros: totalUsd };
+  return { messages, stopReason: "max_turns", totalUsage: total };
 }
 
 function toToolSpec(t: ToolDef): ToolSpec {

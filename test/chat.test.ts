@@ -24,8 +24,13 @@ function endTurn(text: string): Completion {
   return {
     content: [{ type: "text", text }],
     stopReason: "end_turn",
-    usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-    usdMicros: 0,
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      totalTokens: 2,
+    },
   };
 }
 

@@ -90,15 +90,25 @@ describe("runAgent authorize gate", () => {
               { type: "tool_use", id: "t1", name: "forbidden", input: {} },
             ],
             stopReason: "tool_use",
-            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-            usdMicros: 0,
+            usage: {
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+              totalTokens: 0,
+            },
           };
         }
         return {
           content: [{ type: "text", text: "ok" }],
           stopReason: "end_turn",
-          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-          usdMicros: 0,
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            totalTokens: 0,
+          },
         };
       },
     };

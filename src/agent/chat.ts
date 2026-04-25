@@ -23,7 +23,7 @@ import type { Event } from "../bus/types.ts";
 import type { Store } from "../store/db.ts";
 import type { Ledger } from "../ledger/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
-import type { Llm, Message } from "../llm/index.ts";
+import type { Llm, Message, SystemSegment } from "../llm/index.ts";
 import type { ToolDef } from "../extensions/types.ts";
 import { askUp, type Inbox } from "../inbox/index.ts";
 import { checkTool } from "../permissions/index.ts";
@@ -169,7 +169,11 @@ async function runTurn(
     // agent can see "I have 3 threads with pending work" and choose to
     // spawn a secretary, retarget, or stay focused.
     const sidebar = buildMailboxSidebar(allThreads, thread.id);
-    const systemWithSidebar = composeSystemPrompt(
+    // Structured system prompt with the cache breakpoint between stable
+    // (base + principles) and volatile (sidebar) segments. The stable
+    // segment carries cache_control; the sidebar appears after it
+    // uncached, so per-turn mailbox churn never invalidates the prefix.
+    const systemSegments = composeSystemSegments(
       opts.system,
       principleBlock,
       sidebar,
@@ -177,7 +181,7 @@ async function runTurn(
     const result = await runAgent({
       llm: opts.llm,
       model: opts.model,
-      system: systemWithSidebar,
+      system: systemSegments,
       tools,
       toolCtx: {
         hostId: opts.hostId,
@@ -226,14 +230,18 @@ async function runTurn(
       },
     });
     thread.messages = result.messages;
+    let recorded: { usdMicros: number } | undefined;
     if (opts.ledger && result.totalUsage.totalTokens > 0) {
-      opts.ledger.record({
+      recorded = opts.ledger.record({
         actorId: opts.agentId,
+        threadId: thread.id,
         principalId: opts.principalId,
         provider: opts.llm.provider,
         model: opts.model ?? opts.llm.defaultModel,
-        tokens: result.totalUsage.totalTokens,
-        usd: result.totalUsdMicros,
+        inputTokens: result.totalUsage.inputTokens,
+        outputTokens: result.totalUsage.outputTokens,
+        cacheReadTokens: result.totalUsage.cacheReadInputTokens,
+        cacheCreationTokens: result.totalUsage.cacheCreationInputTokens,
       });
     }
     // Commit snapshot before announcing turn-end so subscribers reacting
@@ -249,8 +257,16 @@ async function runTurn(
       durable: true,
       payload: {
         stopReason: result.stopReason,
-        tokens: result.totalUsage.totalTokens,
-        usdMicros: result.totalUsdMicros,
+        inputTokens: result.totalUsage.inputTokens,
+        outputTokens: result.totalUsage.outputTokens,
+        cacheReadTokens: result.totalUsage.cacheReadInputTokens,
+        cacheCreationTokens: result.totalUsage.cacheCreationInputTokens,
+        totalTokens: result.totalUsage.totalTokens,
+        // USD at current prices for the convenience of dashboards/CLI.
+        // Always re-derivable from tokens; included only because every
+        // surface that wants "what did this turn cost?" else has to
+        // re-import pricing.
+        usdMicros: recorded?.usdMicros ?? 0,
       },
     });
   } catch (err) {
@@ -266,17 +282,34 @@ async function runTurn(
   }
 }
 
-function composeSystemPrompt(
+/**
+ * Compose the system prompt as ordered segments with the cache breakpoint
+ * placed between stable and volatile content (LOG 2026-04-24).
+ *
+ * Stable (cached): base system prompt + principles. These change rarely;
+ * an agent self-modifying its identity rewrites the principles row, which
+ * does invalidate the cache — by design, that's the cost of self-modification.
+ *
+ * Volatile (uncached): mailbox sidebar. Updates every turn as threads come
+ * and go. Keeping it in its own segment after the breakpoint means turn-by-turn
+ * sidebar churn doesn't invalidate the principle/identity prefix.
+ */
+function composeSystemSegments(
   base: string | undefined,
   principles: string | null,
   sidebar: string,
-): string | undefined {
-  const parts: string[] = [];
-  if (base) parts.push(base);
-  if (principles) parts.push(principles);
-  if (sidebar) parts.push(sidebar);
-  if (parts.length === 0) return undefined;
-  return parts.join("\n\n");
+): SystemSegment[] | undefined {
+  const stable: string[] = [];
+  if (base) stable.push(base);
+  if (principles) stable.push(principles);
+  const segments: SystemSegment[] = [];
+  if (stable.length > 0) {
+    segments.push({ text: stable.join("\n\n"), cache: "ephemeral" });
+  }
+  if (sidebar) {
+    segments.push({ text: sidebar });
+  }
+  return segments.length > 0 ? segments : undefined;
 }
 
 function buildMailboxSidebar(
@@ -447,6 +480,9 @@ function emitStep(
       },
     });
   } else if (step.kind === "usage") {
+    // Per-call usage event. Cache fields are first-class so subscribers
+    // (CLI tail, future bridges, observability dashboards) see cache
+    // stats turn-by-turn without having to wait for chat.turn-end.
     opts.bus.publish({
       type: "chat.usage",
       hostId: opts.hostId,
@@ -454,7 +490,7 @@ function emitStep(
       parentEventId: origin.id,
       threadId,
       durable: false,
-      payload: { ...step.usage, usdMicros: step.usdMicros },
+      payload: { ...step.usage },
     });
   }
 }

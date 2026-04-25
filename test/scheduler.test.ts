@@ -234,8 +234,8 @@ describe("ledger", () => {
       actorId: "a",
       provider: "anthropic",
       model: "claude-opus-4-7",
-      tokens: 1000,
-      usd: 5000, // micro-USD
+      inputTokens: 1000,
+      outputTokens: 0,
     });
     const rows = store.raw.query<{ id: string }, []>("SELECT id FROM ledger").all();
     expect(rows).toHaveLength(1);
@@ -275,35 +275,39 @@ describe("ledger", () => {
     const events: string[] = [];
     bus.subscribe("*", (e) => void events.push(e.type));
 
-    // 50% — no event
+    // Pricing fallback for unknown model "x": 5_000_000 micros per
+    // million input tokens (= 5 micros per token). We pick input
+    // counts that produce the desired step-amounts under the new
+    // tokens-only ledger.
+    // 50% — 500_000 micros — no event
     ledger.record({
       actorId: agentId,
       principalId,
       provider: "anthropic",
       model: "x",
-      tokens: 100,
-      usd: 500_000,
+      inputTokens: 100_000,
+      outputTokens: 0,
     });
     expect(events).not.toContain("budget.threshold");
-    // 85% — cross 80%
+    // 85% — cross 80% (350_000 micros = 70_000 input tokens)
     ledger.record({
       actorId: agentId,
       principalId,
       provider: "anthropic",
       model: "x",
-      tokens: 100,
-      usd: 350_000,
+      inputTokens: 70_000,
+      outputTokens: 0,
     });
     expect(events).toContain("budget.threshold");
     expect(events).not.toContain("budget.exceeded");
-    // 110% — cross 100%
+    // 110% — cross 100% (250_000 micros = 50_000 input tokens)
     const { overBudget } = ledger.record({
       actorId: agentId,
       principalId,
       provider: "anthropic",
       model: "x",
-      tokens: 100,
-      usd: 250_000,
+      inputTokens: 50_000,
+      outputTokens: 0,
     });
     expect(events).toContain("budget.exceeded");
     expect(overBudget).toBe(true);
