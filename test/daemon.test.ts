@@ -73,4 +73,38 @@ describe("daemon + ipc", () => {
   it("refuses to start a second daemon on the same root", async () => {
     await expect(startDaemon({ root: tmp, quiet: true })).rejects.toThrow(/already running/);
   });
+
+  it("observability.usage returns shaped data even with an empty ledger", async () => {
+    const stats = await client.call<{ totals: { inputTokens: number }; rows: number }>(
+      "observability.usage",
+    );
+    expect(stats.rows).toBe(0);
+    expect(stats.totals.inputTokens).toBe(0);
+  });
+
+  it("observability.self surfaces the root agent's identity", async () => {
+    const self = await client.call<{
+      agentId: string;
+      name: string;
+      principleCount: number;
+    } | null>("observability.self", { agentId: daemon.rootAgentId });
+    expect(self).not.toBeNull();
+    expect(self!.name).toBe("root");
+    expect(self!.agentId).toBe(daemon.rootAgentId);
+  });
+
+  it("observability.events round-trips a published event", async () => {
+    await client.call("publish", {
+      type: "obs.test",
+      payload: { n: 1 },
+      actorId: "cli",
+      durable: true,
+    });
+    const events = await client.call<Array<{ type: string }>>("observability.events", {
+      type: "obs.test",
+      limit: 5,
+    });
+    expect(events.length).toBeGreaterThan(0);
+    expect(events[0]!.type).toBe("obs.test");
+  });
 });

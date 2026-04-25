@@ -13,6 +13,15 @@ import type { ExtensionHost } from "../extensions/index.ts";
 import { history, revertSubtree } from "../extensions/git.ts";
 import { installStarter, listStarters } from "../starters/index.ts";
 import type { OllePaths } from "../paths.ts";
+import type { Store } from "../store/index.ts";
+import {
+  agentSelf,
+  budgetStatus,
+  recentEvents,
+  runHistory,
+  threadInventory,
+  usageStats,
+} from "../observability/index.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
 
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -24,6 +33,10 @@ export interface IpcServerOptions {
   version: string;
   extensions?: ExtensionHost;
   paths?: OllePaths;
+  /** Store used by the observability.* methods. The CLI surface and the
+   *  agent-callable tools both read through src/observability/, so they
+   *  see the same numbers — no privileged human read path. */
+  store?: Store;
   /** Root agent id, returned by `status.rootAgent` so clients (CLI chat,
    *  bridges) can address their mailbox publishes. */
   rootAgentId?: string;
@@ -363,6 +376,84 @@ async function dispatch(
           id: req.id,
           ok: true,
           value: { name, revertedTo: sha, newCommit: newSha, status: ext.status },
+        });
+        return;
+      }
+      // Observability surface — same query layer the agent-callable
+      // tools use. CLI subcommands wrap these (AGENTS.md vision-check).
+      case "observability.usage": {
+        if (!opts.store) {
+          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
+          return;
+        }
+        send({
+          id: req.id,
+          ok: true,
+          value: usageStats(opts.store, (req.params ?? {}) as Parameters<typeof usageStats>[1]),
+        });
+        return;
+      }
+      case "observability.budget": {
+        if (!opts.store) {
+          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
+          return;
+        }
+        send({
+          id: req.id,
+          ok: true,
+          value: budgetStatus(opts.store, (req.params ?? {}) as Parameters<typeof budgetStatus>[1]),
+        });
+        return;
+      }
+      case "observability.runs": {
+        if (!opts.store) {
+          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
+          return;
+        }
+        send({
+          id: req.id,
+          ok: true,
+          value: runHistory(opts.store, (req.params ?? {}) as Parameters<typeof runHistory>[1]),
+        });
+        return;
+      }
+      case "observability.threads": {
+        if (!opts.store) {
+          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
+          return;
+        }
+        send({
+          id: req.id,
+          ok: true,
+          value: threadInventory(
+            opts.store,
+            (req.params ?? {}) as Parameters<typeof threadInventory>[1],
+          ),
+        });
+        return;
+      }
+      case "observability.self": {
+        if (!opts.store) {
+          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
+          return;
+        }
+        const agentId = req.params?.agentId as string | undefined;
+        if (!agentId) {
+          send({ id: req.id, ok: false, error: { message: "agentId required" } });
+          return;
+        }
+        send({ id: req.id, ok: true, value: agentSelf(opts.store, agentId) });
+        return;
+      }
+      case "observability.events": {
+        if (!opts.store) {
+          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
+          return;
+        }
+        send({
+          id: req.id,
+          ok: true,
+          value: recentEvents(opts.store, (req.params ?? {}) as Parameters<typeof recentEvents>[1]),
         });
         return;
       }

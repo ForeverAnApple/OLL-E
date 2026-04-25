@@ -101,6 +101,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     version: opts.version ?? "0.0.0",
     extensions,
     paths,
+    store,
     rootAgentId,
   });
   await ipc.listen();

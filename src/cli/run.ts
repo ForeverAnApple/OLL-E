@@ -1,6 +1,14 @@
 import { startDaemon } from "../daemon/daemon.ts";
 import { resolvePaths } from "../paths.ts";
 import { connectIpc } from "../ipc/client.ts";
+import type {
+  AgentSelf,
+  BudgetStatus,
+  RecentEventRow,
+  RunHistoryRow,
+  ThreadInventoryRow,
+  UsageStats,
+} from "../observability/index.ts";
 
 export async function runCli(args: string[]): Promise<void> {
   const [cmd, ...rest] = args;
@@ -43,6 +51,24 @@ export async function runCli(args: string[]): Promise<void> {
     case "secret":
     case "secrets":
       await cmdSecret(rest);
+      return;
+    case "stats":
+      await cmdStats(rest);
+      return;
+    case "cache":
+      await cmdCache(rest);
+      return;
+    case "runs":
+      await cmdRuns(rest);
+      return;
+    case "threads":
+      await cmdThreads(rest);
+      return;
+    case "events":
+      await cmdEvents(rest);
+      return;
+    case "inspect":
+      await cmdInspect(rest);
       return;
     default:
       console.error(`Unknown command: ${cmd}`);
@@ -352,6 +378,259 @@ async function cmdChat(): Promise<void> {
   rl.on("close", stop);
 }
 
+// --- Observability subcommands. All wrap the same observability.* IPC
+// methods that agents reach through their query_my_* core tools. The CLI
+// is just the human's tool surface — no privileged data, no special path.
+
+interface ObsFlags {
+  agent?: string;
+  thread?: string;
+  since?: number;
+  limit?: number;
+}
+
+function parseObsFlags(args: string[]): ObsFlags {
+  const out: ObsFlags = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--agent" && args[i + 1]) {
+      out.agent = args[++i];
+    } else if (a === "--thread" && args[i + 1]) {
+      out.thread = args[++i];
+    } else if (a === "--since" && args[i + 1]) {
+      out.since = parseSinceArg(args[++i]!);
+    } else if (a === "--limit" && args[i + 1]) {
+      out.limit = Number.parseInt(args[++i]!, 10);
+    }
+  }
+  return out;
+}
+
+// Accept either an absolute ms epoch ("1714000000000") or a relative
+// duration ("1h", "30m", "7d"). Relative is more useful in practice.
+function parseSinceArg(raw: string): number {
+  if (/^\d+$/.test(raw)) return Number.parseInt(raw, 10);
+  const m = /^(\d+)([smhd])$/.exec(raw);
+  if (!m) throw new Error(`bad --since: ${raw} (use ms epoch or 30s/15m/2h/7d)`);
+  const n = Number.parseInt(m[1]!, 10);
+  const unit = m[2];
+  const ms = unit === "s" ? 1000 : unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000;
+  return Date.now() - n * ms;
+}
+
+function fmtUsd(micros: number): string {
+  if (micros === 0) return "$0.00";
+  return `$${(micros / 1_000_000).toFixed(4)}`;
+}
+
+function fmtPct(p: number): string {
+  return `${(p * 100).toFixed(1)}%`;
+}
+
+async function cmdStats(args: string[]): Promise<void> {
+  const flags = parseObsFlags(args);
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    const stats = await client.call<UsageStats>("observability.usage", {
+      actorId: flags.agent,
+      threadId: flags.thread,
+      since: flags.since,
+    });
+    const t = stats.totals;
+    console.log(
+      `tokens: in=${t.inputTokens} out=${t.outputTokens} cache_read=${t.cacheReadTokens} cache_create=${t.cacheCreationTokens}`,
+    );
+    console.log(`hit_ratio: ${fmtPct(t.cacheHitRatio)}`);
+    console.log(`usd: ${fmtUsd(t.usdMicros)} (${stats.rows} ledger rows scanned)`);
+    if (stats.byModel.length > 0) {
+      console.log("by model:");
+      for (const m of stats.byModel) {
+        const tag = m.pricePosted ? "" : " (fallback price)";
+        console.log(
+          `  ${m.provider}/${m.model}: ${m.calls} calls, in=${m.inputTokens} out=${m.outputTokens} cache_r=${m.cacheReadTokens} hit=${fmtPct(m.cacheHitRatio)} ${fmtUsd(m.usdMicros)}${tag}`,
+        );
+      }
+    }
+    // Budget side, same call shape if --agent given.
+    if (flags.agent) {
+      const b = await client.call<BudgetStatus>("observability.budget", {
+        actorId: flags.agent,
+      });
+      if (b.rows.length > 0) {
+        console.log("budget:");
+        for (const r of b.rows) {
+          const cap = r.capUsd != null ? fmtUsd(r.capUsd) : "-";
+          const pct = r.percentUsd != null ? fmtPct(r.percentUsd) : "-";
+          console.log(`  ${r.period}: ${fmtUsd(r.spentUsd)} / ${cap}  (${pct})`);
+        }
+      }
+    }
+  } finally {
+    client.close();
+  }
+}
+
+async function cmdCache(args: string[]): Promise<void> {
+  // Cache-focused rollup — just the cache columns + hit ratio.
+  const flags = parseObsFlags(args);
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    const stats = await client.call<UsageStats>("observability.usage", {
+      actorId: flags.agent,
+      threadId: flags.thread,
+      since: flags.since,
+    });
+    const t = stats.totals;
+    console.log(`hit_ratio: ${fmtPct(t.cacheHitRatio)}`);
+    console.log(
+      `cache_read=${t.cacheReadTokens} cache_create=${t.cacheCreationTokens} input=${t.inputTokens}`,
+    );
+    if (stats.byModel.length === 0) {
+      console.log("(no ledger rows)");
+      return;
+    }
+    console.log("by model:");
+    for (const m of stats.byModel) {
+      console.log(
+        `  ${m.provider}/${m.model}: hit=${fmtPct(m.cacheHitRatio)} read=${m.cacheReadTokens} create=${m.cacheCreationTokens} (${m.calls} calls)`,
+      );
+    }
+  } finally {
+    client.close();
+  }
+}
+
+async function cmdRuns(args: string[]): Promise<void> {
+  const flags = parseObsFlags(args);
+  let status: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--status" && args[i + 1]) {
+      status = args[++i];
+    }
+  }
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    const runs = await client.call<RunHistoryRow[]>("observability.runs", {
+      actorId: flags.agent,
+      status,
+      since: flags.since,
+      limit: flags.limit,
+    });
+    if (runs.length === 0) {
+      console.log("(no runs)");
+      return;
+    }
+    for (const r of runs) {
+      const dur = r.durationMs != null ? `${r.durationMs}ms` : "running";
+      const err = r.error ? `  err=${r.error}` : "";
+      const when = new Date(r.startedAt).toISOString();
+      console.log(`${when}  ${r.status.padEnd(9)}  ${r.taskId}  ${dur}${err}`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
+async function cmdThreads(args: string[]): Promise<void> {
+  const flags = parseObsFlags(args);
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    const threads = await client.call<ThreadInventoryRow[]>("observability.threads", {
+      toAgentId: flags.agent,
+      limit: flags.limit,
+    });
+    if (threads.length === 0) {
+      console.log("(no threads)");
+      return;
+    }
+    for (const t of threads) {
+      const when = new Date(t.lastEventAt).toISOString();
+      console.log(
+        `${when}  ${t.threadId}  events=${t.events}  hit=${fmtPct(t.cacheHitRatio)}  last=${t.lastType}`,
+      );
+    }
+  } finally {
+    client.close();
+  }
+}
+
+async function cmdEvents(args: string[]): Promise<void> {
+  // Single-shot event-log query (the streaming variant is `olle tail`).
+  const flags = parseObsFlags(args);
+  let type: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--type" && args[i + 1]) {
+      type = args[++i];
+    }
+  }
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    const events = await client.call<RecentEventRow[]>("observability.events", {
+      actorId: flags.agent,
+      type,
+      threadId: flags.thread,
+      since: flags.since,
+      limit: flags.limit,
+    });
+    if (events.length === 0) {
+      console.log("(no events)");
+      return;
+    }
+    for (const e of events) {
+      console.log(`${e.hlc} ${e.type} actor=${e.actorId} payload=${JSON.stringify(e.payload)}`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
+async function cmdInspect(args: string[]): Promise<void> {
+  const [sub, target] = args;
+  if (sub !== "agent" || !target) {
+    throw new Error("usage: olle inspect agent <agent-id>");
+  }
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    const self = await client.call<AgentSelf | null>("observability.self", {
+      agentId: target,
+    });
+    if (!self) {
+      console.error(`agent not found: ${target}`);
+      process.exit(1);
+    }
+    console.log(`id:     ${self.agentId}`);
+    console.log(`name:   ${self.name}`);
+    console.log(`host:   ${self.hostId}`);
+    console.log(`parent: ${self.parentAgentId ?? "(none)"}`);
+    console.log(`principles: ${self.principleCount}`);
+    if (self.scope.allowTiers) {
+      console.log(`scope: tiers=${self.scope.allowTiers.join(",")}`);
+    }
+    if (self.tools.length > 0) {
+      console.log(`tools: ${self.tools.map((t) => t.name).join(", ")}`);
+    }
+    if (self.recentlyPricedModels.length > 0) {
+      console.log("recent models:");
+      for (const m of self.recentlyPricedModels) {
+        const tag = m.pricePosted ? "" : " (fallback price)";
+        console.log(`  ${m.provider}/${m.model}${tag}`);
+      }
+    }
+    if (self.systemPrompt) {
+      console.log("---");
+      console.log(self.systemPrompt);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 function printHelp(): void {
   console.log(
     [
@@ -374,6 +653,15 @@ function printHelp(): void {
       "  secret list                 list secret names (values never shown)",
       "  secret set <NAME> [value]   store a secret (or pipe on stdin)",
       "  secret remove <NAME>        remove a stored secret",
+      "",
+      "  Observability — same data agents see via their query_my_* tools:",
+      "  stats [--agent X] [--thread X] [--since 1h]   token + USD rollup",
+      "  cache [--agent X] [--thread X] [--since 1h]   cache hit ratio rollup",
+      "  runs [--agent X] [--status X] [--since 1h]    recent task_runs",
+      "  threads [--agent X] [--limit N]               threads per mailbox",
+      "  events [--agent X] [--type T] [--thread X]    one-shot event query",
+      "  inspect agent <id>                            agent identity surface",
+      "",
       "  version                     show version",
       "  help                        show this help",
     ].join("\n"),
