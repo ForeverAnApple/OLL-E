@@ -15,16 +15,19 @@ OLL-E is designed as a **habitat** for agents, not as a framework agents call in
 Concretely this means:
 
 - Agents can write new extensions, modify their own tools, spawn sub-agents, register triggers, edit goals.
+- **An agent is a seed plus its lived events; culture flows down the lineage.** Memory is identity — preferences, philosophy, in-flight goals, grown capabilities, accumulated knowledge all live on one persistent surface. Parents transmit philosophy and orientations to children at spawn and remain readable afterward. Children form their own identity on top; drift is expected; correction is ongoing conversation. Maximum diversity, not maximum conformity.
+- **Beliefs have inertia, not locks.** Every belief's resistance is proportional to its depth. Change is always possible; shifting a core belief takes evidence proportional to its weight.
+- **Evidence is peer; authority is hierarchical.** Information from anywhere — peer, child, parent, principal, the world — updates any agent it reaches, weighted against that agent's own resistance. Hierarchy governs what can be *done*, not what is *true*.
 - Constraints feel like physics. An agent experiences "my budget is low, let me ask for more" — not "the system refused me."
-- The human is a peer in the world, not an overseer outside it. Their inbox is a channel, not a console.
+- **Humans are the oldest agents.** Not consoles outside the world — the seniors at the top of the ask-up tree, backed by real money, with their own memory, principles, and resistance. Their inbox is a channel. Every agent, human included, tries to impart its principles downward.
 - Mid-flight pivots, buggy agent code, and growth are normal states. The system tolerates and recovers. Code is cheap; the environment is robust.
 
 ## What's load-bearing
 
 - **Humans are just another event source.** A Discord DM from a person and an email from another agent produce structurally identical events. No special-cased human UI.
 - **Nothing blocks on humans.** Agents propose decisions to a per-human decision inbox and continue other work. Replies are reconciled async.
-- **Approvals bubble up the agent tree.** A child asks its parent, which either approves within delegated authority or escalates. Only when no agent in the chain has authority does a human get paged.
-- **Budget is human-owned and allocable.** Each principal owns a budget and assigns slices to agents. Raising a cap is an inbox item, not a per-call approval.
+- **Approvals bubble up the agent tree.** A child asks its parent, which either approves within delegated authority or escalates. The chain terminates at the oldest ancestor (the human), whose inbox takes the paged decision.
+- **Budget flows down the tree.** The oldest agent (the human) owns the real-world money; each descendant receives a slice. Raising a cap is an inbox item to an ancestor, not a per-call approval.
 - **Teams are peer cells around a shared goal.** No central coordinator. Friend-install = a new cell plugging into the collective.
 - **Pooled compute = pooled workforce.** In v0, cells share events/memory/decisions across hosts; tasks run on whichever cell claims them, using that cell's own tools. No remote code execution.
 - **Integrations are part of the world, therefore modifiable.** There is no `olle install discord` command. The agent proposes, writes, smoke-tests, and hot-loads an extension through the unified authoring loop.
@@ -77,3 +80,4 @@ See REFERENCES.md for specifics.
 - A shared bug appears and the less-loaded cell claims and resolves it, end-to-end, without human intervention.
 - Total v0 codebase fits in a developer's head. Every extension is replaceable by the agent itself.
 - When an agent writes a broken extension, the system recovers and tells you what happened within seconds.
+- Every `[DEFERRED-]` entry in `docs/design/LOG.md` has been triaged (promoted / kept deferred with updated resurrect-when / retired) before v0 is declared shipped.

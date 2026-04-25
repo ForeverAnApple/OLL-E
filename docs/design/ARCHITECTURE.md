@@ -47,10 +47,9 @@ Each host runs one long-lived **daemon** process. Any number of **thin clients**
     github/
     claude-code/
     ...
-  goals/                 # markdown goal files (agent-native format)
-    team-acme.md
-    obj-triage.md
-  memory/                # markdown notes; agent-readable/writable
+  memory/                # markdown notes with role tags; agent-readable/writable
+                         # (LOG 2026-04-23) absorbs former goals/ — goals are memories
+                         # with role=goal; preferences, skills, knowledge share the surface
     private/<agent>/     # per-agent private
     team/<team>/         # team-shared with attribution
     scratch/<task>/      # ephemeral task working state
@@ -73,6 +72,8 @@ A deployment unit: one daemon process, one data directory, one SQLite store. Own
 ### Agent
 
 A named logical identity. Has its own memory, tasks, tool access, budget allocation, and permission scope. One host can run N agents; an agent does **not** span hosts in v0. Parent-child relationships (from sub-agent spawning) form an authority delegation tree.
+
+**Humans are agents too** (per LOG 2026-04-23). The principal is represented as an `agents` row at the top of the tree: `host_id=null` (no executing host), real-money-backed, longest-lived, with its own memory and principles. The ask-up chain is one recursion end-to-end — no terminal "now we hit a principal" special case. `principals` collapses into `agents` via a future migration; v0 retains `principals` as a compatibility row until the collapse lands. "Principal" becomes a property ("this agent owns real-world money"), not a separate primitive.
 
 ### Trigger
 
@@ -215,6 +216,13 @@ Three scopes, enforced at write/read:
 Default for new writes: **private**. Promoting private → team is operational. Deleting/overwriting team memory authored by another actor is strategic (inbox item).
 
 Memory reads are logged (`memory_reads`) so the agent can ask "who knew what when."
+
+**Memory is identity** (per LOG 2026-04-23). Each row is part of the persistent self of its `actor_id` — preferences, philosophy, in-flight goals, grown capabilities (tools/extensions) and lived knowledge all live on this one surface. Role tags on each row differentiate posture (`goal`, `preference`, `skill`, `knowledge`, `culture`, etc.) — goals no longer live in a separate directory or primitive. Every memory write is a `memory.*` event; the `memories` table is a materialized projection of the event log, reconstructible by replay (federation = event-log merge, peers sync events). Beliefs carry a depth per the resistance model — seed beliefs from parents arrive pre-stamped heavy; lived beliefs accrue weight through use. Change is always possible; shifting a deep belief takes evidence proportional to its weight. No locks, just inertia.
+
+Open calls tracked for implementation (see LOG 2026-04-23):
+
+- Parent-read of child private memory (private = strictly-solo vs ancestor-readable) — `[DEFERRED-to-v0.1]`.
+- Scratch binding to `task_runs.id` so `recoverLost()` sweeps orphaned scratch — `[DEFERRED-to-v0.1]`.
 
 ## Extension authoring loop
 
