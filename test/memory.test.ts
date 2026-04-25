@@ -4,7 +4,7 @@
 import { describe, expect, it } from "bun:test";
 import { createBus, persistToStore } from "../src/bus/index.ts";
 import { openStore, tables } from "../src/store/index.ts";
-import { ulid } from "../src/id/index.ts";
+import { ulid, encodeStamp } from "../src/id/index.ts";
 import {
   MEMORY_FORGOTTEN,
   MEMORY_WROTE,
@@ -176,6 +176,108 @@ describe("memory projector", () => {
     proj.stop();
   });
 
+  it("drops stale-HLC writes — incoming event with HLC <= existing row's is ignored", () => {
+    const r = rig();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const id = ulid();
+    // Forge a row with a maximum-future HLC. Any real bus event will
+    // necessarily have a smaller HLC; the projector must drop it.
+    const futureHlc = encodeStamp({ l: 0xffffffffffff, c: 0xffff });
+    r.store.raw
+      .prepare(
+        `INSERT INTO memories (
+           id, hlc, host_id, actor_id, scope, scope_ref, role, depth,
+           authored_by, seeded_from, title, body_md, tags,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        futureHlc,
+        r.hostId,
+        "a",
+        "private",
+        "a",
+        "principle",
+        99,
+        null,
+        null,
+        "from-the-future",
+        "winner",
+        "[]",
+        Date.now(),
+        Date.now(),
+      );
+    // Now publish a real wrote event. Its HLC is in the present; the
+    // projector should compare and drop the update.
+    r.bus.publish({
+      type: MEMORY_WROTE,
+      hostId: r.hostId,
+      actorId: "a",
+      durable: true,
+      payload: {
+        id,
+        actorId: "a",
+        scope: "private",
+        scopeRef: "a",
+        role: "principle",
+        title: "stale-loser",
+        bodyMd: "should-not-overwrite",
+        tags: [],
+        depth: 1,
+      },
+    });
+    const row = r.store.raw.query("SELECT title, depth FROM memories WHERE id = ?").get(id) as {
+      title: string;
+      depth: number;
+    };
+    expect(row.title).toBe("from-the-future");
+    expect(row.depth).toBe(99);
+    proj.stop();
+  });
+
+  it("drops stale tombstones — forgotten event with HLC <= existing row's is ignored", () => {
+    const r = rig();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const id = ulid();
+    const futureHlc = encodeStamp({ l: 0xffffffffffff, c: 0xffff });
+    r.store.raw
+      .prepare(
+        `INSERT INTO memories (
+           id, hlc, host_id, actor_id, scope, scope_ref, role, depth,
+           authored_by, seeded_from, title, body_md, tags,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        futureHlc,
+        r.hostId,
+        "a",
+        "private",
+        "a",
+        "knowledge",
+        1,
+        null,
+        null,
+        "survivor",
+        "x",
+        "[]",
+        Date.now(),
+        Date.now(),
+      );
+    r.bus.publish({
+      type: MEMORY_FORGOTTEN,
+      hostId: r.hostId,
+      actorId: "a",
+      durable: true,
+      payload: { id },
+    });
+    const row = r.store.raw.query("SELECT id FROM memories WHERE id = ?").get(id);
+    expect(row).not.toBeNull();
+    proj.stop();
+  });
+
   it("preserves memory_reads across a forget (audit survives tombstone)", () => {
     const r = rig();
     const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
@@ -340,6 +442,230 @@ describe("memory tools", () => {
       .get(r.id) as { scope: string; scope_ref: string };
     expect(row.scope).toBe("team");
     expect(row.scope_ref).toBe(teamId);
+    s.stop();
+  });
+
+  it("explicit depth overrides the role default", async () => {
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    const r = await write.execute(
+      { title: "weak principle", bodyMd: "for now", role: "principle", depth: 3 },
+      makeCtx("alice", s.hostId),
+    );
+    expect(r.depth).toBe(3);
+    const row = s.store.raw.query("SELECT depth FROM memories WHERE id = ?").get(r.id) as {
+      depth: number;
+    };
+    expect(row.depth).toBe(3);
+    s.stop();
+  });
+
+  it("memory_write rejects scope=team without a scopeRef", async () => {
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    await expect(
+      write.execute(
+        { title: "x", bodyMd: "y", role: "knowledge", scope: "team" },
+        makeCtx("alice", s.hostId),
+      ),
+    ).rejects.toThrow(/scopeRef/);
+    s.stop();
+  });
+
+  it("memory_write auto-fills scopeRef=actor for private", async () => {
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    const r = await write.execute(
+      { title: "x", bodyMd: "y", role: "knowledge" },
+      makeCtx("alice", s.hostId),
+    );
+    const row = s.store.raw.query("SELECT scope_ref FROM memories WHERE id = ?").get(r.id) as {
+      scope_ref: string;
+    };
+    expect(row.scope_ref).toBe("alice");
+    s.stop();
+  });
+
+  it("memory_search role filter narrows results to one posture", async () => {
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    const search = getTool(s.tools, "memory_search");
+    await write.execute(
+      { title: "p1", bodyMd: "a", role: "principle" },
+      makeCtx("alice", s.hostId),
+    );
+    await write.execute(
+      { title: "g1", bodyMd: "b", role: "goal" },
+      makeCtx("alice", s.hostId),
+    );
+    await write.execute(
+      { title: "k1", bodyMd: "c", role: "knowledge" },
+      makeCtx("alice", s.hostId),
+    );
+    const goals: Array<{ title: string; role: string }> = await search.execute(
+      { role: "goal" },
+      makeCtx("alice", s.hostId),
+    );
+    expect(goals.map((g) => g.title)).toEqual(["g1"]);
+    expect(goals.every((g) => g.role === "goal")).toBe(true);
+    s.stop();
+  });
+
+  it("memory_search query LIKE-matches title and body", async () => {
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    const search = getTool(s.tools, "memory_search");
+    await write.execute(
+      { title: "git workflow", bodyMd: "branch per feature", role: "skill" },
+      makeCtx("alice", s.hostId),
+    );
+    await write.execute(
+      { title: "code review", bodyMd: "be kind in feedback", role: "skill" },
+      makeCtx("alice", s.hostId),
+    );
+    // Title match
+    const titleHits: Array<{ title: string }> = await search.execute(
+      { query: "git" },
+      makeCtx("alice", s.hostId),
+    );
+    expect(titleHits.map((h) => h.title)).toEqual(["git workflow"]);
+    // Body match
+    const bodyHits: Array<{ title: string }> = await search.execute(
+      { query: "kind" },
+      makeCtx("alice", s.hostId),
+    );
+    expect(bodyHits.map((h) => h.title)).toEqual(["code review"]);
+    s.stop();
+  });
+
+  it("team scope: members can read each other's team memories; non-members cannot", async () => {
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    const read = getTool(s.tools, "memory_read");
+    const search = getTool(s.tools, "memory_search");
+    const teamId = ulid();
+    s.store.insert(tables.teams).values({ id: teamId, name: "x", createdAt: Date.now() }).run();
+    s.store
+      .insert(tables.teamMembers)
+      .values({ teamId, actorId: "alice", role: "member", joinedAt: Date.now() })
+      .run();
+    // bob is not a member
+    const r = await write.execute(
+      {
+        title: "team note",
+        bodyMd: "shared",
+        role: "knowledge",
+        scope: "team",
+        scopeRef: teamId,
+      },
+      makeCtx("alice", s.hostId),
+    );
+    // Owner (alice) reads
+    const got = await read.execute({ id: r.id }, makeCtx("alice", s.hostId));
+    expect(got.title).toBe("team note");
+    // Non-member (bob) denied
+    await expect(read.execute({ id: r.id }, makeCtx("bob", s.hostId))).rejects.toThrow(
+      /caller not in team/,
+    );
+    // Search: bob shouldn't see it
+    const bSearch: Array<{ title: string }> = await search.execute({}, makeCtx("bob", s.hostId));
+    expect(bSearch.map((h) => h.title)).not.toContain("team note");
+    // Add bob to the team — now he can read
+    s.store
+      .insert(tables.teamMembers)
+      .values({ teamId, actorId: "bob", role: "member", joinedAt: Date.now() })
+      .run();
+    const bGot = await read.execute({ id: r.id }, makeCtx("bob", s.hostId));
+    expect(bGot.title).toBe("team note");
+    const bSearch2: Array<{ title: string }> = await search.execute({}, makeCtx("bob", s.hostId));
+    expect(bSearch2.map((h) => h.title)).toContain("team note");
+    s.stop();
+  });
+
+  it("scratch scope: only the owning actor can read; promote rejects scratch", async () => {
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    const read = getTool(s.tools, "memory_read");
+    const promote = getTool(s.tools, "memory_promote");
+    const taskRunId = ulid(); // pretend task_run id; scope_ref is just a string in v0
+    const r = await write.execute(
+      {
+        title: "scratch note",
+        bodyMd: "ephemeral",
+        role: "knowledge",
+        scope: "scratch",
+        scopeRef: taskRunId,
+      },
+      makeCtx("alice", s.hostId),
+    );
+    // Owner reads
+    const got = await read.execute({ id: r.id }, makeCtx("alice", s.hostId));
+    expect(got.scope).toBe("scratch");
+    // Other denied
+    await expect(read.execute({ id: r.id }, makeCtx("bob", s.hostId))).rejects.toThrow(
+      /caller is not the owner/,
+    );
+    // Promotion: scratch is not promotable in v0
+    const teamId = ulid();
+    s.store.insert(tables.teams).values({ id: teamId, name: "t", createdAt: Date.now() }).run();
+    s.store
+      .insert(tables.teamMembers)
+      .values({ teamId, actorId: "alice", role: "member", joinedAt: Date.now() })
+      .run();
+    await expect(
+      promote.execute({ id: r.id, teamId }, makeCtx("alice", s.hostId)),
+    ).rejects.toThrow(/only private memories can be promoted/);
+    s.stop();
+  });
+
+  it("update preserves seeded_from and authored_by — lineage trace survives self-edits", async () => {
+    // Regression: a child editing a seeded principle must keep the
+    // attribution forward. Simulate a seeded row directly (the spawn
+    // path is exercised in pass-on tests; here we isolate the tool
+    // invariant).
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    const childId = ulid();
+    const seededFrom = ulid();
+    s.store.insert(tables.agents).values({ id: childId, name: "c", hostId: s.hostId, scope: {}, createdAt: Date.now() }).run();
+    // Forge a seeded principle directly via a memory.wrote event so
+    // the projector lays it down with the attribution we want.
+    const memId = ulid();
+    s.bus.publish({
+      type: MEMORY_WROTE,
+      hostId: s.hostId,
+      actorId: "parent",
+      durable: true,
+      payload: {
+        id: memId,
+        actorId: childId,
+        scope: "private",
+        scopeRef: childId,
+        role: "principle",
+        title: "inherited",
+        bodyMd: "from parent",
+        tags: [],
+        depth: 10,
+        authoredBy: "parent",
+        seededFrom,
+      },
+    });
+    const seedRow = s.store.raw
+      .query("SELECT authored_by, seeded_from FROM memories WHERE id = ?")
+      .get(memId) as { authored_by: string; seeded_from: string };
+    expect(seedRow.authored_by).toBe("parent");
+    expect(seedRow.seeded_from).toBe(seededFrom);
+    // Child edits it via memory_write+updates — attribution must survive
+    await write.execute(
+      { title: "drifted", bodyMd: "my own take now", role: "principle", updates: memId },
+      makeCtx(childId, s.hostId),
+    );
+    const after = s.store.raw
+      .query("SELECT authored_by, seeded_from, title FROM memories WHERE id = ?")
+      .get(memId) as { authored_by: string; seeded_from: string; title: string };
+    expect(after.title).toBe("drifted");
+    expect(after.authored_by).toBe("parent");
+    expect(after.seeded_from).toBe(seededFrom);
     s.stop();
   });
 

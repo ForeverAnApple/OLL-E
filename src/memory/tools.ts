@@ -218,6 +218,14 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
       let id = args.updates;
       let updated = false;
       let scopeRef = args.scopeRef ?? null;
+      // Lineage attribution survives self-edits: when a child updates
+      // a seeded principle, the seeded_from / authored_by fields must
+      // travel forward, otherwise the next projection nulls them and
+      // the parent-trace is gone forever. New writes (no `updates`)
+      // start fresh — null on both fields. (Pass-on at spawn writes
+      // these directly through the manager, not through this tool.)
+      let authoredBy: string | undefined;
+      let seededFrom: string | undefined;
 
       if (id) {
         const existing = loadMemory(id);
@@ -230,6 +238,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
         updated = true;
         // Inherit the existing scope_ref when not explicitly re-set.
         if (!scopeRef) scopeRef = existing.scopeRef;
+        authoredBy = existing.authoredBy ?? undefined;
+        seededFrom = existing.seededFrom ?? undefined;
       } else {
         id = ulid();
       }
@@ -256,6 +266,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
           bodyMd: args.bodyMd,
           tags,
           depth,
+          authoredBy,
+          seededFrom,
         },
       });
 

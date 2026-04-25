@@ -442,6 +442,55 @@ describe("memory_lineage", () => {
     expect(hitsAll.map((h) => h.title).sort()).toEqual(["grand rule", "parent rule"]);
   });
 
+  it("returns [] when caller has no parent (orphan agent)", async () => {
+    const r = rig();
+    cleanups.push(r.cleanup);
+    const lineage = getTool(r.tools, "memory_lineage");
+    const orphan = "orphan";
+    r.store
+      .insert(tables.agents)
+      .values({ id: orphan, name: "orphan", hostId: r.hostId, scope: {}, createdAt: Date.now() })
+      .run();
+    const hits = await lineage.execute({}, ctxFor(orphan, r.hostId));
+    expect(hits).toEqual([]);
+  });
+
+  it("survives a cycle in parent_agent_id without infinite-looping", async () => {
+    // Cycles shouldn't happen via spawn (parent_agent_id is set once
+    // at insert), but the walk must defend against bad data.
+    const r = rig();
+    cleanups.push(r.cleanup);
+    const lineage = getTool(r.tools, "memory_lineage");
+    const a = "cycA";
+    const b = "cycB";
+    // Insert with the cycle: a → b → a
+    r.store
+      .insert(tables.agents)
+      .values({
+        id: a,
+        name: a,
+        hostId: r.hostId,
+        parentAgentId: b,
+        scope: {},
+        createdAt: Date.now(),
+      })
+      .run();
+    r.store
+      .insert(tables.agents)
+      .values({
+        id: b,
+        name: b,
+        hostId: r.hostId,
+        parentAgentId: a,
+        scope: {},
+        createdAt: Date.now(),
+      })
+      .run();
+    // Should terminate quickly (the seen-set breaks the cycle).
+    const hits = await lineage.execute({}, ctxFor(a, r.hostId));
+    expect(Array.isArray(hits)).toBe(true);
+  });
+
   it("emits memory.read events for each surfaced hit", async () => {
     const r = rig();
     cleanups.push(r.cleanup);
