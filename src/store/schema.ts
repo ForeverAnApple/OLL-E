@@ -334,7 +334,21 @@ export const memories = sqliteTable(
       .references(() => hosts.id),
     actorId: text("actor_id").notNull(),
     scope: text("scope").notNull(), // private | team | scratch
-    scopeRef: text("scope_ref"), // agent id for private, team id for team, task id for scratch
+    scopeRef: text("scope_ref"), // agent id for private, team id for team, task_run id for scratch
+    // Posture differentiator (LOG 2026-04-23). Free-form string; the
+    // blessed load-bearing role is `principle` (always-injected at
+    // turn start, auto-passed at spawn). Other common roles: goal,
+    // preference, skill, knowledge.
+    role: text("role").notNull().default(""),
+    // Belief weight under the resistance model. Seed principles arrive
+    // heavy; lived writes arrive light. No ceiling enforced.
+    depth: integer("depth").notNull().default(1),
+    // Non-null only when another actor wrote this on the owner's behalf —
+    // cultural pass-on is the one blessed case. Otherwise authored_by is
+    // implicit (= actor_id) and stays null.
+    authoredBy: text("authored_by"),
+    // Source memory id during cultural pass-on; null for lived writes.
+    seededFrom: text("seeded_from"),
     title: text("title").notNull(),
     bodyMd: text("body_md").notNull(),
     tags: text("tags", { mode: "json" }).$type<string[]>().notNull().default(sql`'[]'`),
@@ -344,20 +358,22 @@ export const memories = sqliteTable(
   (t) => ({
     byScope: index("memories_scope").on(t.scope, t.scopeRef),
     byActor: index("memories_actor").on(t.actorId),
+    byActorRole: index("memories_actor_role").on(t.actorId, t.role),
   }),
 );
 
 export const memoryReads = sqliteTable(
   "memory_reads",
   {
-    memoryId: text("memory_id")
-      .notNull()
-      .references(() => memories.id),
+    // Weak reference — a forgotten memory's audit records must survive
+    // its deletion. See migration 0004 for the full rationale.
+    memoryId: text("memory_id").notNull(),
     readerActorId: text("reader_actor_id").notNull(),
     at: integer("at").notNull(),
   },
   (t) => ({
     pk: primaryKey({ columns: [t.memoryId, t.readerActorId, t.at] }),
+    byMemory: index("memory_reads_memory").on(t.memoryId),
   }),
 );
 

@@ -30,6 +30,7 @@ import { checkTool } from "../permissions/index.ts";
 import type { AgentScope } from "../store/schema.ts";
 import { tables } from "../store/index.ts";
 import { eq } from "drizzle-orm";
+import { loadPrinciples, renderPrinciples } from "../memory/principles.ts";
 import { runAgent, type AgentStep } from "./runtime.ts";
 
 export interface AgentLoopOptions {
@@ -158,14 +159,21 @@ async function runTurn(
     const redactions = buildRedactionMap(tools);
     const scope = loadAgentScope(opts.store, opts.agentId);
     const grantProposed = new Set<string>();
+    // Principles — the agent's strict commitments, injected at turn
+    // start instead of retrieved (openclaw SOUL pattern adapted to
+    // one-surface memory — LOG 2026-04-23). Stable sort (depth desc,
+    // id asc) keeps prompt caches warm across turns with no changes.
+    const principleBlock = renderPrinciples(loadPrinciples(opts.store, opts.agentId));
     // Mailbox sidebar — a one-line situational awareness block appended
     // to the system prompt each turn. Makes delegation decidable: the
     // agent can see "I have 3 threads with pending work" and choose to
     // spawn a secretary, retarget, or stay focused.
     const sidebar = buildMailboxSidebar(allThreads, thread.id);
-    const systemWithSidebar = sidebar
-      ? (opts.system ? `${opts.system}\n\n${sidebar}` : sidebar)
-      : opts.system;
+    const systemWithSidebar = composeSystemPrompt(
+      opts.system,
+      principleBlock,
+      sidebar,
+    );
     const result = await runAgent({
       llm: opts.llm,
       model: opts.model,
@@ -256,6 +264,19 @@ async function runTurn(
       payload: { error: (err as Error).message },
     });
   }
+}
+
+function composeSystemPrompt(
+  base: string | undefined,
+  principles: string | null,
+  sidebar: string,
+): string | undefined {
+  const parts: string[] = [];
+  if (base) parts.push(base);
+  if (principles) parts.push(principles);
+  if (sidebar) parts.push(sidebar);
+  if (parts.length === 0) return undefined;
+  return parts.join("\n\n");
 }
 
 function buildMailboxSidebar(

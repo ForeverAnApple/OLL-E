@@ -13,6 +13,11 @@ import {
   type AgentManager,
 } from "../agent/index.ts";
 import { buildMetaTools } from "../tools/meta.ts";
+import {
+  buildMemoryTools,
+  startMemoryProjector,
+  type MemoryProjector,
+} from "../memory/index.ts";
 import { createInbox, type Inbox } from "../inbox/index.ts";
 import { ulid } from "../id/index.ts";
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
@@ -65,6 +70,10 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   const scheduler = createScheduler({ bus, store, hostId });
   scheduler.recoverLost();
   const inbox = createInbox({ bus, store, hostId });
+  // Memory projector — folds memory.* events into the `memories` table.
+  // Must start before any memory writes happen (extensions loading,
+  // agent spawn, etc.) so nothing is lost before the subscriber is live.
+  const memoryProjector: MemoryProjector = startMemoryProjector({ bus, store, hostId });
 
   // Late-bound manager reference: extensions are created before the
   // agent manager (which needs the LLM adapter, conditionally built),
@@ -135,13 +144,16 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       principalId: rootPrincipalId,
       threadsDir: paths.threadsDir,
     });
-    const coreTools = buildMetaTools({
-      extensions,
-      extensionsDir: paths.extensionsDir,
-      authorName: chatAgentId,
-      secretsDir: paths.secretsDir,
-      agentManager,
-    });
+    const coreTools = [
+      ...buildMetaTools({
+        extensions,
+        extensionsDir: paths.extensionsDir,
+        authorName: chatAgentId,
+        secretsDir: paths.secretsDir,
+        agentManager,
+      }),
+      ...buildMemoryTools({ bus, store, hostId }),
+    ];
     // Children inherit the same tool set so they can themselves spawn,
     // read extension files, etc. Scope still gates what they get to use.
     agentManager.setCoreTools(coreTools);
@@ -209,6 +221,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     // safe if the manager never came up (no API key).
     agentManager?.shutdown();
     chat?.stop();
+    memoryProjector.stop();
     scheduler.close();
     for (const ext of extensions.list()) {
       try {
