@@ -478,24 +478,47 @@ function visibleLen(s: string): number {
   return s.replace(/\x1b\[[0-9;]*m/g, "").length;
 }
 
-interface ChatUIOpts {
+export interface ChatUIOut {
+  write(s: string): unknown;
+  isTTY?: boolean;
+  columns?: number;
+  rows?: number;
+}
+
+export interface ChatUIOpts {
   agentId: string;
   agentName: string;
   threadId: string;
+  /** Test injection point. Defaults to process.stdout. */
+  out?: ChatUIOut;
 }
 
-function createChatUI(opts: ChatUIOpts) {
-  const out = process.stdout;
+export function createChatUI(opts: ChatUIOpts) {
+  const out: ChatUIOut = opts.out ?? process.stdout;
   const headerLabel = `◆ ${opts.agentName}`;
-  // Per-block accumulator: deltas append to this and the whole block is
-  // re-rendered as markdown on every chunk (opencode-style streaming).
-  // Cleared when the block closes (tool call, error, turn end).
-  let assistantBuffer = "";
-  let assistantOpen = false;
-  let atLineStart = true;
+
+  // Progressive block-commit streaming. The assistant block has two halves:
+  //   committed — header + already-rendered markdown blocks. Written once,
+  //               never rewound. Lines that scroll into the terminal's
+  //               scrollback are stable and never duplicated by a later
+  //               redraw.
+  //   pending   — the in-flight tail past the last stable boundary
+  //               (a blank line outside any fenced code block). Painted as
+  //               raw text and rewound on each delta. Bounded by the
+  //               viewport via maxPendingRows() — when the tail outgrows
+  //               that budget we force-commit it as raw and start fresh,
+  //               sacrificing markdown formatting on the overflow chunk
+  //               but never letting rewind reach into scrollback.
+  let headerWritten = false;
+  let committedText = ""; // exact prefix already markdown-committed
+  let hasCommittedContent = false; // gate the inter-block blank line
+  let inFence = false; // does the committed prefix end inside a fence?
+  let pendingText = ""; // post-boundary tail buffer
+  let pendingRows = 0; // visual rows below the start of the pending tail
+  let pendingCol = 0; // cursor column on the bottom pending row
+
   // Cumulative session stats — accumulated across every chat.turn-end
-  // and rendered as a single dim line above the next prompt. Replaces
-  // the per-turn border footer that used to print after every reply.
+  // and rendered as a single dim line above the next prompt.
   const sessionStats = {
     inputTokens: 0,
     outputTokens: 0,
@@ -504,84 +527,196 @@ function createChatUI(opts: ChatUIOpts) {
     usdMicros: 0,
     model: "",
   };
-  // Visual line and column tracking inside the open assistant block,
-  // including the header line. Used to rewind+redraw with markdown
-  // on every streamed chunk and on the authoritative chat.assistant-text.
-  let visualLines = 0; // total visual lines consumed (header + content + wraps)
-  let col = 0; // cursor column, 0-based; ANSI escapes don't bump this
 
-  function trackChar(ch: string): void {
-    if (ch === "\n") {
-      visualLines++;
-      col = 0;
-      atLineStart = true;
+  function termWidth(): number {
+    const w = out.columns;
+    return w && w > 20 ? w : 80;
+  }
+
+  function termHeight(): number {
+    const h = out.rows;
+    return h && h > 10 ? h : 24;
+  }
+
+  function maxPendingRows(): number {
+    // Reserve a few rows for the readline prompt + statusline so an
+    // expanding tail never quite fills the viewport before we cap it.
+    return Math.max(4, termHeight() - 4);
+  }
+
+  function ensureHeader(): void {
+    if (headerWritten) return;
+    out.write(color(`${ANSI.bold}${ANSI.cyan}`, headerLabel) + "\n");
+    headerWritten = true;
+  }
+
+  function rewindPending(): void {
+    // Cursor back to the start of the pending tail, then erase forward.
+    // Bounded by maxPendingRows() so this never tries to reach into
+    // scrollback. Non-TTY: pending is never painted, nothing to rewind.
+    if (!out.isTTY) return;
+    if (pendingRows === 0 && pendingCol === 0) return;
+    if (pendingRows > 0) out.write(`\x1b[${pendingRows}F`);
+    else out.write("\r");
+    out.write("\x1b[0J");
+    pendingRows = 0;
+    pendingCol = 0;
+  }
+
+  function writeRawPending(text: string): void {
+    // Stream raw text indented two spaces (matching the markdown commit
+    // format), tracking visual rows for the next rewind. Each line of
+    // content gets its own indent so a rewind+rewrite reproduces the
+    // same shape.
+    if (text.length === 0) return;
+    const w = termWidth();
+    if (pendingRows === 0 && pendingCol === 0) {
+      out.write("  ");
+      pendingCol = 2;
+    }
+    for (const ch of text) {
+      if (ch === "\n") {
+        out.write("\n  ");
+        pendingRows++;
+        pendingCol = 2;
+        continue;
+      }
+      // Deferred-wrap accounting: terminals park the cursor at col=width
+      // and only advance to the next row when the *next* visible char
+      // arrives. Counting the wrap on the next char (not when col first
+      // reaches width) keeps pendingRows in sync with where the cursor
+      // actually sits, so the rewind moves up the right number of rows.
+      if (pendingCol >= w) {
+        pendingRows++;
+        pendingCol = 0;
+      }
+      out.write(ch);
+      pendingCol++;
+    }
+  }
+
+  function commitMarkdown(text: string): boolean {
+    if (text.length === 0) return false;
+    const lines = renderMarkdown(
+      text,
+      Math.max(20, termWidth() - 2),
+      out.isTTY ? undefined : plainTheme,
+    );
+    if (lines.length === 0) return false;
+    for (const line of lines) {
+      out.write("  ");
+      out.write(line);
+      out.write("\n");
+    }
+    return true;
+  }
+
+  function commitTail(tail: string): void {
+    if (tail.length === 0) return;
+    if (hasCommittedContent) out.write("\n");
+    if (commitMarkdown(tail)) hasCommittedContent = true;
+  }
+
+  function finalizeBlock(): void {
+    if (!headerWritten) return;
+    out.write("\n");
+    headerWritten = false;
+    committedText = "";
+    pendingText = "";
+    pendingRows = 0;
+    pendingCol = 0;
+    inFence = false;
+    hasCommittedContent = false;
+  }
+
+  function flushAssistant(): void {
+    if (!headerWritten) return;
+    rewindPending();
+    commitTail(pendingText);
+    finalizeBlock();
+  }
+
+  function findStableBoundary(
+    text: string,
+    startInFence: boolean,
+  ): { idx: number; endsInFence: boolean } | null {
+    // Earliest renderable point: position immediately after the last
+    // blank line that sits outside a code fence. The trailing blank
+    // proves the previous block is structurally complete (a paragraph
+    // with no trailing blank could still grow another line and reflow).
+    // The last text segment is excluded because it has no terminating
+    // newline yet — it might still grow.
+    let inF = startInFence;
+    let pos = 0;
+    let lastBoundary = -1;
+    let lastEndsInFence = startInFence;
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const segLen = line.length + (i < lines.length - 1 ? 1 : 0);
+      pos += segLen;
+      if (/^\s*```/.test(line)) inF = !inF;
+      if (i < lines.length - 1 && line.trim() === "" && !inF) {
+        lastBoundary = pos;
+        lastEndsInFence = inF;
+      }
+    }
+    return lastBoundary >= 0
+      ? { idx: lastBoundary, endsInFence: lastEndsInFence }
+      : null;
+  }
+
+  function countFenceToggles(text: string): boolean {
+    let toggled = false;
+    for (const line of text.split("\n")) {
+      if (/^\s*```/.test(line)) toggled = !toggled;
+    }
+    return toggled;
+  }
+
+  function forceFlushPending(): void {
+    // Pending tail outgrew the viewport-bounded rewind budget. Freeze
+    // what's on screen as raw committed text — markdown formatting is
+    // sacrificed for that span, but scrollback stays clean. Subsequent
+    // pending starts fresh on a new row.
+    if (pendingText.length === 0) {
+      pendingRows = 0;
+      pendingCol = 0;
       return;
     }
-    // Deferred-wrap model: most terminals park the cursor at col=width
-    // and only advance to the next line when the *next* character is
-    // written. So we count the wrap when the next char arrives, not
-    // when col first reaches width — otherwise a stream ending exactly
-    // at the wrap boundary over-counts by one line and we'd rewind too far.
-    if (col >= termWidth()) {
-      visualLines++;
-      col = 0;
+    if (countFenceToggles(pendingText)) inFence = !inFence;
+    committedText += pendingText;
+    pendingText = "";
+    hasCommittedContent = true;
+    if (pendingCol > 0) out.write("\n");
+    pendingRows = 0;
+    pendingCol = 0;
+  }
+
+  function processDelta(delta: string): void {
+    if (!out.isTTY) {
+      // Piped output: buffer silently. assistantText() commits the whole
+      // reply once at the end so log files don't get partial chunks.
+      pendingText += delta;
+      return;
     }
-    col++;
-    atLineStart = false;
-  }
-
-  function trackedWrite(s: string): void {
-    if (!s) return;
-    out.write(s);
-    // Skip ANSI escape sequences when counting visual width.
-    let i = 0;
-    while (i < s.length) {
-      if (s[i] === "\x1b" && s[i + 1] === "[") {
-        const end = s.indexOf("m", i);
-        if (end !== -1) {
-          i = end + 1;
-          continue;
-        }
-      }
-      trackChar(s[i]!);
-      i++;
+    ensureHeader();
+    pendingText += delta;
+    const boundary = findStableBoundary(pendingText, inFence);
+    if (boundary) {
+      const stable = pendingText.slice(0, boundary.idx);
+      const remainder = pendingText.slice(boundary.idx);
+      rewindPending();
+      commitTail(stable);
+      committedText += stable;
+      inFence = boundary.endsInFence;
+      pendingText = remainder;
+      writeRawPending(remainder);
+    } else {
+      rewindPending();
+      writeRawPending(pendingText);
     }
-  }
-
-  function rewindAssistant(): void {
-    // Cursor up to the start of the header line, then clear forward.
-    // Skipped on non-TTY because cursor codes don't make sense in a logfile.
-    if (!out.isTTY) return;
-    if (visualLines > 0) out.write(`\x1b[${visualLines}F`);
-    out.write("\x1b[0J");
-    visualLines = 0;
-    col = 0;
-    atLineStart = true;
-  }
-
-  function paintAssistantBlock(text: string): void {
-    // Rewinds (if open) and prints the header + markdown-rendered text.
-    // Caller is responsible for setting/keeping assistantOpen=true after.
-    if (assistantOpen) rewindAssistant();
-    trackedWrite(color(`${ANSI.bold}${ANSI.cyan}`, headerLabel) + "\n");
-    if (text.length === 0) return;
-    const lines = renderMarkdown(text, Math.max(20, termWidth() - 2), out.isTTY ? undefined : plainTheme);
-    for (const line of lines) {
-      trackedWrite("  ");
-      trackedWrite(line);
-      trackedWrite("\n");
-    }
-  }
-
-  function closeAssistant(): void {
-    if (!assistantOpen) return;
-    if (!atLineStart) out.write("\n");
-    assistantOpen = false;
-    atLineStart = true;
-    visualLines = 0;
-    col = 0;
-    assistantBuffer = "";
-    out.write("\n");
+    if (pendingRows > maxPendingRows()) forceFlushPending();
   }
 
   function padLine(s: string, w: number): string {
@@ -615,37 +750,45 @@ function createChatUI(opts: ChatUIOpts) {
       out.write("\n");
     },
 
-    /** Stream a chunk of assistant text. Appends to the per-block buffer
-     *  and re-renders the whole block as markdown on every chunk. On a
-     *  TTY this gives live formatted output; on non-TTY we silently
-     *  buffer and let assistantText() emit the rendered block once. */
+    /** Stream a chunk of assistant text. Each delta extends the pending
+     *  tail and either commits the just-stabilized block as markdown
+     *  (when a blank-line boundary appears) or repaints just the tail.
+     *  On non-TTY we silently buffer and let assistantText() commit the
+     *  whole reply once. */
     assistantDelta(text: string): void {
       if (!text) return;
-      assistantBuffer += text;
-      if (!out.isTTY) return;
-      paintAssistantBlock(assistantBuffer);
-      assistantOpen = true;
+      processDelta(text);
     },
 
-    /** Authoritative full text. Repaints with the canonical text (which
-     *  may differ slightly from the concatenated deltas) and closes the
-     *  block. On non-TTY this is when the markdown actually lands on
-     *  stdout, since deltas don't print in that mode. */
+    /** Authoritative full text. Commits any tail not already markdown-
+     *  rendered and closes the block. Trusts `full` over the streamed
+     *  buffer — if the provider sent something different from what we
+     *  concatenated (rare), we render the un-committed tail of `full`
+     *  rather than risk double-printing. */
     assistantText(full: string): void {
-      paintAssistantBlock(full);
-      assistantOpen = true;
-      closeAssistant();
+      ensureHeader();
+      if (!out.isTTY) {
+        commitTail(full);
+        finalizeBlock();
+        return;
+      }
+      rewindPending();
+      const tail = full.startsWith(committedText)
+        ? full.slice(committedText.length)
+        : pendingText;
+      commitTail(tail);
+      finalizeBlock();
     },
 
     toolCall(name: string, input: unknown): void {
-      closeAssistant();
+      flushAssistant();
       const head = color(ANSI.gray, "  ⏵ ");
       const body = color(ANSI.dim, `${name}(${summarizeInput(input)})`);
       out.write(`${head}${body}\n`);
     },
 
     toolResult(content: string, isError: boolean): void {
-      closeAssistant();
+      flushAssistant();
       const c = isError ? ANSI.red : ANSI.gray;
       const bodyColor = isError ? ANSI.red : ANSI.dim;
       const head = color(c, "  ⏷ ");
@@ -654,7 +797,7 @@ function createChatUI(opts: ChatUIOpts) {
     },
 
     retry(info: { attempt: number; status?: number; waitMs: number; message?: string }): void {
-      closeAssistant();
+      flushAssistant();
       const waitS = (info.waitMs / 1000).toFixed(1);
       const statusStr = info.status ? ` HTTP ${info.status}` : "";
       const reason =
@@ -668,7 +811,7 @@ function createChatUI(opts: ChatUIOpts) {
     },
 
     error(msg: string): void {
-      closeAssistant();
+      flushAssistant();
       out.write(color(ANSI.red, `  ⚠ ${msg}`) + "\n\n");
     },
 
@@ -686,7 +829,7 @@ function createChatUI(opts: ChatUIOpts) {
       stopReason: string;
       model: string;
     }): void {
-      closeAssistant();
+      flushAssistant();
       sessionStats.inputTokens += stats.inputTokens;
       sessionStats.outputTokens += stats.outputTokens;
       sessionStats.cacheReadTokens += stats.cacheReadTokens;
