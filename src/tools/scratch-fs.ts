@@ -45,6 +45,8 @@ export function buildScratchTools(opts: ScratchOptions): ToolDef[] {
 
   const readTool: ToolDef<{ path: string }, string> = {
     name: "scratch_read",
+    category: "scratch",
+    shortClause: "read a file from the task's scratch dir",
     description: "Read a text file from the task's scratch directory.",
     inputSchema: {
       type: "object",
@@ -57,6 +59,8 @@ export function buildScratchTools(opts: ScratchOptions): ToolDef[] {
 
   const writeTool: ToolDef<{ path: string; content: string }, string> = {
     name: "scratch_write",
+    category: "scratch",
+    shortClause: "write a file into the task's scratch dir",
     description: "Write a text file into the task's scratch directory; creates parents.",
     inputSchema: {
       type: "object",
@@ -77,6 +81,8 @@ export function buildScratchTools(opts: ScratchOptions): ToolDef[] {
 
   const listTool: ToolDef<{ path?: string }, string[]> = {
     name: "scratch_list",
+    category: "scratch",
+    shortClause: "list entries in a scratch subdirectory",
     description: "List entries in a scratch subdirectory.",
     inputSchema: {
       type: "object",
@@ -98,6 +104,8 @@ export function buildScratchTools(opts: ScratchOptions): ToolDef[] {
 
   const deleteTool: ToolDef<{ path: string }, string> = {
     name: "scratch_delete",
+    category: "scratch",
+    shortClause: "delete a file or subdir in scratch",
     description: "Delete a file or subdir under the task's scratch dir.",
     inputSchema: {
       type: "object",

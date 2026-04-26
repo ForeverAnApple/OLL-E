@@ -171,6 +171,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
   const write: ToolDef<WriteArgs, WriteResult> = {
     name: "memory_write",
     tier: "operational",
+    category: "memory",
+    shortClause: "record or update a memory (private/team/scratch)",
     description:
       "Write or update a memory. Memory is your persistent self across time — preferences, principles, goals, skills, knowledge. Role tags the posture: `principle` memories are your strict commitments (they're injected into every turn and passed to any child you spawn), `goal` is an in-flight intention, `skill`/`knowledge` is how-you-do-things. Default depth weights the belief under the resistance model: principles default to 10 (strict), other roles to 1 (lived). Scope: `private` (yours only) / `team` (shared with a team) / `scratch` (task-ephemeral). Pass `updates: <id>` to edit an existing memory you own.",
     inputSchema: {
@@ -278,6 +280,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
   const read: ToolDef<ReadArgs, ReadResult> = {
     name: "memory_read",
     tier: "operational",
+    category: "memory",
+    shortClause: "read one memory by id (audited)",
     description:
       "Read a memory by id. Emits an audit event (memory.read) so who-read-what-when is traceable. Scope-gated: you can only read your own private memories; team memories require team membership; scratch is owner-only.",
     inputSchema: {
@@ -317,6 +321,9 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
   const search: ToolDef<SearchArgs, SearchHit[]> = {
     name: "memory_search",
     tier: "operational",
+    category: "memory",
+    shortClause: "find what you've remembered",
+    alwaysLoaded: true,
     description:
       "Search your own memories (plus any team memories you have membership for). LIKE match over title and body. Filter by role (principle/goal/...), scope (private/team/scratch), or a specific actor. Default scope: private + team-you-belong-to. Empty query = recent memories by role/scope filter.",
     inputSchema: {
@@ -381,6 +388,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
 
   const promote: ToolDef<PromoteArgs, { id: string; scope: "team"; teamId: string }> = {
     name: "memory_promote",
+    category: "memory",
+    shortClause: "promote a private memory to team scope",
     tier: "operational",
     description:
       "Promote a private memory you own to team-scope. The memory keeps its id; a new memory.wrote event lands with scope=team and the given teamId. Team members can read from that point on. Promotion is operational (no ask-up needed); demotion is not a v0 operation.",
@@ -432,6 +441,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
 
   const forget: ToolDef<ForgetArgs, { id: string; forgotten: true }> = {
     name: "memory_forget",
+    category: "memory",
+    shortClause: "tombstone one of your own memories",
     tier: "operational",
     description:
       "Tombstone a memory you own. Emits memory.forgotten; the row is removed on projection. Audit (memory_reads) survives the forget. v0 does not gate forgetting on depth — the resistance model currently governs update-difficulty, not retirement-difficulty.",
@@ -479,6 +490,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
 
   const lineage: ToolDef<LineageArgs, LineageHit[]> = {
     name: "memory_lineage",
+    category: "memory",
+    shortClause: "walk ancestor memories (live, post-spawn)",
     tier: "operational",
     description:
       "Walk up your parent chain and surface ancestors' live memories for a given role (default: principle). This is the 'passive read access to the parent's ongoing culture' half of the pass-on model — seed principles are copied into your private memory at birth, but ancestors keep writing, and this tool lets you see what they're currently committed to. Read-only; emits memory.read per hit for audit. Respects strictly-solo private — ancestors' private memories are NEVER returned; only memories they've promoted to team (where you're a fellow member) appear. Use when you're weighing evidence you received against what the lineage holds; use memory_search first if you want to check your own seeded copies.",

@@ -31,6 +31,8 @@ import type { AgentScope } from "../store/schema.ts";
 import { tables } from "../store/index.ts";
 import { eq } from "drizzle-orm";
 import { loadPrinciples, renderPrinciples } from "../memory/principles.ts";
+import { renderToolCatalog } from "./catalog.ts";
+import { buildLoadoutTools } from "../tools/loadout.ts";
 import { runAgent, type AgentStep } from "./runtime.ts";
 
 export interface AgentLoopOptions {
@@ -70,6 +72,11 @@ interface Thread {
   pendingOrigin: Event[];
   /** Set by the single drain loop; undefined means no worker running. */
   worker?: Promise<void>;
+  /** Tool names whose schemas the agent has pulled into context for this
+   *  thread. Mutated by load_tools / unload_tools meta-tools. Always-
+   *  loaded tools are not tracked here — they're sent every turn
+   *  regardless. Per-thread runtime state, not persisted. */
+  loadedTools: Set<string>;
 }
 
 export interface AgentLoop {
@@ -88,7 +95,13 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
     let t = threads.get(id);
     if (t) return t;
     const loaded = agentDir ? tryLoadThread(agentDir, id) : null;
-    t = { id, messages: loaded ?? [], pending: [], pendingOrigin: [] };
+    t = {
+      id,
+      messages: loaded ?? [],
+      pending: [],
+      pendingOrigin: [],
+      loadedTools: new Set<string>(),
+    };
     threads.set(id, t);
     return t;
   }
@@ -155,7 +168,18 @@ async function runTurn(
 ): Promise<void> {
   thread.messages.push({ role: "user", content: text });
   try {
-    const tools = collectTools(opts);
+    // Loadout meta-tools capture this thread's loadedTools set in closure
+    // so load_tools / unload_tools mutate the right thread. Built per-turn
+    // because the closure is per-thread; the cost is two object literals.
+    const loadoutTools = buildLoadoutTools({
+      loadedTools: thread.loadedTools,
+      allTools: () => [...collectTools(opts), ...loadoutTools],
+    });
+    const tools = [...collectTools(opts), ...loadoutTools];
+    // Hot-reload pruning: if an extension was unloaded since last turn and
+    // its tool was in this thread's loaded set, drop the entry silently
+    // and emit a warning event. Otherwise the agent's loaded list lies.
+    pruneOrphanLoaded(thread, tools, opts, origin);
     const redactions = buildRedactionMap(tools);
     const scope = loadAgentScope(opts.store, opts.agentId);
     const grantProposed = new Set<string>();
@@ -164,18 +188,24 @@ async function runTurn(
     // one-surface memory — LOG 2026-04-23). Stable sort (depth desc,
     // id asc) keeps prompt caches warm across turns with no changes.
     const principleBlock = renderPrinciples(loadPrinciples(opts.store, opts.agentId));
+    // Tool catalog — pure function of the registered tool set, rendered
+    // into the stable identity segment so the agent reads "what exists"
+    // alongside its principles. Per-thread loaded state is encoded in
+    // the tools block (which the LLM provider caches separately), NOT
+    // in this catalog text — the catalog must stay stable across
+    // load_tools calls within a thread or it'll invalidate the prefix.
+    const catalogBlock = renderToolCatalog(tools);
     // Mailbox sidebar — a one-line situational awareness block appended
     // to the system prompt each turn. Makes delegation decidable: the
     // agent can see "I have 3 threads with pending work" and choose to
     // spawn a secretary, retarget, or stay focused.
     const sidebar = buildMailboxSidebar(allThreads, thread.id);
     // Structured system prompt with the cache breakpoint between stable
-    // (base + principles) and volatile (sidebar) segments. The stable
-    // segment carries cache_control; the sidebar appears after it
-    // uncached, so per-turn mailbox churn never invalidates the prefix.
+    // (base + principles + catalog) and volatile (sidebar) segments.
     const systemSegments = composeSystemSegments(
       opts.system,
       principleBlock,
+      catalogBlock,
       sidebar,
     );
     const result = await runAgent({
@@ -183,6 +213,7 @@ async function runTurn(
       model: opts.model,
       system: systemSegments,
       tools,
+      isLoaded: (name) => thread.loadedTools.has(name),
       toolCtx: {
         hostId: opts.hostId,
         extensionId: opts.agentId,
@@ -287,9 +318,12 @@ async function runTurn(
  * Compose the system prompt as ordered segments with the cache breakpoint
  * placed between stable and volatile content (LOG 2026-04-24).
  *
- * Stable (cached): base system prompt + principles. These change rarely;
- * an agent self-modifying its identity rewrites the principles row, which
- * does invalidate the cache — by design, that's the cost of self-modification.
+ * Stable (cached): base system prompt + principles + tool catalog. These
+ * change rarely; an agent self-modifying its identity rewrites the
+ * principles row, which does invalidate the cache — by design, that's
+ * the cost of self-modification. The tool catalog is a pure function of
+ * the registered tool set, so per-thread load_tools calls do NOT
+ * invalidate it (intentional — see catalog.ts).
  *
  * Volatile (uncached): mailbox sidebar. Updates every turn as threads come
  * and go. Keeping it in its own segment after the breakpoint means turn-by-turn
@@ -298,11 +332,13 @@ async function runTurn(
 function composeSystemSegments(
   base: string | undefined,
   principles: string | null,
+  catalog: string,
   sidebar: string,
 ): SystemSegment[] | undefined {
   const stable: string[] = [];
   if (base) stable.push(base);
   if (principles) stable.push(principles);
+  if (catalog) stable.push(catalog);
   const segments: SystemSegment[] = [];
   if (stable.length > 0) {
     segments.push({ text: stable.join("\n\n"), cache: "ephemeral" });
@@ -311,6 +347,38 @@ function composeSystemSegments(
     segments.push({ text: sidebar });
   }
   return segments.length > 0 ? segments : undefined;
+}
+
+/**
+ * Drop names from a thread's loadedTools set when their tool no longer
+ * exists in the current registry (extension hot-reloaded away). Emits a
+ * one-line warning event per dropped tool so the agent can see *why* its
+ * loadout shrunk between turns.
+ */
+function pruneOrphanLoaded(
+  thread: Thread,
+  tools: ToolDef[],
+  opts: AgentLoopOptions,
+  origin: Event,
+): void {
+  if (thread.loadedTools.size === 0) return;
+  const present = new Set(tools.map((t) => t.name));
+  for (const name of [...thread.loadedTools]) {
+    if (present.has(name)) continue;
+    thread.loadedTools.delete(name);
+    opts.bus.publish({
+      type: "tool.loaded-dropped",
+      hostId: opts.hostId,
+      actorId: opts.agentId,
+      parentEventId: origin.id,
+      threadId: thread.id,
+      durable: true,
+      payload: {
+        name,
+        reason: "tool no longer registered (extension unloaded?)",
+      },
+    });
+  }
 }
 
 function buildMailboxSidebar(

@@ -27,6 +27,15 @@ export interface AgentRunOptions {
    *  sidebar). */
   system?: string | SystemSegment[];
   tools?: ToolDef[];
+  /** Per-turn filter deciding which tools' schemas reach the LLM. Returns
+   *  true for names whose schema should be sent on the next round-trip.
+   *  Tools with `alwaysLoaded: true` are included regardless. The full
+   *  `tools` list is still required for `execute()` lookup — execution
+   *  is independent of which schemas were sent. Omit to send every tool
+   *  every turn (legacy behavior). The callback is consulted at the
+   *  start of each LLM round-trip, so a tool that mutates the loaded
+   *  set (e.g. `load_tools`) becomes visible on the next round. */
+  isLoaded?: (name: string) => boolean;
   toolCtx: ToolExecuteContext;
   messages: Message[];
   maxTurns?: number;
@@ -62,7 +71,6 @@ export interface AgentResult {
 export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   const model = opts.model ?? opts.llm.defaultModel;
   const maxTurns = opts.maxTurns ?? 10;
-  const toolSpecs: ToolSpec[] | undefined = opts.tools?.map(toToolSpec);
   const toolByName = new Map<string, ToolDef>();
   for (const t of opts.tools ?? []) toolByName.set(t.name, t);
 
@@ -76,6 +84,11 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   };
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    // Filter the tool surface per round-trip so a `load_tools` call
+    // mutating the loaded set (external to runAgent) becomes visible
+    // on the very next LLM call without rebuilding the runtime.
+    const visibleTools = filterVisibleTools(opts.tools, opts.isLoaded);
+    const toolSpecs: ToolSpec[] | undefined = visibleTools?.map(toToolSpec);
     const req: CompletionRequest = {
       model,
       messages,
@@ -158,4 +171,13 @@ function toToolSpec(t: ToolDef): ToolSpec {
     description: t.description,
     inputSchema: t.inputSchema,
   };
+}
+
+function filterVisibleTools(
+  tools: ToolDef[] | undefined,
+  isLoaded: ((name: string) => boolean) | undefined,
+): ToolDef[] | undefined {
+  if (!tools) return undefined;
+  if (!isLoaded) return tools;
+  return tools.filter((t) => t.alwaysLoaded === true || isLoaded(t.name));
 }

@@ -103,6 +103,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   > = {
     name: "write_extension",
     tier: "strategic",
+    category: "extension authoring",
+    shortClause: "write files into an extension dir + git-commit",
     description:
       "Write files into an extension directory and git-commit the subtree. Files is a map of relative path → content. Creates the extension dir if needed.",
     inputSchema: {
@@ -151,6 +153,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   const runSmoke: ToolDef<{ name: string }, { ok: true } | { ok: false; error: string }> = {
     name: "run_smoke_test",
     tier: "operational",
+    category: "extension authoring",
+    shortClause: "run an extension's smoke test without activating it",
     description:
       "Run an extension's smoke test without activating it. Resolves the extension's declared secrets the same way a register/reload would, so a smoke that passes here will pass on load.",
     inputSchema: {
@@ -206,6 +210,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   > = {
     name: "read_extension_file",
     tier: "operational",
+    category: "extension authoring",
+    shortClause: "read manifest / index.ts / smoke.ts before editing",
     description:
       "Read a file from a named extension's directory (e.g. manifest.json, index.ts, smoke.ts). Use this to inspect your own habitat before editing — reading beats guessing at error strings. Paths are relative to the extension dir and must not escape it.",
     inputSchema: {
@@ -256,6 +262,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   > = {
     name: "register_extension",
     tier: "strategic",
+    category: "extension authoring",
+    shortClause: "load (or reload) a named extension; smoke gate first",
     description: "Load (or reload) a named extension. Smoke gate runs first.",
     inputSchema: {
       type: "object",
@@ -276,6 +284,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   > = {
     name: "revert_extension",
     tier: "strategic",
+    category: "extension authoring",
+    shortClause: "revert an extension to a prior git sha and reload",
     description: "Revert an extension to a prior git sha and reload it.",
     inputSchema: {
       type: "object",
@@ -299,6 +309,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   > = {
     name: "extension_history",
     tier: "operational",
+    category: "extension authoring",
+    shortClause: "list recent commits touching an extension",
     description: "List recent commits touching the given extension.",
     inputSchema: {
       type: "object",
@@ -315,6 +327,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   const listStartersT: ToolDef<Record<string, never>, Array<{ name: string; description: string }>> = {
     name: "list_starters",
     tier: "operational",
+    category: "extension authoring",
+    shortClause: "list shipped starter extension templates",
     description: "List the starter extension templates shipped with the binary.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     execute: async () => listStarters().map(({ name, description }) => ({ name, description })),
@@ -332,6 +346,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   > = {
     name: "query_host_context",
     tier: "operational",
+    category: "host context",
+    shortClause: "live cwd, PATH, executables, loaded extensions",
     description:
       "Inspect the local host context before making filesystem or subprocess tool calls. Returns OLL-E data paths, process cwd/PATH, loaded extensions/tools, and whether requested commands are available on PATH. Use this instead of guessing extension/config paths or why a subprocess failed.",
     inputSchema: {
@@ -385,6 +401,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   > = {
     name: "install_starter",
     tier: "strategic",
+    category: "extension authoring",
+    shortClause: "copy a starter into extensions/ and commit",
     description:
       "Copy a named starter template into the extensions directory and git-commit it. Does not register.",
     inputSchema: {
@@ -440,6 +458,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     > = {
       name: "spawn_agent",
       tier: "strategic",
+      category: "delegation",
+      shortClause: "hire a child agent for a specific mission",
       description:
         "Hire a child agent to work on a specific mission. The child runs its own loop in its own thread and replies flow back in chat.* events tagged with the returned threadId. Scope must narrow under your own (narrowsScope) — you can only delegate authority you already hold. Use this when work will take multiple turns or shouldn't block the conversation.",
       inputSchema: {
@@ -491,6 +511,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     const killAgent: ToolDef<{ agentId: string }, { agentId: string; stopped: boolean }> = {
       name: "kill_agent",
       tier: "strategic",
+      category: "delegation",
+      shortClause: "stop a child agent's loop",
       description:
         "Stop a child agent's loop. The agents row stays for audit but the loop no longer receives mail. Use when a spawn turned out wrong, took too long, or the mission was obsoleted.",
       inputSchema: {
@@ -512,6 +534,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     > = {
       name: "list_agents",
       tier: "operational",
+      category: "delegation",
+      shortClause: "list agent loops running on this host",
       description: "List agent loops currently running on this host.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       execute: async () => manager.list().map((agentId) => ({ agentId })),
@@ -523,6 +547,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     > = {
       name: "retarget_thread",
       tier: "strategic",
+      category: "delegation",
+      shortClause: "route inbound on a thread to a different agent",
       description:
         "Route future inbound in a thread to a different agent's mailbox (e.g. a secretary takes over DMs while you focus on work). Omit toAgentId to clear the override and let the bridge's default target (usually root) apply again.",
       inputSchema: {
@@ -551,6 +577,9 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     > = {
       name: "mail_list",
       tier: "operational",
+      category: "mailbox",
+      shortClause: "summarize threads with mail addressed to you",
+      alwaysLoaded: true,
       description:
         "Summarize your mailbox — which threads have recent events addressed to you, ordered by most-recent. The per-turn sidebar shows live threads you've already touched; this call reveals durable mail from threads you haven't ingested yet (e.g. a spawned child's progress, a cron-triggered task). Safe to call before deciding whether to switch focus / delegate.",
       inputSchema: {
@@ -577,6 +606,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     > = {
       name: "set_secret",
       tier: "strategic",
+      category: "secrets",
+      shortClause: "store a host-scoped secret on disk (mode 0600)",
       description:
         "Store a host-scoped secret (e.g. DISCORD_TOKEN). Written to disk mode 0600 and surfaced to extensions that declare it in manifest.secrets. The value is redacted from audit events and persisted session messages. Use before registering an extension that needs the secret.",
       sensitiveInputFields: ["value"],
@@ -611,6 +642,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     > = {
       name: "list_secrets",
       tier: "operational",
+      category: "secrets",
+      shortClause: "list stored secret names (values never returned)",
       description: "List names of stored secrets (values are never returned).",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       execute: async () => {
@@ -627,6 +660,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     const removeSecret: ToolDef<{ name: string }, { name: string; removed: boolean }> = {
       name: "remove_secret",
       tier: "strategic",
+      category: "secrets",
+      shortClause: "remove a stored secret by name",
       description: "Remove a stored secret by name. No-op if absent.",
       inputSchema: {
         type: "object",

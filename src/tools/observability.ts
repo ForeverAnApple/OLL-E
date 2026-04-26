@@ -50,6 +50,8 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
   > = {
     name: "query_my_usage",
     tier: "operational",
+    category: "observability",
+    shortClause: "token + USD rollup over a window",
     description:
       "Token + cache spend rollup with per-model breakdown. Defaults to the calling agent over all time. USD is computed from current prices — if a model has no posted price you'll see pricePosted=false on its row, meaning the USD column is a fallback estimate. Use this to notice when your cache hit ratio is low (=> you're regenerating prefix needlessly; consider stabilizing your system prompt or moving volatile content behind the cache breakpoint).",
     inputSchema: {
@@ -87,6 +89,8 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
   > = {
     name: "query_my_budget",
     tier: "operational",
+    category: "observability",
+    shortClause: "current budget cap and spend",
     description:
       "Current budget allocation: cap (USD/tokens), spent, percent consumed. Defaults to the calling agent. When percentUsd is high, propose a raise via the inbox (askUp) instead of self-rationing — budget caps are real-money constraints owned by your principal, not arbitrary throttles.",
     inputSchema: {
@@ -118,6 +122,8 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
   > = {
     name: "query_my_runs",
     tier: "operational",
+    category: "observability",
+    shortClause: "task_run history (succeeded/failed/lost)",
     description:
       "Recent task_runs (one row per scheduler dispatch). Defaults to the calling agent, ordered most-recent-first. Filter by status to find failures (status='failed') or stalled work (status='lost' = daemon restarted while running). Use this to audit your own behavior — repeated 'failed' on the same task is a signal to inspect the handler or revert the responsible extension.",
     inputSchema: {
@@ -148,6 +154,8 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
   > = {
     name: "query_my_threads",
     tier: "operational",
+    category: "observability",
+    shortClause: "threads addressed to your mailbox, with cache stats",
     description:
       "List threads addressed to your mailbox, ordered by most-recent activity. Each row carries that thread's cache hit ratio (computed from chat.usage events seen in the scan window). Complements the per-turn mailbox sidebar by surfacing durable thread data that the sidebar elides — useful before delegating, retargeting, or auditing children's work.",
     inputSchema: {
@@ -179,6 +187,9 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
   > = {
     name: "query_self",
     tier: "operational",
+    category: "observability",
+    shortClause: "your identity, scope, and tools",
+    alwaysLoaded: true,
     description:
       "Read your own identity surface: name, parent, system prompt, scope (allowed tools/tiers), principle count, registered tools, and which models you've recently used. Use this to introspect before self-modifying — knowing your own current state beats guessing.",
     inputSchema: {
@@ -207,6 +218,8 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
   > = {
     name: "query_events",
     tier: "operational",
+    category: "observability",
+    shortClause: "raw event-log query (use sparingly)",
     description:
       "Generic event-log query. All filters optional — combine actorId/type/threadId/toAgentId/since to narrow. Use sparingly: the event log is the source of truth and large reads cost tokens; prefer the specialized query_* tools when they answer your question.",
     inputSchema: {

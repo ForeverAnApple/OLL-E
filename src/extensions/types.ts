@@ -30,6 +30,21 @@ export interface ToolDef<I = unknown, O = unknown> {
    *  the world (extensions, external services) are strategic; tools that
    *  rewrite mission/budget/goals are vision. */
   tier?: Tier;
+  /** Catalog category this tool belongs in. The catalog renderer groups
+   *  tools by category and emits a category-level blurb before listing
+   *  members. Falls back to `"misc"` (rendered last) when absent. */
+  category?: string;
+  /** One short clause used in the catalog under the tool's name —
+   *  purposive ("when to reach for this"), not structural. The catalog
+   *  uses this instead of `description` to keep per-tool entries tight;
+   *  the full description still ships when the tool's schema is loaded. */
+  shortClause?: string;
+  /** When true, the tool's schema is sent to the LLM on every turn. When
+   *  false (the default), the schema is deferred — agents pull it into
+   *  context with the `load_tools` meta-tool. Default false because tool
+   *  schemas cost LLM context every turn; flip true only for tools used
+   *  on most turns of most threads. */
+  alwaysLoaded?: boolean;
   /** JSON Schema describing the tool's input. Handed straight to the LLM
    *  vendor's tool-use spec — the host does not introspect it. Extensions
    *  author this as a plain object (or convert from their preferred schema
