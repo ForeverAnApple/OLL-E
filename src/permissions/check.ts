@@ -26,6 +26,18 @@ export type CheckResult =
   | { ok: true }
   | { ok: false; reason: string; code: "denied-by-deny" | "not-in-allow" | "tier-not-allowed" };
 
+const KNOWN_TIERS: ReadonlySet<Tier> = new Set<Tier>(["operational", "strategic", "vision"]);
+
+export function assertValidScope(scope: AgentScope): void {
+  if (!scope.allowTiers) return;
+  const bad = scope.allowTiers.filter((t) => !KNOWN_TIERS.has(t as Tier));
+  if (bad.length > 0) {
+    throw new Error(
+      `permissions: allowTiers contains unknown tier(s) ${bad.map((b) => `"${b}"`).join(", ")} — known tiers: ${[...KNOWN_TIERS].join(", ")}`,
+    );
+  }
+}
+
 export function checkTool(scope: AgentScope, tool: ToolPolicyInput): CheckResult {
   if (scope.denyTools?.includes(tool.name)) {
     return { ok: false, code: "denied-by-deny", reason: `tool "${tool.name}" is in denyTools` };
