@@ -12,7 +12,7 @@
 // returns the same rows — parallel-tool-surface rule.
 
 import type { ToolDef } from "../extensions/types.ts";
-import { enrichDecisions, type EnrichedDecision, type Inbox, type Vote } from "../inbox/index.ts";
+import { enrichDecisions, type EnrichedDecision, type Inbox, type UserVote } from "../inbox/index.ts";
 import type { Decision } from "../store/schema.ts";
 import type { Store } from "../store/db.ts";
 
@@ -63,7 +63,7 @@ export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
   const respond: ToolDef<
     {
       id: string;
-      vote: Vote;
+      vote: UserVote;
       message?: string;
       payloadOverride?: Record<string, unknown>;
     },

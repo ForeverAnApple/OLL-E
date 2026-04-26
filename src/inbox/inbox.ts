@@ -17,7 +17,12 @@ import type { Tier } from "../scheduler/index.ts";
 import { and, desc, eq, inArray, like, lt } from "drizzle-orm";
 
 export type DecisionStatus = "open" | "approved" | "denied" | "modified" | "stale";
-export type Vote = "approve" | "deny" | "modify";
+// `stale` is a system-emitted vote — `sweepStale` writes it on auto-expiry.
+// Subscribers handle it explicitly rather than learning a new event type.
+// User-driven `respond()` is restricted to UserVote; the wider Vote shows up
+// only on the resolved-event payload.
+export type UserVote = "approve" | "deny" | "modify";
+export type Vote = UserVote | "stale";
 
 export interface Proposal {
   principalId: string;
@@ -34,7 +39,7 @@ export interface Proposal {
 export interface RespondInput {
   decisionId: string;
   actorId: string;
-  vote: Vote;
+  vote: UserVote;
   message?: string;
   /** For modify votes: the replacement payload. */
   payloadOverride?: Record<string, unknown>;
@@ -227,7 +232,7 @@ export function createInbox(opts: InboxOptions): Inbox {
           principalId: d.principalId,
           proposingAgentId: d.proposingAgentId,
           status: "stale",
-          vote: null,
+          vote: "stale",
         },
       });
     }
