@@ -784,6 +784,10 @@ interface Route {
 const routes = new Map<string, Route>();
 const accumulators = new Map<string, string[]>();
 const turnActors = new Map<string, string>();
+// Tracks threads where discord_send was called explicitly during the current
+// turn. When set, the auto-relay at turn-end is suppressed to avoid a
+// duplicate message.
+const turnExplicitSend = new Set<string>();
 
 let cfg: Config | null = null;
 let wakeRe: RegExp | null = null;
@@ -857,6 +861,15 @@ export function register(api: any) {
     if (ev.actorId) turnActors.set(threadId, ev.actorId as string);
   });
 
+  // When discord_send is called explicitly during a turn, mark the thread so
+  // the auto-relay at turn-end doesn't send a duplicate message.
+  api.on("chat.tool-call", (ev: any) => {
+    const threadId = ev.threadId;
+    if (!threadId || !routes.has(threadId)) return;
+    const p = ev.payload as { name?: string };
+    if (p.name === "discord_send") turnExplicitSend.add(threadId);
+  });
+
   api.on("chat.turn-end", async (ev: any) => {
     const threadId = ev.threadId;
     if (!threadId) return;
@@ -865,7 +878,10 @@ export function register(api: any) {
     const text = finalize(threadId);
     const actor = turnActors.get(threadId);
     turnActors.delete(threadId);
-    if (!text) return;
+    const explicit = turnExplicitSend.delete(threadId);
+    // If the agent already called discord_send explicitly this turn, the prose
+    // was already delivered (or intentionally omitted). Don't double-send.
+    if (!text || explicit) return;
     try {
       await api.callTool(
         "discord_send",
@@ -882,6 +898,7 @@ export function register(api: any) {
     if (!threadId) return;
     accumulators.delete(threadId);
     turnActors.delete(threadId);
+    turnExplicitSend.delete(threadId);
   });
 }
 
@@ -889,6 +906,7 @@ export function unload() {
   routes.clear();
   accumulators.clear();
   turnActors.clear();
+  turnExplicitSend.clear();
   cfg = null;
   wakeRe = null;
 }
