@@ -1,7 +1,7 @@
 import { startDaemon } from "../daemon/daemon.ts";
 import { resolvePaths } from "../paths.ts";
 import { connectIpc } from "../ipc/client.ts";
-import { renderMarkdown } from "./markdown.ts";
+import { plainTheme, renderMarkdown } from "./markdown.ts";
 import type {
   AgentSelf,
   BudgetStatus,
@@ -565,7 +565,7 @@ function createChatUI(opts: ChatUIOpts) {
     if (assistantOpen) rewindAssistant();
     trackedWrite(color(`${ANSI.bold}${ANSI.cyan}`, headerLabel) + "\n");
     if (text.length === 0) return;
-    const lines = renderMarkdown(text, Math.max(20, termWidth() - 2));
+    const lines = renderMarkdown(text, Math.max(20, termWidth() - 2), out.isTTY ? undefined : plainTheme);
     for (const line of lines) {
       trackedWrite("  ");
       trackedWrite(line);

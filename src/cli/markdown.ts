@@ -26,7 +26,7 @@ const ANSI = {
   gray: "\x1b[90m",
 };
 
-interface Theme {
+export interface Theme {
   heading(text: string, level: number): string;
   bold(text: string): string;
   italic(text: string): string;
@@ -34,6 +34,7 @@ interface Theme {
   code(text: string): string;
   codeBlock(text: string): string;
   codeFence(text: string): string;
+  codeHighlight(text: string, lang: string): string;
   link(text: string, href: string): string;
   bullet(text: string): string;
   quoteBar: string;
@@ -51,6 +52,7 @@ const defaultTheme: Theme = {
   code: (t) => `${ANSI.magenta}${t}${ANSI.reset}`,
   codeBlock: (t) => `${ANSI.green}${t}${ANSI.reset}`,
   codeFence: (t) => `${ANSI.dim}${t}${ANSI.reset}`,
+  codeHighlight: (text, lang) => highlightCodeLine(text, lang),
   link: (text, href) =>
     text === href
       ? `${ANSI.cyan}${ANSI.underline}${text}${ANSI.reset}`
@@ -58,6 +60,21 @@ const defaultTheme: Theme = {
   bullet: (t) => `${ANSI.cyan}${t}${ANSI.reset}`,
   quoteBar: `${ANSI.dim}│${ANSI.reset} `,
   hr: (w) => `${ANSI.dim}${"─".repeat(Math.min(w, 60))}${ANSI.reset}`,
+};
+
+export const plainTheme: Theme = {
+  heading: (text, level) => `${"#".repeat(level)} ${text}`,
+  bold: (t) => t,
+  italic: (t) => t,
+  strike: (t) => t,
+  code: (t) => t,
+  codeBlock: (t) => t,
+  codeFence: (t) => t,
+  codeHighlight: (text) => text,
+  link: (text, href) => (text === href ? text : `${text} (${href})`),
+  bullet: (t) => t,
+  quoteBar: "> ",
+  hr: (w) => "-".repeat(Math.min(w, 60)),
 };
 
 /** Strip ANSI escape sequences for visible-length math. */
@@ -164,7 +181,7 @@ function renderBlock(token: Token, width: number, theme: Theme): string[] {
       const lang = normalizeLang(c.lang ?? "");
       const out = [theme.codeFence(`\`\`\`${c.lang ?? ""}`)];
       for (const ln of c.text.split("\n")) {
-        out.push(lang ? highlightCodeLine(ln, lang) : theme.codeBlock(ln));
+        out.push(lang ? theme.codeHighlight(ln, lang) : theme.codeBlock(ln));
       }
       out.push(theme.codeFence("```"));
       out.push("");

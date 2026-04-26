@@ -858,9 +858,8 @@ interface Route {
 const routes = new Map<string, Route>();
 const accumulators = new Map<string, string[]>();
 const turnActors = new Map<string, string>();
-// Tracks threads where discord_send was called explicitly during the current
-// turn. When set, the auto-relay at turn-end is suppressed to avoid a
-// duplicate message.
+// Tracks threads where discord_send was called explicitly to the current
+// route during the turn. Other Discord sends must not suppress the reply.
 const turnExplicitSend = new Set<string>();
 
 let cfg: Config | null = null;
@@ -935,13 +934,18 @@ export function register(api: any) {
     if (ev.actorId) turnActors.set(threadId, ev.actorId as string);
   });
 
-  // When discord_send is called explicitly during a turn, mark the thread so
-  // the auto-relay at turn-end doesn't send a duplicate message.
+  // When discord_send is called explicitly to this conversation's route, mark
+  // the thread so the auto-relay at turn-end doesn't send a duplicate message.
   api.on("chat.tool-call", (ev: any) => {
     const threadId = ev.threadId;
     if (!threadId || !routes.has(threadId)) return;
-    const p = ev.payload as { name?: string };
-    if (p.name === "discord_send") turnExplicitSend.add(threadId);
+    const route = routes.get(threadId)!;
+    const p = ev.payload as { name?: string; input?: unknown };
+    if (p.name !== "discord_send") return;
+    const input = p.input && typeof p.input === "object" ? p.input as Record<string, unknown> : {};
+    if (input.channel_id === route.channelId && input.reply_to === route.originMessageId) {
+      turnExplicitSend.add(threadId);
+    }
   });
 
   api.on("chat.turn-end", async (ev: any) => {

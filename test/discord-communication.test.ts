@@ -197,6 +197,157 @@ describe("discord-communication bridge (mailbox-routed)", () => {
     });
   });
 
+  it("does not suppress the turn-end reply for unrelated discord_send tool calls", async () => {
+    const r = rig();
+    writeDiscordStub(tmp);
+    installStarterInto(tmp, "discord-communication");
+
+    const host = createExtensionHost({
+      ...r,
+      extensionsDir: tmp,
+      defaultTaskAgentId: r.rootAgentId,
+    });
+    await host.load("discord");
+    await host.load("discord-communication");
+
+    const seenCalls: Array<{ caller: string; targetExtension: string; tool: string }> = [];
+    r.bus.subscribe("tool.called", (ev) => {
+      seenCalls.push(ev.payload as (typeof seenCalls)[number]);
+    });
+
+    r.bus.publish({
+      type: "channel-message",
+      hostId: r.hostId,
+      actorId: "discord",
+      durable: true,
+      payload: {
+        message_id: "m-unrelated",
+        guild_id: null,
+        channel_id: "dm-unrelated",
+        thread_id: null,
+        author: { id: "user-unrelated", name: "riley", bot: false },
+        content: "send a message to #general and tell me when done",
+        mentions: [],
+        reply_to: null,
+        is_dm: true,
+        is_mention: false,
+      },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    const threadId = "discord:dm-unrelated:user-unrelated";
+    r.bus.publish({
+      type: "chat.assistant-text",
+      hostId: r.hostId,
+      actorId: r.rootAgentId,
+      durable: true,
+      threadId,
+      payload: { text: "Done." },
+    });
+    r.bus.publish({
+      type: "chat.tool-call",
+      hostId: r.hostId,
+      actorId: r.rootAgentId,
+      durable: true,
+      threadId,
+      payload: {
+        name: "discord_send",
+        input: { channel_id: "general", content: "A side-channel send." },
+      },
+    });
+    r.bus.publish({
+      type: "chat.turn-end",
+      hostId: r.hostId,
+      actorId: r.rootAgentId,
+      durable: true,
+      threadId,
+      payload: {},
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(seenCalls).toHaveLength(1);
+    expect(seenCalls[0]).toMatchObject({
+      caller: "discord-communication",
+      targetExtension: "discord",
+      tool: "discord_send",
+    });
+  });
+
+  it("suppresses the turn-end reply when discord_send targets the current route", async () => {
+    const r = rig();
+    writeDiscordStub(tmp);
+    installStarterInto(tmp, "discord-communication");
+
+    const host = createExtensionHost({
+      ...r,
+      extensionsDir: tmp,
+      defaultTaskAgentId: r.rootAgentId,
+    });
+    await host.load("discord");
+    await host.load("discord-communication");
+
+    const seenCalls: Array<{ caller: string; targetExtension: string; tool: string }> = [];
+    r.bus.subscribe("tool.called", (ev) => {
+      seenCalls.push(ev.payload as (typeof seenCalls)[number]);
+    });
+
+    r.bus.publish({
+      type: "channel-message",
+      hostId: r.hostId,
+      actorId: "discord",
+      durable: true,
+      payload: {
+        message_id: "m-current-route",
+        guild_id: null,
+        channel_id: "dm-current-route",
+        thread_id: null,
+        author: { id: "user-current-route", name: "sam", bot: false },
+        content: "reply here",
+        mentions: [],
+        reply_to: null,
+        is_dm: true,
+        is_mention: false,
+      },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    const threadId = "discord:dm-current-route:user-current-route";
+    r.bus.publish({
+      type: "chat.assistant-text",
+      hostId: r.hostId,
+      actorId: r.rootAgentId,
+      durable: true,
+      threadId,
+      payload: { text: "Already sent." },
+    });
+    r.bus.publish({
+      type: "chat.tool-call",
+      hostId: r.hostId,
+      actorId: r.rootAgentId,
+      durable: true,
+      threadId,
+      payload: {
+        name: "discord_send",
+        input: {
+          channel_id: "dm-current-route",
+          content: "Already sent.",
+          reply_to: "m-current-route",
+        },
+      },
+    });
+    r.bus.publish({
+      type: "chat.turn-end",
+      hostId: r.hostId,
+      actorId: r.rootAgentId,
+      durable: true,
+      threadId,
+      payload: {},
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(seenCalls).toEqual([]);
+  });
+
   it("ignores guild-channel messages that aren't in watchedChannels and lack a wake-word", async () => {
     const r = rig();
     writeDiscordStub(tmp);
