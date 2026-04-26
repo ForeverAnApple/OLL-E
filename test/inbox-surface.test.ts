@@ -8,7 +8,7 @@
 //      the same Inbox the IPC handlers use, so `mail_list`/`mail_respond`
 //      see identical rows.
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,13 +21,20 @@ let daemon: Daemon;
 let client: IpcClient;
 let tmp: string;
 
-beforeEach(async () => {
+// Daemon lifecycle is shared across the file; only inbox state resets per test.
+// Per-test daemon spinup was ~200ms × 13 tests = ~2.5s of pure setup.
+beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "olle-inbox-surface-"));
   daemon = await startDaemon({ root: tmp, version: "test", quiet: true });
   client = await connectIpc(daemon.paths.socketFile);
 });
 
-afterEach(async () => {
+beforeEach(() => {
+  daemon.store.raw.exec("DELETE FROM approvals");
+  daemon.store.raw.exec("DELETE FROM decisions");
+});
+
+afterAll(async () => {
   client.close();
   await daemon.shutdown();
   rmSync(tmp, { recursive: true, force: true });
