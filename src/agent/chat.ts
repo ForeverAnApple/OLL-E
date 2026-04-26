@@ -257,6 +257,7 @@ async function runTurn(
       durable: true,
       payload: {
         stopReason: result.stopReason,
+        model: opts.model ?? opts.llm.defaultModel,
         inputTokens: result.totalUsage.inputTokens,
         outputTokens: result.totalUsage.outputTokens,
         cacheReadTokens: result.totalUsage.cacheReadInputTokens,

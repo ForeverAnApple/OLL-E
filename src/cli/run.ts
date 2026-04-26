@@ -355,6 +355,7 @@ async function cmdChat(): Promise<void> {
           cacheCreationTokens: numFrom(p.cacheCreationTokens),
           usdMicros: numFrom(p.usdMicros),
           stopReason: String(p.stopReason ?? ""),
+          model: typeof p.model === "string" ? p.model : "",
         });
         turnBusy = false;
         prompt();
@@ -379,6 +380,7 @@ async function cmdChat(): Promise<void> {
   });
   prompt = () => {
     if (turnBusy) return;
+    ui.statusLine();
     rl.setPrompt(ui.promptString());
     rl.prompt();
   };
@@ -491,6 +493,17 @@ function createChatUI(opts: ChatUIOpts) {
   let assistantBuffer = "";
   let assistantOpen = false;
   let atLineStart = true;
+  // Cumulative session stats — accumulated across every chat.turn-end
+  // and rendered as a single dim line above the next prompt. Replaces
+  // the per-turn border footer that used to print after every reply.
+  const sessionStats = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    usdMicros: 0,
+    model: "",
+  };
   // Visual line and column tracking inside the open assistant block,
   // including the header line. Used to rewind+redraw with markdown
   // on every streamed chunk and on the authoritative chat.assistant-text.
@@ -659,6 +672,11 @@ function createChatUI(opts: ChatUIOpts) {
       out.write(color(ANSI.red, `  ⚠ ${msg}`) + "\n\n");
     },
 
+    /** Accumulate per-turn usage into running session totals. The
+     *  rendered output is deferred to statusLine(), which the prompt
+     *  loop calls right before each readline prompt — so the user
+     *  sees one quiet line rather than a noisy border after every
+     *  reply. */
     turnEnd(stats: {
       inputTokens: number;
       outputTokens: number;
@@ -666,19 +684,40 @@ function createChatUI(opts: ChatUIOpts) {
       cacheCreationTokens: number;
       usdMicros: number;
       stopReason: string;
+      model: string;
     }): void {
       closeAssistant();
+      sessionStats.inputTokens += stats.inputTokens;
+      sessionStats.outputTokens += stats.outputTokens;
+      sessionStats.cacheReadTokens += stats.cacheReadTokens;
+      sessionStats.cacheCreationTokens += stats.cacheCreationTokens;
+      sessionStats.usdMicros += stats.usdMicros;
+      if (stats.model) sessionStats.model = stats.model;
+      // Surface non-normal stop reasons immediately — user shouldn't
+      // wait for the next prompt to learn the turn cut off early.
+      if (stats.stopReason && stats.stopReason !== "end_turn") {
+        out.write(color(ANSI.dim, `  ⌁ stop: ${stats.stopReason}`) + "\n");
+      }
+    },
+
+    /** Single-line dim status, rendered just above the next prompt.
+     *  Left side: cumulative tokens + cost. Right side: model name.
+     *  Suppressed entirely when there's nothing meaningful to show
+     *  (first prompt, before any turn has completed). */
+    statusLine(): void {
       const parts: string[] = [];
-      if (stats.inputTokens) parts.push(`↑${formatTokens(stats.inputTokens)}`);
-      if (stats.outputTokens) parts.push(`↓${formatTokens(stats.outputTokens)}`);
-      if (stats.cacheReadTokens) parts.push(`R${formatTokens(stats.cacheReadTokens)}`);
-      if (stats.cacheCreationTokens) parts.push(`W${formatTokens(stats.cacheCreationTokens)}`);
-      if (stats.usdMicros) parts.push(formatUsd(stats.usdMicros));
-      if (stats.stopReason && stats.stopReason !== "end_turn") parts.push(stats.stopReason);
-      const inner = parts.length ? `  ${parts.join("  ")}  ` : "  · ";
+      if (sessionStats.inputTokens) parts.push(`↑${formatTokens(sessionStats.inputTokens)}`);
+      if (sessionStats.outputTokens) parts.push(`↓${formatTokens(sessionStats.outputTokens)}`);
+      if (sessionStats.cacheReadTokens) parts.push(`R${formatTokens(sessionStats.cacheReadTokens)}`);
+      if (sessionStats.cacheCreationTokens) parts.push(`W${formatTokens(sessionStats.cacheCreationTokens)}`);
+      if (sessionStats.usdMicros) parts.push(formatUsd(sessionStats.usdMicros));
+      const left = parts.join(" ");
+      const right = sessionStats.model;
+      if (!left && !right) return;
       const w = termWidth();
-      const tail = "─".repeat(Math.max(2, w - inner.length - 2));
-      out.write(color(ANSI.dim, `─${inner}${tail}`) + "\n");
+      const padNeeded = Math.max(1, w - visibleLen(left) - visibleLen(right));
+      const line = `${left}${" ".repeat(padNeeded)}${right}`;
+      out.write(color(ANSI.dim, line) + "\n");
     },
   };
 }
