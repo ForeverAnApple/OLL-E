@@ -17,7 +17,7 @@
 // at spawn — which goes through the manager directly, not through these
 // tools.
 
-import { and, desc, eq, like, or } from "drizzle-orm";
+import { and, desc, eq, inArray, like, or } from "drizzle-orm";
 import type { EventBus } from "../bus/index.ts";
 import type { Store } from "../store/db.ts";
 import type { ToolDef } from "../extensions/types.ts";
@@ -237,8 +237,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
       // the parent-trace is gone forever. New writes (no `updates`)
       // start fresh — null on both fields. (Pass-on at spawn writes
       // these directly through the manager, not through this tool.)
-      let authoredBy: string | undefined;
-      let seededFrom: string | undefined;
+      let authoredBy: string | null | undefined;
+      let seededFrom: string | null | undefined;
 
       if (id) {
         const existing = loadMemory(id);
@@ -251,8 +251,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
         updated = true;
         // Inherit the existing scope_ref when not explicitly re-set.
         if (!scopeRef) scopeRef = existing.scopeRef;
-        authoredBy = existing.authoredBy ?? undefined;
-        seededFrom = existing.seededFrom ?? undefined;
+        authoredBy = existing.authoredBy;
+        seededFrom = existing.seededFrom;
       } else {
         id = ulid();
       }
@@ -276,7 +276,7 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
           id,
           actorId: ctx.actorId,
           scope,
-          scopeRef: scopeRef ?? undefined,
+          scopeRef,
           role,
           title: args.title,
           bodyMd: args.bodyMd,
@@ -353,7 +353,26 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
     },
     execute: async (args, ctx) => {
       const limit = Math.max(1, Math.min(args.limit ?? 20, 100));
-      const parts = [];
+
+      // Caller's accessible team ids — needed so the SQL scope filter
+      // doesn't have to fall back to a JS-side membership check.
+      const teamIds = store
+        .select({ teamId: tables.teamMembers.teamId })
+        .from(tables.teamMembers)
+        .where(eq(tables.teamMembers.actorId, ctx.actorId))
+        .all()
+        .map((r) => r.teamId);
+
+      // Scope visibility: own private + own scratch + own team writes +
+      // any team the caller belongs to. Encoded as a SQL OR so the
+      // database returns only readable rows.
+      const ownAll = eq(tables.memories.actorId, ctx.actorId);
+      const teamVisible = teamIds.length
+        ? and(eq(tables.memories.scope, "team"), inArray(tables.memories.scopeRef, teamIds))!
+        : null;
+      const visibility = teamVisible ? or(ownAll, teamVisible)! : ownAll;
+
+      const parts = [visibility];
       if (args.query) {
         const q = `%${args.query}%`;
         parts.push(or(like(tables.memories.title, q), like(tables.memories.bodyMd, q))!);
@@ -361,42 +380,25 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
       if (args.role) parts.push(eq(tables.memories.role, args.role));
       if (args.scope) parts.push(eq(tables.memories.scope, args.scope));
       if (args.actor) parts.push(eq(tables.memories.actorId, args.actor));
-      const where = parts.length ? and(...parts) : undefined;
-      const rows = where
-        ? store
-            .select()
-            .from(tables.memories)
-            .where(where)
-            .orderBy(desc(tables.memories.updatedAt))
-            .limit(limit * 3) // over-fetch; scope filter may prune heavily
-            .all()
-        : store
-            .select()
-            .from(tables.memories)
-            .orderBy(desc(tables.memories.updatedAt))
-            .limit(limit * 3)
-            .all();
-      const hits: SearchHit[] = [];
-      for (const row of rows) {
-        if (hits.length >= limit) break;
-        const scope = row.scope as MemoryScope;
-        const denied = reasonReadDenied(
-          { actorId: row.actorId, scope, scopeRef: row.scopeRef ?? null },
-          ctx.actorId,
-        );
-        if (denied) continue;
-        hits.push({
-          id: row.id,
-          title: row.title,
-          role: row.role,
-          scope,
-          depth: row.depth,
-          actorId: row.actorId,
-          updatedAt: row.updatedAt,
-          snippet: row.bodyMd.length > 240 ? row.bodyMd.slice(0, 240) + "…" : row.bodyMd,
-        });
-      }
-      return hits;
+
+      const rows = store
+        .select()
+        .from(tables.memories)
+        .where(and(...parts))
+        .orderBy(desc(tables.memories.updatedAt))
+        .limit(limit)
+        .all();
+
+      return rows.map<SearchHit>((row) => ({
+        id: row.id,
+        title: row.title,
+        role: row.role,
+        scope: row.scope as MemoryScope,
+        depth: row.depth,
+        actorId: row.actorId,
+        updatedAt: row.updatedAt,
+        snippet: row.bodyMd.length > 240 ? row.bodyMd.slice(0, 240) + "…" : row.bodyMd,
+      }));
     },
   };
 
@@ -445,8 +447,8 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
           bodyMd: existing.bodyMd,
           tags: existing.tags,
           depth: existing.depth,
-          authoredBy: existing.authoredBy ?? undefined,
-          seededFrom: existing.seededFrom ?? undefined,
+          authoredBy: existing.authoredBy,
+          seededFrom: existing.seededFrom,
         },
       });
       return { id: existing.id, scope: "team", teamId: args.teamId };
@@ -549,23 +551,36 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
       }
       if (ancestors.length === 0) return [];
 
-      // One query per ancestor keeps the result order deterministic by
-      // hops-ascending (near-lineage before far). Private memories from
-      // the ancestor are excluded at query time — strictly-solo holds.
+      // Single fetch across the precomputed ancestor chain; ordering is
+      // restored in JS by walking ancestors in hops-ascending order and
+      // depth-descending within each. Private/scratch are filtered post-fetch
+      // because the ancestor's scope_ref column doesn't carry membership.
+      const hopsByActor = new Map(ancestors.map((a) => [a.id, a.hops] as const));
+      const ancestorIds = ancestors.map((a) => a.id);
+      const rows = store
+        .select()
+        .from(tables.memories)
+        .where(and(inArray(tables.memories.actorId, ancestorIds), eq(tables.memories.role, role)))
+        .orderBy(desc(tables.memories.depth))
+        .all();
+
+      const byActor = new Map<string, typeof rows>();
+      for (const row of rows) {
+        const list = byActor.get(row.actorId) ?? [];
+        list.push(row);
+        byActor.set(row.actorId, list);
+      }
+
       const hits: LineageHit[] = [];
       for (const anc of ancestors) {
         if (hits.length >= limit) break;
-        const rows = store
-          .select()
-          .from(tables.memories)
-          .where(and(eq(tables.memories.actorId, anc.id), eq(tables.memories.role, role)))
-          .orderBy(desc(tables.memories.depth))
-          .all();
-        for (const row of rows) {
+        const ancRows = byActor.get(anc.id);
+        if (!ancRows) continue;
+        for (const row of ancRows) {
           if (hits.length >= limit) break;
           const scope = row.scope as MemoryScope;
-          if (scope === "private") continue; // strictly-solo — never leaked up
-          if (scope === "scratch") continue; // task-ephemeral, not culture
+          if (scope === "private") continue;
+          if (scope === "scratch") continue;
           if (scope === "team") {
             if (!row.scopeRef) continue;
             if (!isTeamMember(row.scopeRef, ctx.actorId)) continue;
@@ -573,20 +588,25 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
           hits.push({
             id: row.id,
             actorId: row.actorId,
-            hopsFromCaller: anc.hops,
+            hopsFromCaller: hopsByActor.get(row.actorId)!,
             role: row.role,
             title: row.title,
             bodyMd: row.bodyMd,
             depth: row.depth,
           });
-          bus.publish({
-            type: MEMORY_READ,
-            hostId,
-            actorId: ctx.actorId,
-            durable: true,
-            payload: { id: row.id, readerActorId: ctx.actorId },
-          });
         }
+      }
+
+      // Audit events fire after the fetch, in the same hops-then-depth
+      // order callers see in the result.
+      for (const hit of hits) {
+        bus.publish({
+          type: MEMORY_READ,
+          hostId,
+          actorId: ctx.actorId,
+          durable: true,
+          payload: { id: hit.id, readerActorId: ctx.actorId },
+        });
       }
       return hits;
     },

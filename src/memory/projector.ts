@@ -20,9 +20,11 @@
 // per host. When cross-host mesh lands we need a tombstone records table
 // or equivalent. See LOG entry on memory surface for the full trade.
 
+import { eq } from "drizzle-orm";
 import type { EventBus } from "../bus/index.ts";
 import type { Event, Unsubscribe } from "../bus/types.ts";
 import type { Store } from "../store/db.ts";
+import { tables } from "../store/index.ts";
 import {
   MEMORY_FORGOTTEN,
   MEMORY_READ,
@@ -45,31 +47,6 @@ export interface MemoryProjector {
 
 export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
   const { bus, store, hostId } = opts;
-  const raw = store.raw;
-
-  // Prepared statements — projector runs on every durable memory event,
-  // preparing once up front is meaningfully cheaper.
-  const selectMemoryHlc = raw.prepare(
-    "SELECT hlc FROM memories WHERE id = ?",
-  );
-  const insertMemory = raw.prepare(
-    `INSERT INTO memories (
-       id, hlc, host_id, actor_id, scope, scope_ref, role, depth,
-       authored_by, seeded_from, title, body_md, tags,
-       created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  const updateMemory = raw.prepare(
-    `UPDATE memories SET
-       hlc = ?, actor_id = ?, scope = ?, scope_ref = ?,
-       role = ?, depth = ?, authored_by = ?, seeded_from = ?,
-       title = ?, body_md = ?, tags = ?, updated_at = ?
-     WHERE id = ?`,
-  );
-  const deleteMemory = raw.prepare("DELETE FROM memories WHERE id = ?");
-  const insertRead = raw.prepare(
-    "INSERT OR IGNORE INTO memory_reads (memory_id, reader_actor_id, at) VALUES (?, ?, ?)",
-  );
 
   function applyWrote(event: Event<MemoryWrotePayload>): void {
     const p = event.payload;
@@ -91,61 +68,81 @@ export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
       console.warn(`[memory.projector] skip ${p.id}: missing title or bodyMd`);
       return;
     }
-    const existing = selectMemoryHlc.get(p.id) as { hlc: string } | null;
+    const existing = store
+      .select({ hlc: tables.memories.hlc })
+      .from(tables.memories)
+      .where(eq(tables.memories.id, p.id))
+      .all()[0];
     const now = event.createdAt;
-    const tags = JSON.stringify(p.tags ?? []);
+    const tags = p.tags ?? [];
+    const depth = Number.isFinite(p.depth) ? p.depth : 1;
+    const role = p.role ?? "";
     if (!existing) {
-      insertMemory.run(
-        p.id,
-        event.hlc,
-        hostId,
-        p.actorId,
-        p.scope,
-        p.scopeRef ?? null,
-        p.role ?? "",
-        Number.isFinite(p.depth) ? p.depth : 1,
-        p.authoredBy ?? null,
-        p.seededFrom ?? null,
-        p.title,
-        p.bodyMd,
-        tags,
-        now,
-        now,
-      );
+      store
+        .insert(tables.memories)
+        .values({
+          id: p.id,
+          hlc: event.hlc,
+          hostId,
+          actorId: p.actorId,
+          scope: p.scope,
+          scopeRef: p.scopeRef ?? null,
+          role,
+          depth,
+          authoredBy: p.authoredBy ?? null,
+          seededFrom: p.seededFrom ?? null,
+          title: p.title,
+          bodyMd: p.bodyMd,
+          tags,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
       return;
     }
     // LWW by HLC (strings are lex-sortable by encodeStamp design).
     if (event.hlc <= existing.hlc) return;
-    updateMemory.run(
-      event.hlc,
-      p.actorId,
-      p.scope,
-      p.scopeRef ?? null,
-      p.role ?? "",
-      Number.isFinite(p.depth) ? p.depth : 1,
-      p.authoredBy ?? null,
-      p.seededFrom ?? null,
-      p.title,
-      p.bodyMd,
-      tags,
-      now,
-      p.id,
-    );
+    store
+      .update(tables.memories)
+      .set({
+        hlc: event.hlc,
+        actorId: p.actorId,
+        scope: p.scope,
+        scopeRef: p.scopeRef ?? null,
+        role,
+        depth,
+        authoredBy: p.authoredBy ?? null,
+        seededFrom: p.seededFrom ?? null,
+        title: p.title,
+        bodyMd: p.bodyMd,
+        tags,
+        updatedAt: now,
+      })
+      .where(eq(tables.memories.id, p.id))
+      .run();
   }
 
   function applyForgotten(event: Event<MemoryForgottenPayload>): void {
     const p = event.payload;
     if (!p || typeof p.id !== "string") return;
-    const existing = selectMemoryHlc.get(p.id) as { hlc: string } | null;
+    const existing = store
+      .select({ hlc: tables.memories.hlc })
+      .from(tables.memories)
+      .where(eq(tables.memories.id, p.id))
+      .all()[0];
     if (!existing) return;
     if (event.hlc <= existing.hlc) return;
-    deleteMemory.run(p.id);
+    store.delete(tables.memories).where(eq(tables.memories.id, p.id)).run();
   }
 
   function applyRead(event: Event<MemoryReadPayload>): void {
     const p = event.payload;
     if (!p || typeof p.id !== "string" || typeof p.readerActorId !== "string") return;
-    insertRead.run(p.id, p.readerActorId, event.createdAt);
+    store
+      .insert(tables.memoryReads)
+      .values({ memoryId: p.id, readerActorId: p.readerActorId, at: event.createdAt })
+      .onConflictDoNothing()
+      .run();
   }
 
   const subs: Unsubscribe[] = [
