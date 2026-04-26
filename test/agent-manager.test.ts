@@ -212,9 +212,10 @@ describe("agent manager — retarget_thread", () => {
     });
 
     expect(mgr.resolveMailbox("t1")).toBeUndefined();
-    mgr.retargetThread("t1", "secretary");
+    mgr.retargetThread("t1", "secretary", "test-agent");
     expect(mgr.resolveMailbox("t1")).toBe("secretary");
     expect(events).toHaveLength(1);
+    expect(events[0]!.actorId).toBe("test-agent");
     expect(events[0]!.payload).toMatchObject({
       threadId: "t1",
       current: "secretary",
@@ -222,7 +223,7 @@ describe("agent manager — retarget_thread", () => {
     });
 
     // Clearing with undefined removes the override.
-    mgr.retargetThread("t1", undefined);
+    mgr.retargetThread("t1", undefined, "test-agent");
     expect(mgr.resolveMailbox("t1")).toBeUndefined();
     expect(events).toHaveLength(2);
     expect(events[1]!.payload).toMatchObject({

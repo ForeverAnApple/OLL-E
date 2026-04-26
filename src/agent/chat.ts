@@ -34,6 +34,7 @@ import { loadPrinciples, renderPrinciples } from "../memory/principles.ts";
 import { renderToolCatalog } from "./catalog.ts";
 import { buildLoadoutTools } from "../tools/loadout.ts";
 import { runAgent, type AgentStep } from "./runtime.ts";
+import { buildRedactionMap, redactInput, redactMessages } from "./redaction.ts";
 
 export interface AgentLoopOptions {
   bus: EventBus;
@@ -217,7 +218,11 @@ async function runTurn(
       isLoaded: (name) => thread.loadedTools.has(name),
       toolCtx: {
         hostId: opts.hostId,
-        extensionId: opts.agentId,
+        // Empty-string sentinel = "this call is from a core tool, not
+        // an extension." Extension-contributed tools are wrapped in
+        // collectTools() to inject their real extensionId at execute
+        // time; this default only ever reaches a core tool.
+        extensionId: "",
         actorId: opts.agentId,
         abort: new AbortController().signal,
         secrets: {},
@@ -241,7 +246,30 @@ async function runTurn(
             input,
           },
         });
-        if (!opts.inbox || !opts.principalId) return;
+        if (!opts.inbox || !opts.principalId) {
+          // Misconfig: scope check denied a call but there's no inbox /
+          // principal wired, so the agent can't ask-up for a grant.
+          // Distinct event type so chat-health doesn't count it as a
+          // chat outage and the CLI doesn't treat it as turn-terminal.
+          opts.bus.publish({
+            type: "tool.misconfig",
+            hostId: opts.hostId,
+            actorId: opts.agentId,
+            parentEventId: origin.id,
+            threadId: thread.id,
+            durable: true,
+            payload: {
+              error:
+                "tool denied and ask-up unavailable — no inbox/principal configured for this agent",
+              tool: tool.name,
+              tier: tool.tier ?? "operational",
+              reason,
+              hasInbox: Boolean(opts.inbox),
+              hasPrincipal: Boolean(opts.principalId),
+            },
+          });
+          return;
+        }
         if (grantProposed.has(tool.name)) return;
         grantProposed.add(tool.name);
         // Resolve agent name for the summary so the principal sees a
@@ -425,9 +453,22 @@ function buildMailboxSidebar(
 function collectTools(opts: AgentLoopOptions): ToolDef[] {
   const tools: ToolDef[] = [...(opts.coreTools ?? [])];
   if (opts.extensions) {
-    for (const { tool } of opts.extensions.tools()) tools.push(tool);
+    for (const { extensionId, tool } of opts.extensions.tools()) {
+      tools.push(wrapExtensionTool(tool, extensionId));
+    }
   }
   return tools;
+}
+
+/** Wrap an extension-contributed tool so its `execute` always receives a
+ *  ctx whose `extensionId` is the contributing extension's id, regardless
+ *  of what the chat agent's shared toolCtx carries. Without this every
+ *  extension tool would see whatever sentinel chat.ts plugged in. */
+function wrapExtensionTool(tool: ToolDef, extensionId: string): ToolDef {
+  return {
+    ...tool,
+    execute: (args, ctx) => tool.execute(args, { ...ctx, extensionId }),
+  } as ToolDef;
 }
 
 function loadAgentScope(store: Store, agentId: string): AgentScope {
@@ -475,42 +516,6 @@ function saveThread(
   } catch {
     // Best-effort; in-memory thread remains intact.
   }
-}
-
-function buildRedactionMap(tools: ToolDef[]): Map<string, string[]> {
-  const m = new Map<string, string[]>();
-  for (const t of tools) {
-    if (t.sensitiveInputFields && t.sensitiveInputFields.length) {
-      m.set(t.name, t.sensitiveInputFields);
-    }
-  }
-  return m;
-}
-
-function redactInput(input: unknown, fields: string[]): Record<string, unknown> {
-  const src = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
-  const out: Record<string, unknown> = { ...src };
-  for (const f of fields) {
-    if (f in out) out[f] = "[redacted]";
-  }
-  return out;
-}
-
-function redactMessages(
-  messages: Message[],
-  redactions: Map<string, string[]>,
-): Message[] {
-  return messages.map((m) => {
-    if (m.role !== "assistant" || typeof m.content === "string") return m;
-    const content = (m.content as unknown[]).map((block) => {
-      const b = block as { type?: string; name?: string; input?: unknown };
-      if (b.type !== "tool_use" || !b.name) return block;
-      const fields = redactions.get(b.name);
-      if (!fields) return block;
-      return { ...b, input: redactInput(b.input, fields) };
-    });
-    return { ...m, content } as Message;
-  });
 }
 
 function emitStep(

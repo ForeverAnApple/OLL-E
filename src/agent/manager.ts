@@ -20,7 +20,7 @@ import type { AgentScope } from "../store/schema.ts";
 import { tables } from "../store/index.ts";
 import { ulid } from "../id/index.ts";
 import { MEMORY_WROTE, type MemoryScope, type MemoryWrotePayload } from "../memory/events.ts";
-import { narrowsScope } from "../permissions/index.ts";
+import { assertValidScope, narrowsScope } from "../permissions/index.ts";
 import { startAgentLoop, type AgentLoop } from "./chat.ts";
 
 export interface AgentManagerDeps {
@@ -100,8 +100,14 @@ export interface AgentManager {
   list(): string[];
   /** Retarget a thread to a different agent. Bridges call
    *  `resolveMailbox(threadId)` when deciding where to publish — the
-   *  override wins. `undefined` as target removes the override. */
-  retargetThread(threadId: string, toAgentId: string | undefined): void;
+   *  override wins. `undefined` as target removes the override.
+   *  `callerId` is the agent on whose behalf the change is made; the
+   *  emitted `thread.retargeted` event attributes to it. */
+  retargetThread(
+    threadId: string,
+    toAgentId: string | undefined,
+    callerId: string,
+  ): void;
   /** Look up a thread's current mailbox target. Undefined = no override. */
   resolveMailbox(threadId: string): string | undefined;
   /** Stop every tracked loop (daemon shutdown). */
@@ -140,6 +146,7 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
     }
     const parentScope = (parent.scope as AgentScope) ?? {};
     const childScope: AgentScope = opts.scope ?? {};
+    assertValidScope(childScope);
     const check = narrowsScope(parentScope, childScope);
     if (!check.ok) {
       throw new Error(`spawn: child scope rejected — ${check.reason}`);
@@ -249,7 +256,11 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
     });
   }
 
-  function retargetThread(threadId: string, toAgentId: string | undefined): void {
+  function retargetThread(
+    threadId: string,
+    toAgentId: string | undefined,
+    callerId: string,
+  ): void {
     if (!threadId) throw new Error("retargetThread: threadId required");
     const previous = threadRoutes.get(threadId);
     if (toAgentId) threadRoutes.set(threadId, toAgentId);
@@ -257,7 +268,7 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
     deps.bus.publish({
       type: "thread.retargeted",
       hostId: deps.hostId,
-      actorId: agentFromCall() ?? "manager",
+      actorId: callerId,
       durable: true,
       threadId,
       payload: { threadId, previous, current: toAgentId ?? null },
@@ -284,13 +295,6 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
     resolveMailbox,
     shutdown,
   };
-}
-
-// There's no agent-call-stack yet; this is a placeholder for when we
-// thread caller identity through. For now retargeting is attributed to
-// the manager itself in the emitted event.
-function agentFromCall(): string | undefined {
-  return undefined;
 }
 
 interface PassOnArgs {

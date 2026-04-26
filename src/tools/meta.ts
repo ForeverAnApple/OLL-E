@@ -560,8 +560,8 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
         required: ["threadId"],
         additionalProperties: false,
       },
-      execute: async ({ threadId, toAgentId }) => {
-        manager.retargetThread(threadId, toAgentId);
+      execute: async ({ threadId, toAgentId }, ctx) => {
+        manager.retargetThread(threadId, toAgentId, ctx.actorId);
         const current = manager.resolveMailbox(threadId);
         return { threadId, current: current ?? null };
       },

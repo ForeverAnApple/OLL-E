@@ -585,6 +585,12 @@ Three design calls embedded:
 
 ---
 
+## 2026-04-26 — Caller identity for `retargetThread` (resolved same day)
+
+The `retarget_thread` meta-tool now passes `ctx.actorId` through to `manager.retargetThread`, so `thread.retargeted` events attribute to the agent that requested the redirect rather than to the manager process. `callerId` is required on the manager API; the previous `agentFromCall()` placeholder is removed. The earlier same-day [DEFERRED-to-v0.1] entry is retired — promoted in the same review pass that flagged the dead-weight parameter.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.
