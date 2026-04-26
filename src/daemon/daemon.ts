@@ -17,6 +17,7 @@ import { buildObservabilityTools } from "../tools/observability.ts";
 import { buildInboxTools } from "../tools/inbox.ts";
 import { checkCoreInvariants, formatFailures } from "../boot/invariants.ts";
 import { startChatHealthMonitor, type ChatHealthMonitor } from "./chat-health.ts";
+import { installFaultIsolation, type FaultIsolation } from "./fault-isolation.ts";
 import {
   buildMemoryTools,
   startMemoryProjector,
@@ -96,6 +97,16 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     resolveMailbox: (threadId) => managerHolder.ref?.resolveMailbox(threadId),
   });
   const ledger = createLedger({ bus, store, hostId });
+
+  // Route stray throws (timer callbacks, microtasks, naked promise
+  // rejections) into the existing per-extension circuit breaker instead
+  // of letting Node terminate the daemon. Architecture: crashed extensions
+  // auto-disable; the daemon does not. Installed once, before any
+  // extension code runs, so first-tick throws are covered too.
+  const faultIsolation: FaultIsolation = installFaultIsolation({
+    host: extensions,
+    log: opts.quiet ? () => {} : undefined,
+  });
 
   // Tracked so `status.chat` can explain the absence — the IPC handler
   // closes over these and reads them lazily, so chat startup can race
@@ -336,6 +347,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     await ipc.close();
     bus.close();
     store.close();
+    faultIsolation.uninstall();
     if (existsSync(paths.pidFile)) {
       try {
         unlinkSync(paths.pidFile);

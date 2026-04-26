@@ -37,6 +37,7 @@ function mockExtensions(): ExtensionHost {
     smokeTest: async () => ({ ok: true }),
     inventory: async () => [],
     reportFailure: () => {},
+    attribute: () => undefined,
     tools: () => [
       {
         extensionId: "ext-1",

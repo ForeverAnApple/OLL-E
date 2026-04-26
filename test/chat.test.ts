@@ -80,6 +80,7 @@ function fakeLiveExtensionHost(opts: {
     },
     smokeTest: async () => ({ ok: true }),
     reportFailure: () => {},
+    attribute: () => undefined,
     tools: () =>
       opts.loaded.has(opts.extensionName)
         ? [{ extensionId: opts.extensionName, tool: opts.tool }]

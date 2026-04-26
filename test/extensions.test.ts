@@ -422,6 +422,58 @@ describe("hot reload + failure tracking", () => {
     expect(host.tools().map((t) => t.tool.name)).toEqual(["v2"]);
   });
 
+  describe("attribute()", () => {
+    it("returns the extension name for a frame inside the extensions dir", async () => {
+      const r = rig();
+      writeExt(tmp, "alpha", { index: `export function register() {}` });
+      const host = createExtensionHost({ ...r, extensionsDir: tmp });
+      await host.load("alpha");
+      const err = new Error("synthetic");
+      err.stack = `Error: synthetic\n    at fn (${join(tmp, "alpha", "index.ts")}:5:3)`;
+      expect(host.attribute(err)).toBe("alpha");
+    });
+
+    it("returns the extension name for a frame inside the staging dir", async () => {
+      const r = rig();
+      writeExt(tmp, "beta", { index: `export function register() {}` });
+      const host = createExtensionHost({ ...r, extensionsDir: tmp });
+      await host.load("beta");
+      // Synthesize a stack frame matching the staging path the runtime
+      // copies extensions into. Shape: <tmpdir>/olle-stage-<host>/<name>/<ulid>/index.ts.
+      const stagingPath = join(tmpdir(), `olle-stage-${r.hostId}`, "beta", "01ABC", "index.ts");
+      const err = new Error("synthetic");
+      err.stack = `Error: synthetic\n    at fn (${stagingPath}:7:1)`;
+      expect(host.attribute(err)).toBe("beta");
+    });
+
+    it("returns undefined when no frame falls inside an extension", async () => {
+      const r = rig();
+      const host = createExtensionHost({ ...r, extensionsDir: tmp });
+      const err = new Error("synthetic");
+      err.stack = `Error: synthetic\n    at fn (/usr/local/lib/node_modules/something/index.js:1:1)`;
+      expect(host.attribute(err)).toBeUndefined();
+    });
+
+    it("does not attribute to extensions that are not currently loaded", async () => {
+      const r = rig();
+      // On-disk dir exists, but never loaded — a stale stack frame must
+      // not fire reportFailure on a name the host doesn't know.
+      writeExt(tmp, "gamma", { index: `export function register() {}` });
+      const host = createExtensionHost({ ...r, extensionsDir: tmp });
+      const err = new Error("synthetic");
+      err.stack = `Error: synthetic\n    at fn (${join(tmp, "gamma", "index.ts")}:1:1)`;
+      expect(host.attribute(err)).toBeUndefined();
+    });
+
+    it("handles non-Error throws gracefully", async () => {
+      const r = rig();
+      const host = createExtensionHost({ ...r, extensionsDir: tmp });
+      expect(host.attribute("a string")).toBeUndefined();
+      expect(host.attribute(undefined)).toBeUndefined();
+      expect(host.attribute({ stack: 42 })).toBeUndefined();
+    });
+  });
+
   it("auto-disables after repeated failures", async () => {
     const r = rig();
     writeExt(tmp, "flaky", {

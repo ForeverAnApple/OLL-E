@@ -647,6 +647,16 @@ Security review found that extension manifests declared broad capabilities infor
 
 ---
 
+## 2026-04-26 — Daemon survives extension throws via process-level fault isolation
+
+A stale on-disk `cron-trigger` manifest (predating the previous entry's eventWrites enforcement) sent the daemon into a crash-restart loop: its `setInterval` callback called `api.publish("cron.fire", …)`, the new authority assertion threw, and Node terminated the process because no `uncaughtException` handler was installed. The supervisor relaunched, the bug recurred immediately, and `olle chat` showed a continuous reconnect loop.
+
+Architecture already promised "crashed extensions auto-disable and notify; they do not take down the daemon," and the breaker was already built — `ExtensionHost.reportFailure` had been counting failures, tripping at 2-in-5min, marking the row crashed, and unloading. The missing piece was the wire from "Node would otherwise call `process.exit`" to that breaker. Resisted wrapping every `setInterval`/`setTimeout` at the api boundary (extensions call those directly; we don't control the call sites) and instead added a single `process.on("uncaughtException" | "unhandledRejection")` guard at daemon startup that calls a new `host.attribute(err)` (path-prefix match against the extensions dir and the in-memory staging dir) and routes attributable throws into the existing `reportFailure`. Unattributed throws log loudly and are dropped — daemon never exits. No new circuit-breaker primitive; the elegant fix was plumbing into the one that already existed. Lives in `src/daemon/fault-isolation.ts`; uninstalls on `daemon.shutdown()` so test harnesses don't accumulate handlers.
+
+Follow-up still owed: `reportFailure` emits `extension.crashed` events but does not yet post a decision-inbox item with the rollback option (the architecture's "Last working commit was X, options: revert / keep-disabled / inspect" UX). Tracked separately.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.

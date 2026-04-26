@@ -97,6 +97,15 @@ export interface ExtensionHost {
   /** Called by task handlers when an extension tool or trigger throws.
    *  Increments failure count and auto-disables past the threshold. */
   reportFailure(name: string, err: unknown): void;
+  /** Best-effort: walk the error's stack frames and return the loaded
+   *  extension name whose source they came from. Matches both the on-disk
+   *  extensions dir (where `register()` runs from in dev) and the staging
+   *  dir (where the compiled binary loads from at runtime). Returns
+   *  undefined when no frame falls inside an extension — used by the
+   *  daemon's uncaughtException guard to route stray throws into the
+   *  existing circuit breaker, while still logging anything that can't be
+   *  attributed. */
+  attribute(err: unknown): string | undefined;
   tools(): Array<{ extensionId: string; tool: ToolDef }>;
   triggers(): Array<{ extensionId: string; trigger: TriggerDef }>;
 }
@@ -154,6 +163,13 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   // outside the git-tracked extensions root so we don't commit copies.
   const stagingRoot = join(tmpdir(), `olle-stage-${opts.hostId}`);
   mkdirSync(stagingRoot, { recursive: true });
+
+  // Precompiled at construction: both dirs are stable for the lifetime
+  // of the host, and `attribute()` runs on every uncaughtException —
+  // re-escaping + re-compiling each call would be needless work.
+  const attributionRegexes = [opts.extensionsDir, stagingRoot].map(
+    (root) => new RegExp(`${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/([^/]+)`, "g"),
+  );
 
   /** Stage a fresh copy of the extension into a uniquely-named sibling
    *  directory so dynamic import resolves a new module URL — Bun's ESM
@@ -662,6 +678,27 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     }
   }
 
+  const errorStack = (err: unknown): string | undefined =>
+    err && typeof err === "object" && typeof (err as { stack?: unknown }).stack === "string"
+      ? (err as { stack: string }).stack
+      : undefined;
+
+  function attribute(err: unknown): string | undefined {
+    const stack = errorStack(err);
+    if (!stack) return undefined;
+    // First loaded extension whose source the stack mentions. Returns on
+    // first hit so a tall stack doesn't keep getting walked.
+    for (const re of attributionRegexes) {
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(stack)) !== null) {
+        const name = m[1];
+        if (name && loaded.has(name)) return name;
+      }
+    }
+    return undefined;
+  }
+
   function reportFailure(name: string, err: unknown): void {
     const record = loaded.get(name);
     if (!record) return;
@@ -715,6 +752,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     reload,
     smokeTest,
     reportFailure,
+    attribute,
     tools,
     triggers,
   };

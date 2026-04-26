@@ -31,6 +31,7 @@ function fakeExtensionHost(opts: {
     },
     smokeTest: async () => ({ ok: true }),
     reportFailure: () => {},
+    attribute: () => undefined,
     tools: () =>
       Object.entries(opts.toolsByExt).flatMap(([extensionId, tools]) =>
         tools.map((tool) => ({ extensionId, tool })),
