@@ -14,7 +14,7 @@ import { history, revertSubtree } from "../extensions/git.ts";
 import { installStarter, listStarters } from "../starters/index.ts";
 import type { OllePaths } from "../paths.ts";
 import type { Store } from "../store/index.ts";
-import type { Inbox, Vote } from "../inbox/index.ts";
+import { enrichDecision, enrichDecisions, type Inbox, type Vote } from "../inbox/index.ts";
 import {
   agentSelf,
   budgetStatus,
@@ -481,7 +481,8 @@ async function dispatch(
         const status = req.params?.status as string | undefined;
         const rows =
           status === "all" ? opts.inbox.listAll(principalId) : opts.inbox.listOpen(principalId);
-        send({ id: req.id, ok: true, value: rows });
+        const enriched = opts.store ? enrichDecisions(opts.store, rows) : rows;
+        send({ id: req.id, ok: true, value: enriched });
         return;
       }
       case "inbox.get": {
@@ -499,7 +500,11 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: `decision ${id} not found` } });
           return;
         }
-        send({ id: req.id, ok: true, value: row });
+        send({
+          id: req.id,
+          ok: true,
+          value: opts.store ? enrichDecision(opts.store, row) : row,
+        });
         return;
       }
       case "inbox.respond": {

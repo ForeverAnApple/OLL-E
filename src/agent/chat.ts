@@ -226,7 +226,7 @@ async function runTurn(
       onStep: (step) => emitStep(opts, thread.id, origin, step, redactions),
       authorize: (tool) =>
         checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),
-      onDenied: ({ tool, reason }) => {
+      onDenied: ({ tool, reason, input }) => {
         opts.bus.publish({
           type: "tool.denied",
           hostId: opts.hostId,
@@ -238,23 +238,37 @@ async function runTurn(
             tool: tool.name,
             tier: tool.tier ?? "operational",
             reason,
+            input,
           },
         });
         if (!opts.inbox || !opts.principalId) return;
         if (grantProposed.has(tool.name)) return;
         grantProposed.add(tool.name);
+        // Resolve agent name for the summary so the principal sees a
+        // human label, not a ULID. The store is authoritative; if the
+        // row is gone we fall back to the id.
+        const agentRow = opts.store
+          .select({ name: tables.agents.name })
+          .from(tables.agents)
+          .where(eq(tables.agents.id, opts.agentId))
+          .all()[0];
+        const agentLabel = agentRow?.name ?? opts.agentId;
         askUp(
           { bus: opts.bus, store: opts.store, hostId: opts.hostId, inbox: opts.inbox },
           {
             proposingAgentId: opts.agentId,
             principalId: opts.principalId,
             tier: "strategic",
-            summary: `grant ${opts.agentId} permission to call ${tool.name}`,
+            summary: `grant ${agentLabel} permission to call ${tool.name}(${summarizeInputArgs(input)})`,
             payload: {
               action: "grant_scope",
               agentId: opts.agentId,
+              agentName: agentLabel,
               tool: tool.name,
+              toolDescription: tool.description,
               tier: tool.tier ?? "operational",
+              input,
+              threadId: thread.id,
               reason,
             },
           },
@@ -396,7 +410,7 @@ function buildMailboxSidebar(
   }
   if (others.length === 0) return "";
   // Cap the visual — if an agent has 40 open threads the sidebar is
-  // not the right surface anyway; they should use mail_list for detail.
+  // not the right surface anyway; load query_my_threads for detail.
   const shown = others.slice(0, 8);
   const truncated = others.length - shown.length;
   const lines = shown.map(
@@ -404,7 +418,7 @@ function buildMailboxSidebar(
       `  - ${o.id}: ${o.pending} unread${o.msgs ? `, ${o.msgs} msgs in context` : ""}`,
   );
   const header = `Your mailbox — ${others.length} other thread(s) with activity:`;
-  const footer = truncated > 0 ? `\n  (+${truncated} more — call mail_list for full list)` : "";
+  const footer = truncated > 0 ? `\n  (+${truncated} more — load query_my_threads for full inventory)` : "";
   return `${header}\n${lines.join("\n")}${footer}`;
 }
 
@@ -595,4 +609,36 @@ function emitStep(
       payload: { ...step.info },
     });
   }
+}
+
+/** One-line summary of a denied tool call's input args, for the
+ *  grant_scope proposal summary. Mirrors what humans want to read first
+ *  on the inbox: "install_starter(discord)" beats raw ULIDs.
+ *
+ *  Strategy: pick a small set of well-known short keys, render
+ *  `key=value` pairs joined by spaces, capped to ~80 chars. Falls back
+ *  to a compact JSON when no recognizable shape. */
+function summarizeInputArgs(input: unknown): string {
+  if (input == null) return "";
+  if (typeof input !== "object") return String(input).slice(0, 80);
+  const obj = input as Record<string, unknown>;
+  const preferred = ["name", "id", "tool", "type", "channel", "to", "path", "scope", "starter"];
+  const parts: string[] = [];
+  for (const k of preferred) {
+    if (obj[k] != null && (typeof obj[k] === "string" || typeof obj[k] === "number")) {
+      parts.push(`${k}=${String(obj[k])}`);
+    }
+  }
+  if (parts.length === 0) {
+    // Fall back to a compact stringify; trim if long.
+    let s: string;
+    try {
+      s = JSON.stringify(obj);
+    } catch {
+      s = String(obj);
+    }
+    return s.length > 80 ? `${s.slice(0, 79)}…` : s;
+  }
+  const joined = parts.join(" ");
+  return joined.length > 80 ? `${joined.slice(0, 79)}…` : joined;
 }

@@ -12,20 +12,25 @@
 // returns the same rows — parallel-tool-surface rule.
 
 import type { ToolDef } from "../extensions/types.ts";
-import type { Inbox, Vote } from "../inbox/index.ts";
+import { enrichDecisions, type EnrichedDecision, type Inbox, type Vote } from "../inbox/index.ts";
 import type { Decision } from "../store/schema.ts";
+import type { Store } from "../store/db.ts";
 
 export interface InboxToolsOptions {
   inbox: Inbox;
   /** The host's principal id. v0 is single-principal so every agent on
    *  this host reads/responds against the same inbox. */
   principalId: string;
+  /** Store handle for resolving agent/principal display names on read.
+   *  Optional so existing tests that pass `{ inbox, principalId }` still
+   *  compile; the agent surface degrades to raw ids when omitted. */
+  store?: Store;
 }
 
 export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
-  const { inbox, principalId } = opts;
+  const { inbox, principalId, store } = opts;
 
-  const list: ToolDef<{ includeResolved?: boolean; limit?: number }, Decision[]> = {
+  const list: ToolDef<{ includeResolved?: boolean; limit?: number }, EnrichedDecision[] | Decision[]> = {
     name: "mail_list",
     tier: "operational",
     category: "mailbox",
@@ -48,10 +53,10 @@ export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
       additionalProperties: false,
     },
     execute: (args) => {
-      if (args.includeResolved) {
-        return inbox.listAll(principalId, args.limit ?? 50);
-      }
-      return inbox.listOpen(principalId);
+      const rows = args.includeResolved
+        ? inbox.listAll(principalId, args.limit ?? 50)
+        : inbox.listOpen(principalId);
+      return store ? enrichDecisions(store, rows) : rows;
     },
   };
 

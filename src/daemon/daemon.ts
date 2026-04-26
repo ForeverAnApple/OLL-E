@@ -168,7 +168,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       // the CLI (`olle inbox`) reads from. mail_list is always-loaded
       // (orientation tool); mail_respond is deferred (only needed when
       // voting on a proposal).
-      ...buildInboxTools({ inbox, principalId: rootPrincipalId }),
+      ...buildInboxTools({ inbox, principalId: rootPrincipalId, store }),
     ];
     // Children inherit the same tool set so they can themselves spawn,
     // read extension files, etc. Scope still gates what they get to use.

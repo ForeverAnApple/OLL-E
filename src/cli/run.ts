@@ -1162,11 +1162,23 @@ function fmtAge(ms: number): string {
 }
 
 async function cmdInbox(args: string[]): Promise<void> {
-  const [sub = "list", ...rest] = args;
+  // Default form (`olle inbox` with no subcommand) drops into the
+  // mutt-style TUI on a TTY. Pipes / scripts fall through to `list`
+  // so existing automation keeps working.
+  const ttyDefault = process.stdout.isTTY && process.stdin.isTTY;
+  const [sub = ttyDefault ? "tui" : "list", ...rest] = args;
   const paths = resolvePaths();
   const client = await connectIpc(paths.socketFile);
   try {
     switch (sub) {
+      case "tui": {
+        if (!process.stdout.isTTY || !process.stdin.isTTY) {
+          throw new Error("inbox tui requires a tty; use `olle inbox list` for non-tty");
+        }
+        const { runInboxTui } = await import("./inbox-tui.ts");
+        await runInboxTui({ client });
+        return;
+      }
       case "list": {
         const all = rest.includes("--all");
         const rows = await client.call<InboxRow[]>("inbox.list", {
@@ -1272,7 +1284,8 @@ function printHelp(): void {
       "  secret remove <NAME>        remove a stored secret",
       "",
       "  Inbox — async decisions awaiting your response (paired with mail_* tools):",
-      "  inbox [list] [--all]                          list open (or all) decisions",
+      "  inbox                                         interactive TUI (vim keys; ? for help)",
+      "  inbox list [--all]                            list open (or all) decisions",
       "  inbox show <id>                               full decision payload",
       "  inbox respond <id> approve|deny|modify [--message ...] [--payload {json}]",
       "",
