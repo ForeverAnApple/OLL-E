@@ -73,7 +73,24 @@ export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
 
   function applyWrote(event: Event<MemoryWrotePayload>): void {
     const p = event.payload;
-    if (!p || typeof p !== "object" || typeof p.id !== "string") return;
+    // Skip malformed payloads instead of throwing — one bad publisher
+    // (or a peer's replayed event in v1+ federation) must not poison
+    // the bus dispatch loop. The original publisher's tool layer is
+    // responsible for rejecting bad input; this is defense-in-depth.
+    if (!p || typeof p !== "object") return;
+    if (typeof p.id !== "string" || p.id.length === 0) return;
+    if (typeof p.actorId !== "string" || p.actorId.length === 0) {
+      console.warn(`[memory.projector] skip ${event.id}: missing actorId`);
+      return;
+    }
+    if (typeof p.scope !== "string") {
+      console.warn(`[memory.projector] skip ${p.id}: missing scope`);
+      return;
+    }
+    if (typeof p.title !== "string" || typeof p.bodyMd !== "string") {
+      console.warn(`[memory.projector] skip ${p.id}: missing title or bodyMd`);
+      return;
+    }
     const existing = selectMemoryHlc.get(p.id) as { hlc: string } | null;
     const now = event.createdAt;
     const tags = JSON.stringify(p.tags ?? []);

@@ -210,6 +210,17 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
       additionalProperties: false,
     },
     execute: async (args, ctx) => {
+      // Validate at the boundary — the LLM may send malformed args
+      // (omitted fields, snake_case, empty strings). Without this,
+      // the publish goes through and the projector crashes on NOT NULL,
+      // returning a "successful" id the agent can never read back.
+      if (typeof args.title !== "string" || args.title.length === 0) {
+        throw new Error("memory_write: title is required and must be a non-empty string");
+      }
+      if (typeof args.bodyMd !== "string" || args.bodyMd.length === 0) {
+        throw new Error("memory_write: bodyMd is required and must be a non-empty string");
+      }
+
       const role = args.role ?? "";
       const scope: MemoryScope = args.scope ?? "private";
       const tags = args.tags ?? [];
@@ -248,6 +259,9 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
 
       if (scope === "team" && !scopeRef) {
         throw new Error("memory_write: scope=team requires scopeRef (team id)");
+      }
+      if (scope === "scratch" && !scopeRef) {
+        throw new Error("memory_write: scope=scratch requires scopeRef (task_run id)");
       }
       if (scope === "private" && !scopeRef) {
         scopeRef = ctx.actorId;
