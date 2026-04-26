@@ -1,6 +1,7 @@
 import { startDaemon } from "../daemon/daemon.ts";
 import { resolvePaths } from "../paths.ts";
 import { connectIpc } from "../ipc/client.ts";
+import { renderMarkdown } from "./markdown.ts";
 import type {
   AgentSelf,
   BudgetStatus,
@@ -309,10 +310,16 @@ async function cmdChat(): Promise<void> {
   // Falls back to "root" only as a last resort — ids are ULID so the
   // lookup is cheap and authoritative.
   const { rootAgentId } = await client.call<{ rootAgentId: string }>("status.rootAgent");
+  // Resolve the agent's actual name so the banner says "olle" or whatever
+  // the principal named their agent — the ULID id is for logs, not eyes.
+  const self = await client
+    .call<AgentSelf | null>("observability.self", { agentId: rootAgentId })
+    .catch(() => null);
+  const agentName = self?.name?.trim() || "agent";
   const threadId = `cli:${Math.random().toString(36).slice(2, 10)}`;
   const sub = client.stream("tail", { type: "*" });
 
-  const ui = createChatUI({ agentId: rootAgentId, threadId });
+  const ui = createChatUI({ agentId: rootAgentId, agentName, threadId });
   ui.banner();
 
   let turnBusy = false;
@@ -325,10 +332,10 @@ async function cmdChat(): Promise<void> {
       if (ev.type === "chat.assistant-delta") {
         ui.assistantDelta(String(p.text ?? ""));
       } else if (ev.type === "chat.assistant-text") {
-        // Authoritative full text arrives after the deltas finish. We've
-        // already streamed it; just close the assistant block so the next
-        // tool/turn-end lands cleanly.
-        ui.assistantClose();
+        // Authoritative full text arrives after the deltas finish.
+        // Rewind the streamed plaintext and reprint with markdown
+        // applied so the user sees real headings/bold/code blocks.
+        ui.assistantText(String(p.text ?? ""));
       } else if (ev.type === "chat.tool-call") {
         ui.toolCall(String(p.name ?? "?"), p.input);
       } else if (ev.type === "chat.tool-result") {
@@ -433,10 +440,6 @@ function termWidth(): number {
   return w && w > 20 ? w : 80;
 }
 
-function shortAgent(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-3)}` : id;
-}
-
 function formatTokens(n: number): string {
   if (n < 1000) return String(n);
   if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
@@ -475,25 +478,69 @@ function visibleLen(s: string): number {
 
 interface ChatUIOpts {
   agentId: string;
+  agentName: string;
   threadId: string;
 }
 
 function createChatUI(opts: ChatUIOpts) {
   const out = process.stdout;
+  const headerLabel = `◆ ${opts.agentName}`;
   // Track open assistant block so consecutive deltas/chunks land under
-  // one "◆ olle" header instead of restamping it each time. Also tracks
+  // one header instead of restamping it each time. Also tracks
   // whether the last byte we wrote ended on a newline — important for
   // streaming deltas, which can arrive mid-line and need a leading "  "
   // indent only at the start of a fresh line.
   let assistantOpen = false;
   let atLineStart = true;
+  // Visual line and column tracking inside the open assistant block,
+  // including the header line. Used to rewind+redraw with markdown
+  // when the authoritative chat.assistant-text arrives.
+  let visualLines = 0; // total visual lines consumed (header + content + wraps)
+  let col = 0; // cursor column, 0-based; ANSI escapes don't bump this
+
+  function trackChar(ch: string): void {
+    if (ch === "\n") {
+      visualLines++;
+      col = 0;
+      atLineStart = true;
+      return;
+    }
+    // Deferred-wrap model: most terminals park the cursor at col=width
+    // and only advance to the next line when the *next* character is
+    // written. So we count the wrap when the next char arrives, not
+    // when col first reaches width — otherwise a stream ending exactly
+    // at the wrap boundary over-counts by one line and we'd rewind too far.
+    if (col >= termWidth()) {
+      visualLines++;
+      col = 0;
+    }
+    col++;
+    atLineStart = false;
+  }
+
+  function trackedWrite(s: string): void {
+    if (!s) return;
+    out.write(s);
+    // Skip ANSI escape sequences when counting visual width.
+    let i = 0;
+    while (i < s.length) {
+      if (s[i] === "\x1b" && s[i + 1] === "[") {
+        const end = s.indexOf("m", i);
+        if (end !== -1) {
+          i = end + 1;
+          continue;
+        }
+      }
+      trackChar(s[i]!);
+      i++;
+    }
+  }
 
   function ensureAssistantHeader(): void {
     if (assistantOpen) return;
-    out.write(color(`${ANSI.bold}${ANSI.cyan}`, "◆ olle") + "\n");
-    out.write("  "); // first-line indent
+    trackedWrite(color(`${ANSI.bold}${ANSI.cyan}`, headerLabel) + "\n");
+    trackedWrite("  "); // first-line indent
     assistantOpen = true;
-    atLineStart = false;
   }
 
   function closeAssistant(): void {
@@ -501,6 +548,8 @@ function createChatUI(opts: ChatUIOpts) {
     if (!atLineStart) out.write("\n");
     assistantOpen = false;
     atLineStart = true;
+    visualLines = 0;
+    col = 0;
     out.write("\n");
   }
 
@@ -515,13 +564,11 @@ function createChatUI(opts: ChatUIOpts) {
       const top = color(ANSI.cyan, `╭${"─".repeat(inner)}╮`);
       const bot = color(ANSI.cyan, `╰${"─".repeat(inner)}╯`);
       const side = color(ANSI.cyan, "│");
-      const title = `${ANSI.bold}olle chat${ANSI.reset}`;
-      const meta = `${color(ANSI.dim, "agent")} ${shortAgent(opts.agentId)}  ${color(ANSI.dim, "thread")} ${opts.threadId}`;
+      const title = `${ANSI.bold}${opts.agentName}${ANSI.reset}`;
       const hint = color(ANSI.dim, "/exit to quit · Ctrl-C to interrupt");
       const row = (s: string) => `${side} ${padLine(s, inner - 2)} ${side}\n`;
       out.write(`${top}\n`);
       out.write(row(title));
-      out.write(row(meta));
       out.write(row(hint));
       out.write(`${bot}\n\n`);
     },
@@ -544,26 +591,51 @@ function createChatUI(opts: ChatUIOpts) {
     assistantDelta(text: string): void {
       if (!text) return;
       ensureAssistantHeader();
-      // Walk the chunk char-by-char on newlines so multi-line deltas
-      // get re-indented; everything else writes through unchanged.
+      // Walk the chunk on newlines so multi-line deltas get re-indented;
+      // everything else writes through tracked.
       const parts = text.split("\n");
       for (let i = 0; i < parts.length; i++) {
         const part = parts[i]!;
         if (atLineStart && part.length > 0) {
-          out.write("  ");
-          atLineStart = false;
+          trackedWrite("  ");
         }
-        if (part.length > 0) out.write(part);
-        if (i < parts.length - 1) {
-          out.write("\n");
-          atLineStart = true;
-        }
+        if (part.length > 0) trackedWrite(part);
+        if (i < parts.length - 1) trackedWrite("\n");
       }
     },
 
-    /** Called when the authoritative chat.assistant-text arrives — the
-     *  stream is done, flush any trailing newline + visual gap. */
-    assistantClose(): void {
+    /** Authoritative full text. Rewinds the streamed plaintext and
+     *  re-emits the same block with markdown rendering applied. On
+     *  non-TTY (piping) we leave the streamed text alone — terminal
+     *  redraw codes don't make sense in a logfile. */
+    assistantText(full: string): void {
+      if (!assistantOpen) {
+        // No streamed deltas — render straight from the full text.
+        if (!full) return;
+        ensureAssistantHeader();
+        // Reset the "  " indent we just wrote; we'll re-prefix below.
+        // Easier path: just close and rewrite the rendered block from
+        // scratch via the redraw path.
+      }
+      const lines = renderMarkdown(full, Math.max(20, termWidth() - 2));
+      if (out.isTTY && assistantOpen) {
+        // Move cursor up to the header line and clear to end of screen.
+        // \x1b[<n>F: cursor up n lines, to column 1.
+        // \x1b[0J: clear from cursor to end of screen.
+        if (visualLines > 0) out.write(`\x1b[${visualLines}F`);
+        out.write("\x1b[0J");
+        visualLines = 0;
+        col = 0;
+        atLineStart = true;
+      }
+      // Reprint the header + rendered markdown.
+      trackedWrite(color(`${ANSI.bold}${ANSI.cyan}`, headerLabel) + "\n");
+      for (const line of lines) {
+        trackedWrite("  ");
+        trackedWrite(line);
+        trackedWrite("\n");
+      }
+      assistantOpen = true;
       closeAssistant();
     },
 

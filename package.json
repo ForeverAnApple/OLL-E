@@ -17,8 +17,9 @@
     "build": "bash scripts/build.sh"
   },
   "dependencies": {
-    "drizzle-orm": "^0.38.3",
     "@anthropic-ai/sdk": "^0.38.0",
+    "drizzle-orm": "^0.38.3",
+    "marked": "^18.0.2",
     "zod": "^3.24.1"
   },
   "devDependencies": {
