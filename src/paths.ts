@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 
 export interface OllePaths {
   readonly root: string;
@@ -51,6 +51,18 @@ export function ensurePaths(paths: OllePaths): void {
     paths.secretsDir,
     paths.threadsDir,
   ]) {
-    mkdirSync(dir, { recursive: true });
+    ensurePrivateDir(dir);
   }
+}
+
+function ensurePrivateDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = lstatSync(dir);
+  if (!st.isDirectory()) {
+    throw new Error(`paths: ${dir} exists but is not a directory`);
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`paths: ${dir} must not be a symlink`);
+  }
+  chmodSync(dir, 0o700);
 }

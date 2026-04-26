@@ -19,6 +19,7 @@ const cronTrigger: StarterTemplate = {
         version: "0.1.0",
         description: "Periodic event trigger. Configure intervalMs + eventType.",
         capabilities: ["trigger:cron"],
+        eventWrites: ["cron.fire"],
         config: { intervalMs: 60000, eventType: "cron.fire" },
       },
       null,
@@ -237,6 +238,7 @@ const discord: StarterTemplate = {
         description: "Discord gateway adapter: channel-message + member-join triggers, REST tools.",
         secrets: ["DISCORD_TOKEN"],
         capabilities: ["channel:discord", "trigger:channel-message", "trigger:member-join"],
+        eventWrites: ["channel-message", "member-join"],
         config: {
           // 1 (GUILDS) | 2 (GUILD_MEMBERS) | 512 (GUILD_MESSAGES) |
           // 4096 (DIRECT_MESSAGES) | 32768 (MESSAGE_CONTENT) = 37379.
@@ -799,6 +801,14 @@ const discordCommunication: StarterTemplate = {
         description: "Wake-word + DM bridge between Discord and the chat agent.",
         capabilities: ["bridge:discord-chat"],
         callsTools: ["discord_send"],
+        eventReads: [
+          "channel-message",
+          "chat.assistant-text",
+          "chat.tool-call",
+          "chat.turn-end",
+          "chat.error",
+        ],
+        eventWrites: ["chat.input"],
         config: {
           wakeWord: "olle",
           watchedChannels: [] as string[],

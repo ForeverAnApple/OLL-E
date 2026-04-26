@@ -1,6 +1,7 @@
 import { createServer, type Server, type Socket } from "node:net";
 import {
   existsSync,
+  chmodSync,
   mkdirSync,
   readdirSync,
   statSync,
@@ -77,6 +78,7 @@ export function createIpcServer(opts: IpcServerOptions): IpcServer {
         server.once("error", reject);
         server.listen(opts.socketPath, () => {
           server.off("error", reject);
+          chmodSync(opts.socketPath, 0o600);
           resolve();
         });
       });

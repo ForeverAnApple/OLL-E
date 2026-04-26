@@ -175,7 +175,8 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
       try {
         const args = tool.validate ? tool.validate(block.input) : block.input;
         const result = await tool.execute(args, opts.toolCtx);
-        const rendered = typeof result === "string" ? result : JSON.stringify(result);
+        const safeResult = redactToolResult(tool, result);
+        const rendered = typeof safeResult === "string" ? safeResult : JSON.stringify(safeResult);
         pushResult(block.id, block.name, rendered, false);
       } catch (err) {
         const msg = (err as Error).message ?? String(err);
@@ -203,4 +204,16 @@ function filterVisibleTools(
   if (!tools) return undefined;
   if (!isLoaded) return tools;
   return tools.filter((t) => t.alwaysLoaded === true || isLoaded(t.name));
+}
+
+function redactToolResult(tool: ToolDef, result: unknown): unknown {
+  if (tool.sensitiveOutput) return "[redacted]";
+  const fields = tool.sensitiveOutputFields;
+  if (!fields || fields.length === 0) return result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const out: Record<string, unknown> = { ...(result as Record<string, unknown>) };
+  for (const f of fields) {
+    if (f in out) out[f] = "[redacted]";
+  }
+  return out;
 }

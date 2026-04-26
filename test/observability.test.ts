@@ -11,6 +11,7 @@ import {
   threadInventory,
   usageStats,
 } from "../src/observability/index.ts";
+import { buildObservabilityTools } from "../src/tools/observability.ts";
 
 function rig() {
   const store = openStore({ path: ":memory:" });
@@ -232,6 +233,38 @@ describe("observability.threadInventory + recentEvents", () => {
 
     const recent = recentEvents(store, { threadId: "t1" });
     expect(recent.length).toBe(2);
+  });
+});
+
+describe("observability tools scope", () => {
+  it("query_events defaults to the caller and rejects cross-actor widening", async () => {
+    const { store, bus, hostId } = rig();
+    bus.publish({
+      type: "memory.wrote",
+      hostId,
+      actorId: "alice",
+      durable: true,
+      payload: { bodyMd: "alice private" },
+    });
+    bus.publish({
+      type: "memory.wrote",
+      hostId,
+      actorId: "bob",
+      durable: true,
+      payload: { bodyMd: "bob private" },
+    });
+    const tool = buildObservabilityTools({ store }).find((t) => t.name === "query_events")!;
+    const ctx = {
+      hostId,
+      extensionId: "",
+      actorId: "alice",
+      abort: new AbortController().signal,
+      secrets: {},
+    };
+    const own = await tool.execute({}, ctx);
+    expect(JSON.stringify(own)).toContain("alice private");
+    expect(JSON.stringify(own)).not.toContain("bob private");
+    expect(() => tool.execute({ actorId: "bob" }, ctx)).toThrow(/cross-actor/);
   });
 });
 

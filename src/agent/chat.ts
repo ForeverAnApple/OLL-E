@@ -29,7 +29,7 @@ import { askUp, type Inbox } from "../inbox/index.ts";
 import { checkTool } from "../permissions/index.ts";
 import type { AgentScope } from "../store/schema.ts";
 import { tables } from "../store/index.ts";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { loadPrinciples, renderPrinciples } from "../memory/principles.ts";
 import { renderToolCatalog } from "./catalog.ts";
 import { buildLoadoutTools, markLoaded, type LoadResultEntry } from "../tools/loadout.ts";
@@ -304,6 +304,11 @@ async function runTurn(
       catalogBlock,
       sidebar,
     );
+    const budgetBlock = paidBudgetBlock(opts, thread.id, origin);
+    if (budgetBlock) {
+      if (agentDir) saveThread(agentDir, thread, redactions);
+      return;
+    }
     const result = await runAgent({
       llm: opts.llm,
       model: opts.model,
@@ -451,6 +456,83 @@ async function runTurn(
       payload: { error: (err as Error).message },
     });
   }
+}
+
+function paidBudgetBlock(opts: AgentLoopOptions, threadId: string, origin: Event): boolean {
+  if (!opts.principalId) return false;
+  const rows = opts.store
+    .select()
+    .from(tables.budgets)
+    .where(
+      and(
+        eq(tables.budgets.principalId, opts.principalId),
+        eq(tables.budgets.agentId, opts.agentId),
+      ),
+    )
+    .all();
+  const blocked = rows.find((b) => {
+    const usdBlocked = b.capUsd != null && b.spentUsd >= b.capUsd;
+    const tokenBlocked = b.capTokens != null && b.spentTokens >= b.capTokens;
+    return usdBlocked || tokenBlocked;
+  });
+  if (!blocked) return false;
+
+  const reason =
+    blocked.capUsd != null && blocked.spentUsd >= blocked.capUsd
+      ? `USD budget exhausted for period ${blocked.period}`
+      : `token budget exhausted for period ${blocked.period}`;
+  opts.bus.publish({
+    type: "chat.error",
+    hostId: opts.hostId,
+    actorId: opts.agentId,
+    parentEventId: origin.id,
+    threadId,
+    durable: true,
+    payload: { error: `${reason}; paid LLM work paused until the cap is raised` },
+  });
+  opts.bus.publish({
+    type: "budget.exceeded",
+    hostId: opts.hostId,
+    actorId: opts.agentId,
+    parentEventId: origin.id,
+    threadId,
+    durable: true,
+    payload: {
+      principalId: opts.principalId,
+      agentId: opts.agentId,
+      period: blocked.period,
+      capUsd: blocked.capUsd,
+      spentUsd: blocked.spentUsd,
+      capTokens: blocked.capTokens,
+      spentTokens: blocked.spentTokens,
+    },
+  });
+  if (opts.inbox) {
+    try {
+      askUp(
+        { bus: opts.bus, store: opts.store, hostId: opts.hostId, inbox: opts.inbox },
+        {
+          proposingAgentId: opts.agentId,
+          principalId: opts.principalId,
+          tier: "strategic",
+          summary: `raise budget for agent ${opts.agentId}`,
+          payload: {
+            action: "raise_budget",
+            agentId: opts.agentId,
+            period: blocked.period,
+            currentCapUsd: blocked.capUsd,
+            currentSpentUsd: blocked.spentUsd,
+            currentCapTokens: blocked.capTokens,
+            currentSpentTokens: blocked.spentTokens,
+            reason,
+          },
+        },
+      );
+    } catch {
+      /* best-effort: the budget wall still holds */
+    }
+  }
+  return true;
 }
 
 /**

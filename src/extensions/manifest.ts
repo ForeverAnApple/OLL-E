@@ -31,5 +31,11 @@ export function validateManifest(value: unknown, context = "(unknown)"): Manifes
   if (Array.isArray(v.callsTools) && v.callsTools.every((x) => typeof x === "string")) {
     out.callsTools = v.callsTools as string[];
   }
+  if (Array.isArray(v.eventReads) && v.eventReads.every((x) => typeof x === "string")) {
+    out.eventReads = v.eventReads as string[];
+  }
+  if (Array.isArray(v.eventWrites) && v.eventWrites.every((x) => typeof x === "string")) {
+    out.eventWrites = v.eventWrites as string[];
+  }
   return out;
 }

@@ -20,6 +20,12 @@ export interface Manifest {
    *  front so the coupling is visible in git. Tools not listed here are
    *  rejected at call time; self-registered tools are not exempt. */
   callsTools?: string[];
+  /** Event types this extension may observe via api.on() or scheduler
+   *  tasks. Use "*" only for deliberately broad observability extensions. */
+  eventReads?: string[];
+  /** Event types this extension may emit via api.publish(), triggers, or
+   *  task ctx.emit(). Use "*" only for deliberately broad bridge layers. */
+  eventWrites?: string[];
 }
 
 export interface ToolDef<I = unknown, O = unknown> {
@@ -59,6 +65,13 @@ export interface ToolDef<I = unknown, O = unknown> {
    *  event or persisted message (e.g. secret bodies). The tool still
    *  receives the raw value; only the trace is sanitized. */
   sensitiveInputFields?: string[];
+  /** When true, the tool result is replaced with "[redacted]" before it
+   *  reaches the LLM transcript, event log, or persisted thread snapshot. */
+  sensitiveOutput?: boolean;
+  /** Output object fields whose values must be redacted before tracing or
+   *  feeding the result back to the model. Ignored when sensitiveOutput is
+   *  true. */
+  sensitiveOutputFields?: string[];
   execute(args: I, ctx: ToolExecuteContext): Promise<O> | O;
 }
 

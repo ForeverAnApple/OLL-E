@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, type Daemon } from "../src/daemon/daemon.ts";
@@ -35,6 +35,13 @@ describe("daemon + ipc", () => {
     expect(s.hostId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
     expect(s.pid).toBe(process.pid);
     expect(s.uptimeMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("creates private local IPC and data directories", () => {
+    expect(statSync(daemon.paths.root).mode & 0o777).toBe(0o700);
+    expect(statSync(daemon.paths.runDir).mode & 0o777).toBe(0o700);
+    expect(statSync(daemon.paths.secretsDir).mode & 0o777).toBe(0o700);
+    expect(statSync(daemon.paths.socketFile).mode & 0o777).toBe(0o600);
   });
 
   it("publish round-trips into the event store", async () => {
@@ -122,7 +129,12 @@ describe("daemon + ipc", () => {
     writeFileSync(
       join(extDir, "manifest.json"),
       JSON.stringify(
-        { name: "boot-bridge", version: "0.1.0", description: "boot bridge regression test" },
+        {
+          name: "boot-bridge",
+          version: "0.1.0",
+          description: "boot bridge regression test",
+          eventWrites: ["chat.input"],
+        },
         null,
         2,
       ),

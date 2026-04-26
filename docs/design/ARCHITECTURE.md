@@ -289,6 +289,8 @@ The unified flow for adding capabilities — channels, tools, trigger types, any
 5. **Hot-load**: daemon detects new/changed extension, validates manifest, loads into runtime. If load throws or smoke fails → extension is left on disk, marked inactive, inbox item emitted with error detail.
 6. **Live**: extension now participates in event routing; its tools/triggers available.
 
+Manifests are the visible authority boundary for extensions. `callsTools` lists cross-extension tool calls; `eventReads` and `eventWrites` list bus event types the extension may subscribe to or emit through direct publishes, triggers, or scheduler tasks. A broader event surface is authored as a normal manifest edit and passes through the same smoke + hot-load path.
+
 ### Core bundle (shipped in binary, not an extension)
 
 - LLM provider adapters (Anthropic, OpenAI) via API key config

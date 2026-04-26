@@ -6,6 +6,7 @@ import { createBus, persistToStore } from "../src/bus/index.ts";
 import { openStore, tables } from "../src/store/index.ts";
 import { ulid } from "../src/id/index.ts";
 import { startAgentLoop } from "../src/agent/chat.ts";
+import { createInbox } from "../src/inbox/index.ts";
 import type { Completion, CompletionRequest, Llm } from "../src/llm/types.ts";
 import type { ExtensionHost, ToolDef } from "../src/extensions/index.ts";
 
@@ -474,6 +475,54 @@ describe("agent loop over the mailbox", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("blocks paid LLM work when the caller's budget is already exhausted", async () => {
+    const r = rig();
+    const principalId = ulid();
+    r.store.insert(tables.principals).values({
+      id: principalId,
+      display: "p",
+      channels: [],
+      createdAt: Date.now(),
+    }).run();
+    r.store.insert(tables.budgets).values({
+      id: ulid(),
+      principalId,
+      agentId: r.agentId,
+      period: "all-time",
+      capUsd: 1,
+      capTokens: null,
+      spentUsd: 1,
+      spentTokens: 0,
+      updatedAt: Date.now(),
+    }).run();
+    const inbox = createInbox({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const llm = mockLlm([]);
+    startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      principalId,
+      inbox,
+    });
+    const done = new Promise<string>((resolve) => {
+      r.bus.subscribe("chat.error", (e) => resolve((e.payload as { error: string }).error));
+    });
+    r.bus.publish({
+      type: "chat.input",
+      hostId: r.hostId,
+      actorId: "cli",
+      durable: true,
+      toAgentId: r.agentId,
+      threadId: "budget-block",
+      payload: { text: "spend" },
+    });
+    const error = await done;
+    expect(error).toContain("budget exhausted");
+    expect(inbox.listOpen(principalId)).toHaveLength(1);
   });
 });
 

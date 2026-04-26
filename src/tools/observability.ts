@@ -8,8 +8,9 @@
 // terminal, they go through `olle stats` / `olle threads`.
 //
 // Defaults are scoped to the calling agent (ctx.actorId) — agents read
-// their own world by default. Filters can widen to the whole host but
-// require explicit input, so a vague query never leaks unrelated data.
+// their own world by default. Raw event queries stay scoped too; widening
+// belongs to a future authority-aware observability action, not this
+// operational tool.
 
 import type { Store } from "../store/index.ts";
 import type { ToolDef } from "../extensions/types.ts";
@@ -234,16 +235,32 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
       },
       additionalProperties: false,
     },
-    execute: (args) =>
+    execute: (args, ctx) =>
       recentEvents(store, {
-        actorId: args.actorId,
+        actorId: scopedActor(args.actorId, ctx.actorId, "query_events"),
         type: args.type,
         threadId: args.threadId,
-        toAgentId: args.toAgentId,
+        toAgentId: scopedAgent(args.toAgentId, ctx.actorId, "query_events"),
         since: args.since,
         limit: args.limit,
       } satisfies RecentEventsFilter),
   };
 
   return [queryUsage, queryBudget, queryRuns, queryThreads, querySelf, queryEvents];
+}
+
+function scopedActor(requested: string | undefined, caller: string, tool: string): string {
+  if (!requested) return caller;
+  if (requested !== caller) {
+    throw new Error(`${tool}: actorId is scoped to caller (${caller}); cross-actor reads require an approved widening action`);
+  }
+  return requested;
+}
+
+function scopedAgent(requested: string | undefined, caller: string, tool: string): string | undefined {
+  if (!requested) return undefined;
+  if (requested !== caller) {
+    throw new Error(`${tool}: toAgentId is scoped to caller (${caller}); cross-mailbox reads require an approved widening action`);
+  }
+  return requested;
 }

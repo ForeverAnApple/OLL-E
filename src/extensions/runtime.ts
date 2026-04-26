@@ -212,7 +212,21 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     const resolveOwnSecrets = () => resolveManifestSecrets(manifest);
 
     const callerAllowlist = new Set(manifest.callsTools ?? []);
+    const eventReadAllowlist = new Set(manifest.eventReads ?? []);
+    const eventWriteAllowlist = new Set(manifest.eventWrites ?? []);
     const callerName = manifest.name;
+    const assertEventRead = (type: string, action: string) => {
+      if (eventReadAllowlist.has(type) || eventReadAllowlist.has("*")) return;
+      throw new Error(
+        `extensions: "${callerName}" cannot ${action} "${type}" — add it to manifest.eventReads`,
+      );
+    };
+    const assertEventWrite = (type: string, action: string) => {
+      if (eventWriteAllowlist.has(type) || eventWriteAllowlist.has("*")) return;
+      throw new Error(
+        `extensions: "${callerName}" cannot ${action} "${type}" — add it to manifest.eventWrites`,
+      );
+    };
 
     const api: ExtensionApi = {
       hostId: opts.hostId,
@@ -259,6 +273,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
             `extensions: registerTask called by "${manifest.name}" but host has no scheduler wired`,
           );
         }
+        assertEventRead(task.eventType, "registerTask");
         const taskId = `ext:${manifest.name}:${task.id}`;
         const agentId = opts.defaultTaskAgentId;
         const unregister = opts.scheduler.register({
@@ -277,6 +292,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
               agentId,
               secrets: resolved,
               emit: (type, payload, emitOpts) => {
+                assertEventWrite(type, "emit");
                 ctx.emit(type, payload, emitOpts);
               },
               // Task-context callTool threads the acting agentId so
@@ -296,6 +312,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
         list.push({ taskId, unregister });
       },
       on(event: string, handler: (ev: Event) => void | Promise<void>) {
+        assertEventRead(event, "subscribe to");
         const un = opts.bus.subscribe(event, handler);
         unsubs.push(un);
         return un;
@@ -311,6 +328,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
           parentEventId?: string;
         },
       ) {
+        assertEventWrite(type, "publish");
         opts.bus.publish({
           type,
           payload,
@@ -440,8 +458,17 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
 
   async function startTriggers(extensionId: string, manifest: Manifest, extDir: string): Promise<void> {
     const list = triggersByExt.get(extensionId) ?? [];
+    const eventWriteAllowlist = new Set(manifest.eventWrites ?? []);
+    const assertTriggerWrite = (type: string) => {
+      if (eventWriteAllowlist.has(type) || eventWriteAllowlist.has("*")) return;
+      throw new Error(
+        `extensions: "${manifest.name}" cannot emit trigger "${type}" — add it to manifest.eventWrites`,
+      );
+    };
     for (const entry of list) {
-      const emit = (payload: unknown) =>
+      assertTriggerWrite(entry.trigger.type);
+      const emit = (payload: unknown) => {
+        assertTriggerWrite(entry.trigger.type);
         opts.bus.publish({
           type: entry.trigger.type,
           payload,
@@ -449,6 +476,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
           actorId: extensionId,
           durable: true,
         });
+      };
       const resolved = resolveManifestSecrets(manifest);
       await entry.trigger.start(emit, { hostId: opts.hostId, extensionId, secrets: resolved });
       entry.stop = entry.trigger.stop?.bind(entry.trigger);

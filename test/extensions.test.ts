@@ -172,6 +172,87 @@ describe("manifest validation", () => {
     expect(entry!.tool.inputSchema).toEqual({ type: "object" });
   });
 
+  it("requires manifest.eventWrites before publishing events", async () => {
+    const r = rig();
+    writeExt(tmp, "talker", {
+      manifest: { name: "talker", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          api.publish("chat.input", { text: "hi" }, { durable: true });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("talker")).rejects.toThrow(/manifest\.eventWrites/);
+  });
+
+  it("requires manifest.eventReads before subscribing to events", async () => {
+    const r = rig();
+    writeExt(tmp, "listener", {
+      manifest: { name: "listener", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          api.on("chat.input", () => {});
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("listener")).rejects.toThrow(/manifest\.eventReads/);
+  });
+
+  it("allows declared event reads and writes", async () => {
+    const r = rig();
+    const seen: unknown[] = [];
+    r.bus.subscribe("listener.seen", (ev) => {
+      seen.push(ev.payload);
+    });
+    writeExt(tmp, "listener", {
+      manifest: {
+        name: "listener",
+        version: "0.1.0",
+        eventReads: ["chat.input"],
+        eventWrites: ["listener.seen"],
+      },
+      index: `
+        export function register(api) {
+          api.on("chat.input", (ev) => {
+            api.publish("listener.seen", { text: ev.payload.text }, { durable: true });
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("listener");
+    r.bus.publish({
+      type: "chat.input",
+      payload: { text: "hello" },
+      hostId: r.hostId,
+      actorId: "test",
+      durable: true,
+    });
+    expect(seen).toEqual([{ text: "hello" }]);
+  });
+
+  it("requires manifest.eventWrites for trigger output events", async () => {
+    const r = rig();
+    writeExt(tmp, "trigger", {
+      manifest: { name: "trigger", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          api.registerTrigger({
+            name: "ticker",
+            type: "tick",
+            start(emit) {
+              emit({ ok: true });
+            },
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("trigger")).rejects.toThrow(/manifest\.eventWrites/);
+  });
+
   it("rejects a name mismatch", async () => {
     const r = rig();
     writeExt(tmp, "correct-dir", {

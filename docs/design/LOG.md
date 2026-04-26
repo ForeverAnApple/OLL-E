@@ -641,6 +641,12 @@ The decision inbox primitive existed and was wired into `askUp()`, but `askUp()`
 
 ---
 
+## 2026-04-26 — Extension event scopes are manifest-declared and enforced
+
+Security review found that extension manifests declared broad capabilities informally, while `api.on()` and `api.publish()` could still read or emit any bus event. That made the event log a hidden ambient authority and let a compromised bridge impersonate unrelated behavior. The fix keeps the extension loop agentic rather than introducing an admin side channel: manifests now declare `eventReads` and `eventWrites`, and the runtime enforces those lists for bus subscriptions, direct publishes, trigger emits, scheduler task subscriptions, and task emits. Widening an extension's event surface is a normal propose → write → smoke → hot-load edit, visible in git and reviewable with the rest of the extension.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.

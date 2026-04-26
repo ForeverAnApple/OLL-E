@@ -106,6 +106,32 @@ describe("runAgent", () => {
     expect((toolResult as { content: string }).content).toBe("echoed:ping");
   });
 
+  it("redacts sensitive tool outputs before tracing or feeding back to the model", async () => {
+    const llm = mockLlm([
+      toolUse("t1", "token_fetch", {}),
+      endTurn("done."),
+    ]);
+    const tool: ToolDef<Record<string, never>, { token: string; label: string }> = {
+      name: "token_fetch",
+      description: "fetch token",
+      inputSchema: { type: "object", properties: {} },
+      sensitiveOutputFields: ["token"],
+      execute: () => ({ token: "raw-secret", label: "visible" }),
+    };
+    const seen: string[] = [];
+    await runAgent({
+      llm,
+      toolCtx: ctx,
+      tools: [tool],
+      messages: [{ role: "user", content: "fetch" }],
+      onStep: (s) => {
+        if (s.kind === "tool_result") seen.push(s.content);
+      },
+    });
+    expect(seen).toEqual([JSON.stringify({ token: "[redacted]", label: "visible" })]);
+    expect(JSON.stringify(llm.calls)).not.toContain("raw-secret");
+  });
+
   it("surfaces tool errors as is_error tool_result blocks", async () => {
     const llm = mockLlm([
       toolUse("t1", "boom", {}),
