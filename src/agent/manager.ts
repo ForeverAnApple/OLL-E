@@ -83,21 +83,6 @@ export interface SpawnResult {
   threadId: string;
 }
 
-export interface MailSummaryOptions {
-  /** Cap the number of threads returned (default 20). */
-  limit?: number;
-  /** Only look back this many events (default 500 — bounds the scan). */
-  scan?: number;
-}
-
-export interface MailSummaryEntry {
-  threadId: string;
-  events: number;
-  lastHlc: string;
-  lastType: string;
-  lastFromActor: string;
-}
-
 export interface AgentManager {
   /** Register an already-running loop (used for the root agent whose
    *  loop is wired by the daemon before the manager starts tracking). */
@@ -119,11 +104,6 @@ export interface AgentManager {
   retargetThread(threadId: string, toAgentId: string | undefined): void;
   /** Look up a thread's current mailbox target. Undefined = no override. */
   resolveMailbox(threadId: string): string | undefined;
-  /** Summarize a given agent's mailbox activity — which threads have
-   *  recent events, how many, and the last activity age. Cheap durable
-   *  view over the events table; safe to call every turn. Does not
-   *  mark anything read. */
-  mailSummary(agentId: string, opts?: MailSummaryOptions): MailSummaryEntry[];
   /** Stop every tracked loop (daemon shutdown). */
   shutdown(): void;
 }
@@ -288,47 +268,6 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
     return threadRoutes.get(threadId);
   }
 
-  function mailSummary(agentId: string, opts?: MailSummaryOptions): MailSummaryEntry[] {
-    const limit = Math.max(1, Math.min(opts?.limit ?? 20, 100));
-    const scan = Math.max(50, Math.min(opts?.scan ?? 500, 5000));
-    // Raw SQL because drizzle doesn't know about the mailbox columns
-    // we added in migration 0003 by their TypeScript names in every
-    // query path — easier to be explicit than fight the builder here.
-    const rows = deps.store.raw
-      .prepare(
-        `SELECT thread_id, type, actor_id, hlc
-         FROM events
-         WHERE to_agent_id = ?
-           AND thread_id IS NOT NULL
-         ORDER BY hlc DESC
-         LIMIT ?`,
-      )
-      .all(agentId, scan) as Array<{
-        thread_id: string;
-        type: string;
-        actor_id: string;
-        hlc: string;
-      }>;
-    const byThread = new Map<string, MailSummaryEntry>();
-    for (const r of rows) {
-      const existing = byThread.get(r.thread_id);
-      if (existing) {
-        existing.events += 1;
-        continue;
-      }
-      byThread.set(r.thread_id, {
-        threadId: r.thread_id,
-        events: 1,
-        lastHlc: r.hlc,
-        lastType: r.type,
-        lastFromActor: r.actor_id,
-      });
-    }
-    return [...byThread.values()]
-      .sort((a, b) => (a.lastHlc < b.lastHlc ? 1 : -1))
-      .slice(0, limit);
-  }
-
   function shutdown(): void {
     for (const loop of loops.values()) loop.stop();
     loops.clear();
@@ -343,7 +282,6 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
     list: () => [...loops.keys()],
     retargetThread,
     resolveMailbox,
-    mailSummary,
     shutdown,
   };
 }

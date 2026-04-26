@@ -557,6 +557,34 @@ Agents were guessing extension paths, current directories, and subprocess availa
 
 ---
 
+## 2026-04-25 — Core reliability: boot invariants, chat health funnel, live smoke
+
+`olle chat` 400'd on every turn ("tools: Tool names must be unique") because two `mail_list` ToolDefs ended up in the assembled core registry — one in `src/tools/inbox.ts` (the canonical decision-inbox listing, per the entry above), and one stale duplicate in `src/tools/meta.ts` left over from an earlier thread-mailbox concept that LOG 2026-04-25 already retired in favor of `query_my_threads`. Provider rejected the request, so the agent had no surface to propose its own fix — chat is core, and core breakage severs the propose channel.
+
+The vision says broken extensions auto-recover and tell you within seconds. Broken core has no analogous loop because (a) the agent's mouth lives *in* core, and (b) the binary isn't rebuildable on the user's laptop. So core self-repair has to be a different posture from extension self-repair: **fail loud, give the principal enough trace to revert, never let breakage be silent**. Three layers landed today, ordered by blast radius:
+
+1. **Static boot invariants** (`src/boot/invariants.ts`). Pure check of the assembled `coreTools` array for duplicate names, invalid name shape, missing/non-object inputSchemas, and missing descriptions. Daemon calls it before chat starts; failures emit `daemon.invariant-failed`, drop a vision-tier `system_diagnostic` inbox item, and refuse to start the chat loop. Daemon stays up either way — non-LLM channels (tail, observability, inbox) keep working. Same battery is also a runtime guard inside `runAgent`, catching the case where an extension hot-load introduces a collision *after* boot.
+
+2. **Chat health funnel** (`src/daemon/chat-health.ts`). Mirrors the extension auto-disable rule (2 failures within a 5-minute sliding window). When the threshold trips, posts one inbox item per outage with the last error, the recovery hint, and a rollback plan; resets when a `chat.turn-end` finally fires. The principal hears via whatever channel the inbox routes to (Discord bridge, CLI banner, future email) even when chat itself is dead — turning a silent 400-loop into a paged decision.
+
+3. **Live integration smoke** (`test/chat-live-smoke.test.ts`). Boots the daemon end-to-end, sends one real `chat.input` through the Anthropic adapter (Haiku, tiny `maxTokens`), asserts no `chat.error` precedes `chat.turn-end`. Skipped without `ANTHROPIC_API_KEY`; runs alongside `bun test` when the dev key is set. Catches anything the wire rejects that local checks can't enumerate — schema-shape problems, prompt-segment rules, future provider behavior changes. Round-trip costs fractions of a cent and runs in ~1.6s. Confirmed against the original bug: with the duplicate `mail_list` restored, the smoke fails by timeout (no turn-end ever lands); with the fix, it passes.
+
+Three design calls embedded:
+
+1. **`mail_list` collision — fix is delete, not rename.** LOG 2026-04-25 design call #2 ("`mail_list` returns decisions, not chat threads") established the canonical semantics. The `meta.ts` `mailList` was a leftover from the earlier thread-mailbox concept and its functionality is already covered by `query_my_threads`. Deleted the ToolDef and the now-unused `agentManager.mailSummary` helper alongside it; updated the chat agent's system prompt and the per-turn sidebar text to point at `query_my_threads` instead of `mail_list` for thread inventory.
+
+2. **Invariants are advisory at the boundary, hard inside `runAgent`.** Boot-time failures don't crash the daemon — chat just doesn't start, and the principal gets paged. But `runAgent` throws on a duplicate-name check before the LLM call because at that point we know we're about to send a request the provider will reject; turning it into a named local error beats waiting for a generic 400. Two layers, two postures, same check.
+
+3. **Where the live smoke lives.** Inside `bun test`, not pre-push or behind a CI gate (no CI today). The user's framing: dev env always has the key, so `bun test` *is* the gate. `[DEFERRED]` items below cover the alternatives.
+
+`[DEFERRED-to-v0.1]` Degraded-mode IPC chat. When chat itself can't reach the LLM, the daemon answers IPC chat requests with a non-LLM diagnostic ("I'm broken — last error X — last commit Y — try `olle revert <Y>`"). The CLI renders it like any other turn. **Resurrect when:** core breakage is observed in real use that boot checks didn't catch and the inbox path doesn't reach the principal fast enough.
+
+`[DEFERRED-to-v0.1]` CI gate on PRs to `main` running the live smoke as a required check. **Resurrect when:** a chat-breaker merges past local `bun test` (or there's a CI environment to run in).
+
+`[DEFERRED-to-v0.1]` Generalize the chat-error inbox funnel into a "recurring-core-error → diagnostic" pattern that covers more than just `chat.error`. **Resurrect when:** a second core surface (scheduler? bridge?) earns the same treatment in real use.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.

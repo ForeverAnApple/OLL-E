@@ -15,6 +15,8 @@ import {
 import { buildMetaTools } from "../tools/meta.ts";
 import { buildObservabilityTools } from "../tools/observability.ts";
 import { buildInboxTools } from "../tools/inbox.ts";
+import { checkCoreInvariants, formatFailures } from "../boot/invariants.ts";
+import { startChatHealthMonitor, type ChatHealthMonitor } from "./chat-health.ts";
 import {
   buildMemoryTools,
   startMemoryProjector,
@@ -133,6 +135,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // anchored to root's mailbox. Bridges publish into that mailbox.
   let chat: AgentLoop | undefined;
   let chatAgentId: string | undefined;
+  let chatHealth: ChatHealthMonitor | undefined;
   if (process.env.ANTHROPIC_API_KEY) {
     chatAgentId = rootAgentId;
     const llm = createAnthropicAdapter();
@@ -170,32 +173,81 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       // voting on a proposal).
       ...buildInboxTools({ inbox, principalId: rootPrincipalId, store }),
     ];
-    // Children inherit the same tool set so they can themselves spawn,
-    // read extension files, etc. Scope still gates what they get to use.
-    agentManager.setCoreTools(coreTools);
-    chat = startAgentLoop({
-      bus,
-      store,
-      hostId,
-      llm,
-      agentId: chatAgentId,
-      extensions,
-      coreTools,
-      ledger,
-      inbox,
-      principalId: rootPrincipalId,
-      threadsDir: paths.threadsDir,
-      system: [
-        "You are olle, a helpful assistant living inside OLL-E — a habitat built for agents like you.",
-        "Your job is to accomplish what the human asks. OLL-E is yours to reshape: when the world is missing something you need, extend it.",
-        buildHostContextPrompt(paths, hostId),
-        "Your tools live in a catalog (rendered below). Most schemas are deferred — call `load_tools([\"name\"])` to pull them into context for this thread; the schema appears on the next turn. The catalog tells you what exists; loading is the act of picking it up. Unload with `unload_tools` when done.",
-        "The four tools you always carry — `load_tools`, `query_self`, `mail_list`, `memory_search` — are in your tool list every turn without loading. Use `query_self` to orient at the start of strategic work; `mail_list` to check whether children or peers have replied; `memory_search` to recall what you've remembered.",
-        "Never block a human waiting for slow work — delegate via `spawn_agent`. The per-turn mailbox sidebar shows live threads; `mail_list` reveals durable mail you haven't ingested.",
-        "When something feels off, look first (load `query_my_usage` / `query_my_runs` / `query_events`); when caching seems wasteful, propose a strategy revision through the inbox. Be concise.",
-      ].join("\n\n"),
-    });
-    agentManager.register(chatAgentId, chat);
+    // Boot invariants — last gate before chat goes live. Tool-name
+    // duplication, malformed schemas, etc. surface here as a named
+    // failure instead of as a provider 400 on every turn. Daemon stays
+    // up either way; chat refuses to start when the registry is broken,
+    // and the principal hears via the inbox if the store is reachable.
+    const invariants = checkCoreInvariants(coreTools);
+    if (!invariants.ok) {
+      const summary = formatFailures(invariants);
+      if (!opts.quiet) console.error(`olle: ${summary}`);
+      bus.publish({
+        type: "daemon.invariant-failed",
+        hostId,
+        actorId: hostId,
+        durable: true,
+        payload: { failures: invariants.failures },
+      });
+      try {
+        inbox.propose({
+          principalId: rootPrincipalId,
+          // FK on decisions.proposing_agent_id → agents; hostId would
+          // violate it. Root agent is the closest legitimate proposer
+          // for environment-level diagnostics.
+          proposingAgentId: rootAgentId,
+          tier: "vision",
+          summary: "core tool invariants failed — chat is disabled",
+          payload: {
+            action: "system_diagnostic",
+            kind: "boot-invariants",
+            failures: invariants.failures,
+            recovery:
+              "Inspect recent commits to src/tools/* and src/daemon/daemon.ts; revert the registration that introduced the offender(s).",
+          },
+          rollbackPlan: "git log -- src/tools/ src/daemon/daemon.ts",
+        });
+      } catch {
+        // Inbox propose is best-effort — never let a secondary failure
+        // mask the primary diagnostic on stderr.
+      }
+    } else {
+      // Children inherit the same tool set so they can themselves spawn,
+      // read extension files, etc. Scope still gates what they get to use.
+      agentManager.setCoreTools(coreTools);
+      chat = startAgentLoop({
+        bus,
+        store,
+        hostId,
+        llm,
+        agentId: chatAgentId,
+        extensions,
+        coreTools,
+        ledger,
+        inbox,
+        principalId: rootPrincipalId,
+        threadsDir: paths.threadsDir,
+        system: [
+          "You are olle, a helpful assistant living inside OLL-E — a habitat built for agents like you.",
+          "Your job is to accomplish what the human asks. OLL-E is yours to reshape: when the world is missing something you need, extend it.",
+          buildHostContextPrompt(paths, hostId),
+          "Your tools live in a catalog (rendered below). Most schemas are deferred — call `load_tools([\"name\"])` to pull them into context for this thread; the schema appears on the next turn. The catalog tells you what exists; loading is the act of picking it up. Unload with `unload_tools` when done.",
+          "The four tools you always carry — `load_tools`, `query_self`, `mail_list`, `memory_search` — are in your tool list every turn without loading. Use `query_self` to orient at the start of strategic work; `mail_list` to see open decisions awaiting your principal's response; `memory_search` to recall what you've remembered.",
+          "Never block a human waiting for slow work — delegate via `spawn_agent`. The per-turn mailbox sidebar shows live threads; load `query_my_threads` for the durable thread inventory.",
+          "When something feels off, look first (load `query_my_usage` / `query_my_runs` / `query_events`); when caching seems wasteful, propose a strategy revision through the inbox. Be concise.",
+        ].join("\n\n"),
+      });
+      agentManager.register(chatAgentId, chat);
+      // Crash funnel: repeated chat.error events auto-propose an inbox
+      // diagnostic so the principal hears even when chat itself is dead.
+      chatHealth = startChatHealthMonitor({
+        bus,
+        inbox,
+        hostId,
+        principalId: rootPrincipalId,
+        agentId: chatAgentId,
+      });
+    }
   } else if (!opts.quiet) {
     console.log("olle: ANTHROPIC_API_KEY not set — chat agent disabled");
   }
@@ -230,6 +282,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     // explicit chat?.stop() is redundant when the manager owns it, but
     // safe if the manager never came up (no API key).
     agentManager?.shutdown();
+    chatHealth?.stop();
     chat?.stop();
     memoryProjector.stop();
     scheduler.close();

@@ -571,30 +571,12 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
       },
     };
 
-    const mailList: ToolDef<
-      { limit?: number; scan?: number },
-      Array<{ threadId: string; events: number; lastHlc: string; lastType: string; lastFromActor: string }>
-    > = {
-      name: "mail_list",
-      tier: "operational",
-      category: "mailbox",
-      shortClause: "summarize threads with mail addressed to you",
-      alwaysLoaded: true,
-      description:
-        "Summarize your mailbox — which threads have recent events addressed to you, ordered by most-recent. The per-turn sidebar shows live threads you've already touched; this call reveals durable mail from threads you haven't ingested yet (e.g. a spawned child's progress, a cron-triggered task). Safe to call before deciding whether to switch focus / delegate.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "Max threads to return (default 20, max 100)." },
-          scan: { type: "number", description: "Events to scan back (default 500, max 5000)." },
-        },
-        additionalProperties: false,
-      },
-      execute: async ({ limit, scan }) =>
-        manager.mailSummary(opts.authorName, { limit, scan }),
-    };
+    // Thread-mailbox summary lives on `query_my_threads` (observability) per
+    // LOG 2026-04-25 — `mail_list` is the *decision inbox* tool. The earlier
+    // duplicate definition here collided with `buildInboxTools.mail_list`
+    // and wedged `olle chat` with a 400 (tool names must be unique).
 
-    tools.push(spawnAgent, killAgent, listAgents, retargetThread, mailList);
+    tools.push(spawnAgent, killAgent, listAgents, retargetThread);
   }
 
   if (opts.secretsDir) {

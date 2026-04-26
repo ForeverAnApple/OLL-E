@@ -71,8 +71,19 @@ export interface AgentResult {
 export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   const model = opts.model ?? opts.llm.defaultModel;
   const maxTurns = opts.maxTurns ?? 10;
+  // Pre-flight: catch duplicate tool names before the provider 400s. Boot
+  // invariants check this at daemon start, but extension hot-reload can
+  // still introduce a collision with a core tool mid-session — re-checking
+  // here turns a generic provider 400 into a named local error.
   const toolByName = new Map<string, ToolDef>();
-  for (const t of opts.tools ?? []) toolByName.set(t.name, t);
+  for (const t of opts.tools ?? []) {
+    if (toolByName.has(t.name)) {
+      throw new Error(
+        `runAgent: duplicate tool name "${t.name}" in registry — refusing to call provider`,
+      );
+    }
+    toolByName.set(t.name, t);
+  }
 
   const messages: Message[] = [...opts.messages];
   const total: Usage = {
