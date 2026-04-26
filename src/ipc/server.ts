@@ -47,6 +47,12 @@ export interface IpcServerOptions {
   /** Decision-inbox handle. Wired so the CLI surface (`olle inbox`) and the
    *  agent core tools (mail_list/mail_respond) hit the same query layer. */
   inbox?: Inbox;
+  /** Live snapshot of whether the root agent's chat loop is running.
+   *  Evaluated on every `status.chat` request so the answer is current
+   *  even when chat startup races IPC listen. False = chat.input events
+   *  fall on the floor; consumers (chat REPL, bridges) probe this to
+   *  fail fast instead of publishing into a dead mailbox. */
+  chatStatus?: () => { enabled: boolean; reason?: string };
 }
 
 export interface IpcServer {
@@ -198,6 +204,18 @@ async function dispatch(
           return;
         }
         send({ id: req.id, ok: true, value: { rootAgentId: opts.rootAgentId } });
+        return;
+      }
+      case "status.chat": {
+        // Whether the root mailbox has a draining agent. False = chat.input
+        // events fall on the floor; the chat REPL should refuse to start
+        // and bridges should surface the reason rather than queue silently.
+        const s = opts.chatStatus ? opts.chatStatus() : { enabled: false };
+        send({
+          id: req.id,
+          ok: true,
+          value: { enabled: s.enabled, reason: s.reason ?? null },
+        });
         return;
       }
       case "tail": {

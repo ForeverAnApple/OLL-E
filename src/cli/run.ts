@@ -308,78 +308,58 @@ async function cmdSecret(args: string[]): Promise<void> {
 
 async function cmdChat(): Promise<void> {
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
+  // Initial connect — fail-fast if the daemon is not up at launch.
+  // Once we're in the chat session, transient daemon outages are
+  // recovered by the reconnect loop below.
+  let current = await connectIpc(paths.socketFile);
   // Fetch the root agent's id so we can address events to its mailbox.
   // Falls back to "root" only as a last resort — ids are ULID so the
   // lookup is cheap and authoritative.
-  const { rootAgentId } = await client.call<{ rootAgentId: string }>("status.rootAgent");
+  const { rootAgentId } = await current.call<{ rootAgentId: string }>("status.rootAgent");
+  // Fail fast if the daemon's chat loop isn't running — typing into a
+  // dead mailbox is the worst UX. The bus-level fallback also bounces
+  // chat.input with the same reason, so this is belt-and-suspenders for
+  // the CLI specifically. Older daemons without this method default to
+  // "enabled" so we don't block the REPL on a missing endpoint.
+  const chatStatus = await current
+    .call<{ enabled: boolean; reason: string | null }>("status.chat")
+    .catch(() => ({ enabled: true, reason: null }));
+  if (!chatStatus.enabled) {
+    current.close();
+    const reason = chatStatus.reason ?? "chat loop not running";
+    console.error(`olle chat: chat agent is disabled\n  ${reason}`);
+    process.exit(1);
+  }
   // Resolve the agent's actual name so the banner says "olle" or whatever
   // the principal named their agent — the ULID id is for logs, not eyes.
-  const self = await client
+  const self = await current
     .call<AgentSelf | null>("observability.self", { agentId: rootAgentId })
     .catch(() => null);
   const agentName = self?.name?.trim() || "agent";
   // Inbox count is the channel-of-first-contact's nudge: if proposals are
   // waiting, surface them before the user types anything. Failing this
   // call shouldn't block chat — older daemons don't expose inbox.count.
-  const inboxOpen = await client
+  const inboxOpen = await current
     .call<{ open: number }>("inbox.count")
     .then((r) => r.open)
     .catch(() => 0);
   const threadId = `cli:${Math.random().toString(36).slice(2, 10)}`;
-  const sub = client.stream("tail", { type: "*" });
 
   const ui = createChatUI({ agentId: rootAgentId, agentName, threadId, inboxOpen });
   ui.banner();
 
   let turnBusy = false;
+  let stopping = false;
   let prompt = () => undefined as void;
 
-  (async () => {
-    for await (const ev of sub.events) {
-      if (ev.threadId !== threadId) continue;
-      const p = ev.payload as Record<string, unknown>;
-      if (ev.type === "chat.assistant-delta") {
-        ui.assistantDelta(String(p.text ?? ""));
-      } else if (ev.type === "chat.assistant-text") {
-        // Authoritative full text arrives after the deltas finish.
-        // Rewind the streamed plaintext and reprint with markdown
-        // applied so the user sees real headings/bold/code blocks.
-        ui.assistantText(String(p.text ?? ""));
-      } else if (ev.type === "chat.tool-call") {
-        ui.toolCall(String(p.name ?? "?"), p.input);
-      } else if (ev.type === "chat.tool-result") {
-        ui.toolResult(String(p.content ?? ""), Boolean(p.isError));
-      } else if (ev.type === "chat.api-retry") {
-        ui.retry({
-          attempt: numFrom(p.attempt),
-          status: typeof p.status === "number" ? p.status : undefined,
-          waitMs: numFrom(p.waitMs),
-          message: typeof p.message === "string" ? p.message : undefined,
-        });
-      } else if (ev.type === "chat.turn-end") {
-        ui.turnEnd({
-          inputTokens: numFrom(p.inputTokens),
-          outputTokens: numFrom(p.outputTokens),
-          cacheReadTokens: numFrom(p.cacheReadTokens),
-          cacheCreationTokens: numFrom(p.cacheCreationTokens),
-          usdMicros: numFrom(p.usdMicros),
-          stopReason: String(p.stopReason ?? ""),
-          model: typeof p.model === "string" ? p.model : "",
-        });
-        turnBusy = false;
-        prompt();
-      } else if (ev.type === "chat.error") {
-        ui.error(String(p.error ?? ""));
-        turnBusy = false;
-        prompt();
-      }
-    }
-  })();
-
   const stop = async () => {
-    await sub.cancel();
-    client.close();
+    if (stopping) return;
+    stopping = true;
+    try {
+      current.close();
+    } catch {
+      /* already gone */
+    }
     process.exit(0);
   };
   process.on("SIGINT", stop);
@@ -389,12 +369,11 @@ async function cmdChat(): Promise<void> {
     output: process.stdout,
   });
   prompt = () => {
-    if (turnBusy) return;
+    if (stopping || turnBusy) return;
     ui.statusLine();
     rl.setPrompt(ui.promptString());
     rl.prompt();
   };
-  prompt();
   rl.on("line", async (line) => {
     const text = line.trim();
     if (!text) {
@@ -407,16 +386,117 @@ async function cmdChat(): Promise<void> {
     }
     turnBusy = true;
     ui.afterUserInput();
-    await client.call("publish", {
-      type: "chat.input",
-      payload: { text },
-      actorId: "cli",
-      durable: true,
-      toAgentId: rootAgentId,
-      threadId,
-    });
+    try {
+      await current.call("publish", {
+        type: "chat.input",
+        payload: { text },
+        actorId: "cli",
+        durable: true,
+        toAgentId: rootAgentId,
+        threadId,
+      });
+    } catch (e) {
+      // Publish failed — usually the daemon dropped between input and
+      // send. Surface the error; the reconnect loop repaints the prompt
+      // once we're back on the bus.
+      ui.error(`send failed: ${(e as Error).message}`);
+      turnBusy = false;
+    }
   });
   rl.on("close", stop);
+
+  // Outer reconnect loop. Each iteration subscribes to the tail and
+  // drains events until the underlying socket closes, then reconnects
+  // with exponential backoff and resubscribes — same threadId, so the
+  // session continues against the same conversation on the daemon side.
+  let backoff = 250;
+  while (!stopping) {
+    let sub: ReturnType<typeof current.stream>;
+    try {
+      sub = current.stream("tail", { type: "*" });
+    } catch {
+      await current.closed.catch(() => {});
+      await reconnect();
+      continue;
+    }
+    backoff = 250;
+    prompt();
+
+    try {
+      for await (const ev of sub.events) {
+        if (ev.threadId !== threadId) continue;
+        const p = ev.payload as Record<string, unknown>;
+        if (ev.type === "chat.assistant-delta") {
+          ui.assistantDelta(String(p.text ?? ""));
+        } else if (ev.type === "chat.assistant-text") {
+          // Authoritative full text arrives after the deltas finish.
+          // Rewind the streamed plaintext and reprint with markdown
+          // applied so the user sees real headings/bold/code blocks.
+          ui.assistantText(String(p.text ?? ""));
+        } else if (ev.type === "chat.tool-call") {
+          ui.toolCall(String(p.name ?? "?"), p.input);
+        } else if (ev.type === "chat.tool-result") {
+          ui.toolResult(String(p.content ?? ""), Boolean(p.isError));
+        } else if (ev.type === "chat.api-retry") {
+          ui.retry({
+            attempt: numFrom(p.attempt),
+            status: typeof p.status === "number" ? p.status : undefined,
+            waitMs: numFrom(p.waitMs),
+            message: typeof p.message === "string" ? p.message : undefined,
+          });
+        } else if (ev.type === "chat.turn-end") {
+          ui.turnEnd({
+            inputTokens: numFrom(p.inputTokens),
+            outputTokens: numFrom(p.outputTokens),
+            cacheReadTokens: numFrom(p.cacheReadTokens),
+            cacheCreationTokens: numFrom(p.cacheCreationTokens),
+            usdMicros: numFrom(p.usdMicros),
+            stopReason: String(p.stopReason ?? ""),
+            model: typeof p.model === "string" ? p.model : "",
+          });
+          turnBusy = false;
+          prompt();
+        } else if (ev.type === "chat.error") {
+          ui.error(String(p.error ?? ""));
+          turnBusy = false;
+          prompt();
+        }
+      }
+    } catch {
+      /* ipc closed mid-stream — fall through to reconnect */
+    }
+
+    if (stopping) break;
+    // Disconnect mid-turn leaves turnBusy true with no chat.turn-end
+    // ever arriving. Clear it so the prompt re-fires after we
+    // resubscribe.
+    turnBusy = false;
+    await reconnect();
+  }
+
+  async function reconnect(): Promise<void> {
+    process.stdout.write(
+      color(ANSI.yellow, "  ⟳ daemon disconnected — reconnecting…") + "\n",
+    );
+    let attempt = 1;
+    while (!stopping) {
+      try {
+        current = await connectIpc(paths.socketFile);
+        process.stdout.write(color(ANSI.yellow, "  ⟳ reconnected") + "\n");
+        return;
+      } catch {
+        process.stdout.write(
+          color(
+            ANSI.dim,
+            `  ⟳ retry in ${(backoff / 1000).toFixed(1)}s (attempt ${attempt})`,
+          ) + "\n",
+        );
+        await new Promise((r) => setTimeout(r, backoff));
+        backoff = Math.min(backoff * 2, 30_000);
+        attempt++;
+      }
+    }
+  }
 }
 
 function numFrom(v: unknown): number {

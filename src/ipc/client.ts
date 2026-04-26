@@ -9,6 +9,9 @@ export interface IpcClient {
     params?: Record<string, unknown>,
   ): { events: AsyncIterable<Event>; cancel(): Promise<void> };
   close(): void;
+  /** Resolves when the underlying socket closes — peer disconnect or local close.
+   *  Consumers can await this to drive reconnect logic. */
+  closed: Promise<void>;
 }
 
 export async function connectIpc(socketPath: string): Promise<IpcClient> {
@@ -55,11 +58,17 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
     }
   });
 
+  let resolveClosed!: () => void;
+  const closed = new Promise<void>((r) => (resolveClosed = r));
+  let didClose = false;
   const onClose = () => {
+    if (didClose) return;
+    didClose = true;
     for (const r of pending.values()) r({ id: 0, ok: false, error: { message: "ipc closed" } });
     for (const s of streams.values()) s.end(new Error("ipc closed"));
     pending.clear();
     streams.clear();
+    resolveClosed();
   };
   sock.on("close", onClose);
   sock.on("error", onClose);
@@ -79,7 +88,11 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
   function stream(method: string, params?: Record<string, unknown>) {
     const id = nextId++;
     const buf: Event[] = [];
-    let waiter: ((r: IteratorResult<Event>) => void) | null = null;
+    type Waiter = {
+      resolve: (r: IteratorResult<Event>) => void;
+      reject: (e: Error) => void;
+    };
+    let waiter: Waiter | null = null;
     let ended = false;
     let endErr: Error | undefined;
 
@@ -88,7 +101,7 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
         if (waiter) {
           const w = waiter;
           waiter = null;
-          w({ value: ev, done: false });
+          w.resolve({ value: ev, done: false });
         } else {
           buf.push(ev);
         }
@@ -99,8 +112,8 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
         if (waiter) {
           const w = waiter;
           waiter = null;
-          if (err) throw err;
-          w({ value: undefined as unknown as Event, done: true });
+          if (err) w.reject(err);
+          else w.resolve({ value: undefined as unknown as Event, done: true });
         }
       },
     });
@@ -116,8 +129,8 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
               if (endErr) return Promise.reject(endErr);
               return Promise.resolve({ value: undefined as unknown as Event, done: true });
             }
-            return new Promise<IteratorResult<Event>>((resolve) => {
-              waiter = resolve;
+            return new Promise<IteratorResult<Event>>((resolve, reject) => {
+              waiter = { resolve, reject };
             });
           },
           return(): Promise<IteratorResult<Event>> {
@@ -140,7 +153,7 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
       if (waiter) {
         const w = waiter;
         waiter = null;
-        w({ value: undefined as unknown as Event, done: true });
+        w.resolve({ value: undefined as unknown as Event, done: true });
       }
     };
 
@@ -152,5 +165,5 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
     sock.destroy();
   }
 
-  return { call, stream, close };
+  return { call, stream, close, closed };
 }

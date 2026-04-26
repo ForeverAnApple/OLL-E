@@ -98,6 +98,14 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   });
   const ledger = createLedger({ bus, store, hostId });
 
+  // Tracked so `status.chat` can explain the absence — the IPC handler
+  // closes over these and reads them lazily, so chat startup can race
+  // ipc.listen without a window of "unknown" answers.
+  let chat: AgentLoop | undefined;
+  let chatAgentId: string | undefined;
+  let chatHealth: ChatHealthMonitor | undefined;
+  let chatDisabledReason: string | undefined;
+
   const ipc = createIpcServer({
     socketPath: paths.socketFile,
     bus,
@@ -108,6 +116,10 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     rootAgentId,
     rootPrincipalId,
     inbox,
+    chatStatus: () => ({
+      enabled: chat !== undefined,
+      reason: chatDisabledReason,
+    }),
   });
   await ipc.listen();
 
@@ -133,12 +145,10 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // still runs but `olle chat` just bounces with chat.error. Note: this
   // is no longer a "chat agent"; it's the generic agent drain loop
   // anchored to root's mailbox. Bridges publish into that mailbox.
-  let chat: AgentLoop | undefined;
-  let chatAgentId: string | undefined;
-  let chatHealth: ChatHealthMonitor | undefined;
-  if (process.env.ANTHROPIC_API_KEY) {
+  const anthropicKey = readSecret(paths.secretsDir, "ANTHROPIC_API_KEY");
+  if (anthropicKey) {
     chatAgentId = rootAgentId;
-    const llm = createAnthropicAdapter();
+    const llm = createAnthropicAdapter({ apiKey: anthropicKey });
     // Manager first — meta-tools need a reference so spawn_agent etc.
     // resolve. The root loop gets registered into it after start.
     agentManager = createAgentManager({
@@ -181,6 +191,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     const invariants = checkCoreInvariants(coreTools);
     if (!invariants.ok) {
       const summary = formatFailures(invariants);
+      chatDisabledReason = `${summary} — see \`olle inbox\` for the full diagnostic.`;
       if (!opts.quiet) console.error(`olle: ${summary}`);
       bus.publish({
         type: "daemon.invariant-failed",
@@ -248,8 +259,37 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         agentId: chatAgentId,
       });
     }
-  } else if (!opts.quiet) {
-    console.log("olle: ANTHROPIC_API_KEY not set — chat agent disabled");
+  } else {
+    chatDisabledReason =
+      "No ANTHROPIC_API_KEY secret stored. Set it with: `olle secret set ANTHROPIC_API_KEY` (paste value or pipe on stdin), then restart the daemon.";
+    if (!opts.quiet) {
+      console.log("olle: no ANTHROPIC_API_KEY secret — chat agent disabled (set with `olle secret set ANTHROPIC_API_KEY`)");
+    }
+  }
+
+  // Dead-mailbox bouncer. Whenever chat is disabled (no key or invariants
+  // failed), every chat.input addressed to root would otherwise sit on
+  // the bus with no subscriber — silent waiting forever, on the CLI and
+  // on every bridge equally. Echo a chat.error back so the channel of
+  // first contact (and any future channel) gets a clear diagnostic
+  // instead of dead air. Transport-agnostic by construction: the same
+  // event reaches the CLI, Discord, GitHub, anything.
+  if (!chat) {
+    bus.subscribe("chat.input", (ev) => {
+      if (ev.toAgentId !== rootAgentId) return;
+      if (!ev.threadId) return;
+      bus.publish({
+        type: "chat.error",
+        hostId,
+        actorId: rootAgentId,
+        parentEventId: ev.id,
+        threadId: ev.threadId,
+        durable: true,
+        payload: {
+          error: `chat agent disabled: ${chatDisabledReason ?? "unknown reason"}`,
+        },
+      });
+    });
   }
 
   writeFileSync(paths.pidFile, String(process.pid), "utf8");
@@ -401,10 +441,15 @@ function ensurePrincipalRow(store: Store, display: string): string {
   return id;
 }
 
+// Secrets are file-backed only. process.env is intentionally NOT consulted —
+// env is for behavior/functionality (OLLE_HOME, paths), not for secrets.
+// One source of truth, set via `olle secret set <NAME>`. Drift between an
+// install-time-embedded plist env and the secrets store was the bug this
+// closes.
 function readSecret(secretsDir: string, name: string): string | undefined {
   try {
     return readFileSync(join(secretsDir, name), "utf8").trim();
   } catch {
-    return process.env[name];
+    return undefined;
   }
 }
