@@ -234,6 +234,27 @@ Self-modification thrashes the cache by design — when an agent rewrites its id
 
 Cache fields ride on `chat.usage` and `chat.turn-end` event payloads turn-by-turn so subscribers (CLI tail, future bridges, downstream observability dashboards) see cache stats live without polling the ledger.
 
+## Tool catalog and lazy loading
+
+Tool schemas (name + description + JSON Schema) cost LLM context every turn. With a growing extension surface, always-carrying every schema bloats the prefix and amplifies cache-write cost whenever self-modification invalidates it. So tool schemas ship deferred by default; agents pull what they need on demand.
+
+**Always-loaded core (`alwaysLoaded: true` on `ToolDef`):** four tools, in the LLM's tool list every turn — `load_tools`, `query_self`, `mail_list`, `memory_search`. These are the orientation + mailbox + memory-read primitives most strategic turns need. `unload_tools` is also always-loaded but isn't conceptually "core" — it's the partner to `load_tools`. Everything else (extension authoring, observability beyond `query_self`, delegation, secrets, scratch, full memory write/lineage, host context, extension-registered tools) is deferred.
+
+**The catalog** lives in the stable system segment alongside principles. It's a pure function of the registered tool set: rich category prose ("when to reach for these") + minimal `name — short clause` per tool, grouped by category. Categories: `loadout`, `observability`, `memory`, `delegation`, `mailbox`, `extension authoring`, `secrets`, `host context`, `scratch`. Extension-contributed categories render with a default blurb until the core registry learns them. The catalog does NOT include "loaded right now" markers — that state lives in the tools block (cached separately) and would otherwise invalidate the catalog inside the cached identity prefix.
+
+**Loading and unloading:**
+
+- `load_tools(names)` — adds names to the per-thread loaded set, returns each tool's schema in the result so the agent can read it the same turn. Schemas appear in the LLM's tool list on the next inner round-trip; calls to those tools succeed from then on.
+- `unload_tools(names)` — drops names from the loaded set. Always-loaded core tools cannot be unloaded.
+
+Both report unknown / no-op cases per-name without aborting the call. Cost: a `load_tools` round-trip is one extra LLM call; the schema then rides every subsequent turn until unloaded.
+
+**Per-thread, not per-agent.** The loaded set lives on the in-memory `Thread` (`src/agent/chat.ts`) and is runtime state, not durable identity. Restart drops it; a fresh thread starts with the always-loaded core. This intentionally treats the loadout as conversational working state — if an agent decides "I always want X loaded," it writes a principle, and per-agent loadout durability is `[DEFERRED-to-v0.1]` pending real ledger evidence of recurring loads.
+
+**Hot-reload pruning.** When an extension is unloaded between turns, any of its tools still in a thread's loaded set drop silently and a `tool.loaded-dropped` event fires. The next turn's tools block reflects the removal; the agent sees the warning event in `query_events` if it asks.
+
+**Why no progressive catalog folding.** As tool counts grow, the simple-tier catalog grows too. Earlier draft proposed B/C/D fold tiers (collapse taglines → categories → degenerate to flat keyword search). Rejected for v0: the parallel specialist-delegation plan offers a cleaner answer to scale — agents specialize by domain, each agent's catalog stays small, out-of-domain work is `delegate_to(specialist)` rather than catalog inflation. If that doesn't pan out, fold tiers and `ToolSearch`-style discovery resurrect for v0.1+.
+
 ## Memory tiers
 
 Three scopes, enforced at write/read:
@@ -272,7 +293,8 @@ The unified flow for adding capabilities — channels, tools, trigger types, any
 - Decision-inbox router
 - CLI chat handler (channel-of-first-contact)
 - Scratch filesystem tool
-- Meta-tools: `write-extension`, `run-smoke-test`, `register-extension`, `revert-extension`
+- Meta-tools: `write_extension`, `run_smoke_test`, `register_extension`, `revert_extension`, `read_extension_file`, `extension_history`, `query_host_context`
+- Loadout meta-tools: `load_tools`, `unload_tools` — bring deferred tool schemas into / out of a thread's context (see "Tool catalog and lazy loading")
 - Observability tools: `query_my_usage`, `query_my_budget`, `query_my_runs`, `query_my_threads`, `query_self`, `query_events` — agents read their own world; CLI uses the same query layer
 
 ### Starter templates (shipped read-only; agents clone and modify)

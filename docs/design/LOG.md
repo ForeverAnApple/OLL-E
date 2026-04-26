@@ -513,6 +513,26 @@ Cache fields land on `chat.*` events but other LLM-call surfaces (future memory.
 
 ---
 
+## 2026-04-25 — Lazy tool loading via catalog + `load_tools`
+
+Tool schemas (name + description + JSON Schema) were riding the LLM context every turn. With ~25 tools today and a growing extension surface, that's 5–10KB of system-prompt-equivalent input per call — cheap on cache hits but expensive every time self-modification thrashes the cache (which, per ARCHITECTURE.md "self-modification thrashes the cache by design," is not rare). The framing the user landed on: "knowing you have a hammer in the toolbox" should be cheap; "carrying a hammer at all times for the one job a year that needs one" is wasteful.
+
+The shape: every tool defaults `alwaysLoaded: false`. Each turn the runtime sends only `alwaysLoaded || isLoaded(name)` schemas to the LLM. A new `load_tools(names)` meta-tool mutates a per-thread `loadedTools: Set<string>` and returns the schemas in the result; the next LLM round-trip in the inner loop sees them. The agent picks up the hammer when needed and can `unload_tools` to set it down. The catalog — rich category prose + minimal `name — clause` per tool — renders into the stable system segment alongside principles so the agent reads "here's what exists" as part of identity.
+
+**Always-loaded core (4):** `load_tools`, `query_self`, `mail_list`, `memory_search`. Chosen by hit-rate consistency, not symbolic weight. `write_extension` / `read_extension_file` / `spawn_agent` are strategic-tier tools used a handful of times per thread; promoting them on "centerpiece of agents grow the world" grounds while excluding `spawn_agent` would be inconsistent. The catalog already advertises *that* the agent can do these things; loading them is the deliberate gesture appropriate for strategic actions — exactly the "pick up the hammer" framing the design rests on. (`unload_tools` is also `alwaysLoaded` but isn't really part of the conceptual core — agents don't reach for it strategically.)
+
+**Per-thread, not per-agent.** Threads are first-class (mailbox-drainer collapse, cache columns, observability rollups all key on threadId). The right unit for "what is the agent equipped with" is the conversation. Each thread starts with the always-loaded core; the agent re-equips per conversation. Loaded set is runtime state, not durable identity — restart drops it. (If an agent decides "I always want X loaded," they write a principle that says so; auto-promotion via ledger-observed loading patterns is `[DEFERRED-to-v0.1]`.)
+
+**Why no `[LOADED]` markers in the catalog.** Per-thread loaded state would make the catalog text mutate every load, which would invalidate the catalog's place in the cached identity segment (and everything after it, including principles). The tools block — which the LLM provider caches separately — already encodes loaded-set state. Catalog stays static identity; tools block is the dynamic loadout.
+
+**Why no progressive fold tiers for catalog scaling.** Earlier draft proposed collapsing taglines / categories / falling back to `ToolSearch`-style keyword search as the catalog grows past 3000/5000/8000 tokens. Dropped from v0 because the parallel `docs/plan/specialist-delegation.plan.md` offers a cleaner answer: agents specialize by domain, each agent's catalog stays small, out-of-domain work goes through `delegate_to(specialist)` rather than ballooning the catalog. If specialist delegation doesn't pan out and catalogs grow uncomfortably in real usage, revisit folding then. `[DEFERRED-to-v0.1+]` tier-fold mechanism; `[DEFERRED-to-v0.1+]` flat keyword search.
+
+`[DEFERRED-to-v0.1]` Auto-promotion of frequently-loaded tools to a per-agent loadout. **Resurrect when:** ledger shows agents repeatedly loading the same N tools across M+ threads — the empirical signal that the four-tool core under-fits real usage.
+
+`[DEFERRED-to-v0.1]` Per-thread loaded-set persistence. Pure optimization; the user-visible cost of restart-drop is one extra `load_tools` call. Revisit if real users complain.
+
+---
+
 ## 2026-04-25 — Stable host coordinates in prompt; live context as a tool
 
 Agents were guessing extension paths, current directories, and subprocess availability, then receiving opaque tool failures like `ENOENT: no such file or directory, posix_spawn 'claude'`. The fix is a split: stable coordinates (`host_id`, OLL-E home, extensions/config/memory/log paths) are injected into the base prompt for root and default child agents, while dynamic facts (process cwd, PATH, loaded extensions/tools, executable availability) live behind the operational `query_host_context` tool. This follows the world-legibility rule without making the human CLI privileged: agents get the same map and can inspect live state themselves. We deliberately do not put PATH or loaded extension state in the cached prompt because hot-loads, daemon restarts, and shell environments can change them; stale dynamic context is worse than no context.
