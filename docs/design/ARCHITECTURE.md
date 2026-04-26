@@ -249,6 +249,10 @@ Tool schemas (name + description + JSON Schema) cost LLM context every turn. Wit
 
 Both report unknown / no-op cases per-name without aborting the call. Cost: a `load_tools` round-trip is one extra LLM call; the schema then rides every subsequent turn until unloaded.
 
+**Live tool surface within a turn.** The chat loop's `getTools()` re-reads `opts.extensions.tools()` at the start of every inner round-trip, so tools registered/unloaded mid-turn appear in (or disappear from) both the LLM's tool list and the dispatch table on the very next call. The catalog stays turn-stable on purpose — it lives in the cached system prefix; an agent that just registered a tool already knows it exists. (See LOG 2026-04-26 for the full reasoning.)
+
+**Auto-load on register.** `register_extension` adds the just-registered extension's contributed tools to the calling thread's loaded set and surfaces their schemas in the result (mirroring `load_tools`). The agent already paid the write+smoke+register cost with intent to use; forcing a separate `load_tools` hop is the kind of papercut habitat philosophy is supposed to delete. Always-loaded tools and already-loaded names are reported but not re-added. `unload_tools` remains the cheap path back if the agent regrets the inflation.
+
 **Per-thread, not per-agent.** The loaded set lives on the in-memory `Thread` (`src/agent/chat.ts`) and is runtime state, not durable identity. Restart drops it; a fresh thread starts with the always-loaded core. This intentionally treats the loadout as conversational working state — if an agent decides "I always want X loaded," it writes a principle, and per-agent loadout durability is `[DEFERRED-to-v0.1]` pending real ledger evidence of recurring loads.
 
 **Hot-reload pruning.** When an extension is unloaded between turns, any of its tools still in a thread's loaded set drop silently and a `tool.loaded-dropped` event fires. The next turn's tools block reflects the removal; the agent sees the warning event in `query_events` if it asks.

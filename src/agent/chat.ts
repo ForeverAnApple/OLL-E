@@ -32,9 +32,9 @@ import { tables } from "../store/index.ts";
 import { eq } from "drizzle-orm";
 import { loadPrinciples, renderPrinciples } from "../memory/principles.ts";
 import { renderToolCatalog } from "./catalog.ts";
-import { buildLoadoutTools } from "../tools/loadout.ts";
+import { buildLoadoutTools, markLoaded, type LoadResultEntry } from "../tools/loadout.ts";
 import { runAgent, type AgentStep } from "./runtime.ts";
-import { buildRedactionMap, redactInput, redactMessages } from "./redaction.ts";
+import { buildRedactionMap, mergeRedactionMap, redactInput, redactMessages } from "./redaction.ts";
 
 export interface AgentLoopOptions {
   bus: EventBus;
@@ -169,20 +169,48 @@ async function runTurn(
 ): Promise<void> {
   thread.messages.push({ role: "user", content: text });
   try {
-    // Loadout meta-tools capture this thread's loadedTools set in closure
-    // so load_tools / unload_tools mutate the right thread. Built per-turn
-    // because the closure is per-thread; the cost is two object literals.
-    const coreTools = collectTools(opts);
+    // Core tools wrapped per-turn so register_extension's auto-load
+    // closure binds this thread's loadedTools.
+    const wrappedCore = (opts.coreTools ?? []).map((t) =>
+      t.name === "register_extension" && opts.extensions
+        ? wrapRegisterForAutoLoad(t, {
+            loadedTools: thread.loadedTools,
+            extensions: opts.extensions,
+          })
+        : t,
+    );
     const loadoutTools = buildLoadoutTools({
       loadedTools: thread.loadedTools,
-      allTools: () => tools,
+      allTools: () => getTools(),
     });
-    const tools = [...coreTools, ...loadoutTools];
+    // Live tool surface — re-read on every round-trip so a mid-turn
+    // register/unload becomes visible on the very next call (both in the
+    // LLM's tool list and in dispatch). The catalog rendered into the
+    // system prefix uses the turn-start snapshot below; that is on
+    // purpose — invalidating the cached prefix mid-turn would defeat the
+    // cache architecture.
+    const getTools = (): ToolDef[] => {
+      const out: ToolDef[] = [...wrappedCore];
+      if (opts.extensions) {
+        for (const { extensionId, tool } of opts.extensions.tools()) {
+          out.push(wrapExtensionTool(tool, extensionId));
+        }
+      }
+      out.push(...loadoutTools);
+      return out;
+    };
+    const turnStartTools = getTools();
     // Hot-reload pruning: if an extension was unloaded since last turn and
     // its tool was in this thread's loaded set, drop the entry silently
     // and emit a warning event. Otherwise the agent's loaded list lies.
-    pruneOrphanLoaded(thread, tools, opts, origin);
-    const redactions = buildRedactionMap(tools);
+    pruneOrphanLoaded(thread, turnStartTools, opts, origin);
+    const redactions = buildRedactionMap(turnStartTools);
+    const refreshRedactions = () => mergeRedactionMap(redactions, getTools());
+    const redactToolInput = (name: string, input: unknown) => {
+      refreshRedactions();
+      const fields = redactions.get(name);
+      return fields ? redactInput(input, fields) : input;
+    };
     const scope = loadAgentScope(opts.store, opts.agentId);
     const grantProposed = new Set<string>();
     // Principles — the agent's strict commitments, injected at turn
@@ -196,7 +224,7 @@ async function runTurn(
     // the tools block (which the LLM provider caches separately), NOT
     // in this catalog text — the catalog must stay stable across
     // load_tools calls within a thread or it'll invalidate the prefix.
-    const catalogBlock = renderToolCatalog(tools);
+    const catalogBlock = renderToolCatalog(turnStartTools);
     // Mailbox sidebar — a one-line situational awareness block appended
     // to the system prompt each turn. Makes delegation decidable: the
     // agent can see "I have 3 threads with pending work" and choose to
@@ -214,13 +242,13 @@ async function runTurn(
       llm: opts.llm,
       model: opts.model,
       system: systemSegments,
-      tools,
+      getTools,
       isLoaded: (name) => thread.loadedTools.has(name),
       toolCtx: {
         hostId: opts.hostId,
         // Empty-string sentinel = "this call is from a core tool, not
-        // an extension." Extension-contributed tools are wrapped in
-        // collectTools() to inject their real extensionId at execute
+        // an extension." Extension-contributed tools are wrapped by
+        // wrapExtensionTool() to inject their real extensionId at execute
         // time; this default only ever reaches a core tool.
         extensionId: "",
         actorId: opts.agentId,
@@ -228,10 +256,11 @@ async function runTurn(
         secrets: {},
       },
       messages: thread.messages,
-      onStep: (step) => emitStep(opts, thread.id, origin, step, redactions),
+      onStep: (step) => emitStep(opts, thread.id, origin, step, redactToolInput),
       authorize: (tool) =>
         checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),
       onDenied: ({ tool, reason, input }) => {
+        const safeInput = redactToolInput(tool.name, input);
         opts.bus.publish({
           type: "tool.denied",
           hostId: opts.hostId,
@@ -243,7 +272,7 @@ async function runTurn(
             tool: tool.name,
             tier: tool.tier ?? "operational",
             reason,
-            input,
+            input: safeInput,
           },
         });
         if (!opts.inbox || !opts.principalId) {
@@ -287,7 +316,7 @@ async function runTurn(
             proposingAgentId: opts.agentId,
             principalId: opts.principalId,
             tier: "strategic",
-            summary: `grant ${agentLabel} permission to call ${tool.name}(${summarizeInputArgs(input)})`,
+            summary: `grant ${agentLabel} permission to call ${tool.name}(${summarizeInputArgs(safeInput)})`,
             payload: {
               action: "grant_scope",
               agentId: opts.agentId,
@@ -295,7 +324,7 @@ async function runTurn(
               tool: tool.name,
               toolDescription: tool.description,
               tier: tool.tier ?? "operational",
-              input,
+              input: safeInput,
               threadId: thread.id,
               reason,
             },
@@ -321,6 +350,7 @@ async function runTurn(
     // Commit snapshot before announcing turn-end so subscribers reacting
     // to the event can rely on disk state being current. Sensitive tool
     // inputs (e.g. set_secret value) are redacted from the persisted form.
+    refreshRedactions();
     if (agentDir) saveThread(agentDir, thread, redactions);
     opts.bus.publish({
       type: "chat.turn-end",
@@ -450,16 +480,6 @@ function buildMailboxSidebar(
   return `${header}\n${lines.join("\n")}${footer}`;
 }
 
-function collectTools(opts: AgentLoopOptions): ToolDef[] {
-  const tools: ToolDef[] = [...(opts.coreTools ?? [])];
-  if (opts.extensions) {
-    for (const { extensionId, tool } of opts.extensions.tools()) {
-      tools.push(wrapExtensionTool(tool, extensionId));
-    }
-  }
-  return tools;
-}
-
 /** Wrap an extension-contributed tool so its `execute` always receives a
  *  ctx whose `extensionId` is the contributing extension's id, regardless
  *  of what the chat agent's shared toolCtx carries. Without this every
@@ -468,6 +488,35 @@ function wrapExtensionTool(tool: ToolDef, extensionId: string): ToolDef {
   return {
     ...tool,
     execute: (args, ctx) => tool.execute(args, { ...ctx, extensionId }),
+  } as ToolDef;
+}
+
+export interface RegisterAutoLoadDeps {
+  loadedTools: Set<string>;
+  extensions: ExtensionHost;
+}
+
+/** Wrap register_extension so a successful register auto-loads the
+ *  extension's contributed tools into the calling thread's loadedTools
+ *  set and surfaces their schemas in the result — write+smoke+register
+ *  is explicit cost paid with intent to use, so a separate load_tools
+ *  hop is dead weight. unload_tools is the way back if regretted. */
+export function wrapRegisterForAutoLoad(tool: ToolDef, deps: RegisterAutoLoadDeps): ToolDef {
+  return {
+    ...tool,
+    execute: async (args, ctx) => {
+      const result = (await tool.execute(args, ctx)) as Record<string, unknown>;
+      const name = (args as { name?: string }).name;
+      if (!name) return result;
+      const ext = deps.extensions.get(name);
+      if (!ext) return result;
+      const autoLoaded: LoadResultEntry[] = [];
+      for (const entry of deps.extensions.tools()) {
+        if (entry.extensionId !== ext.id) continue;
+        autoLoaded.push(markLoaded(deps.loadedTools, entry.tool));
+      }
+      return { ...result, autoLoaded };
+    },
   } as ToolDef;
 }
 
@@ -523,7 +572,7 @@ function emitStep(
   threadId: string,
   origin: Event,
   step: AgentStep,
-  redactions: Map<string, string[]>,
+  redactToolInput: (name: string, input: unknown) => unknown,
 ): void {
   if (step.kind === "assistant") {
     const text = step.content
@@ -561,8 +610,7 @@ function emitStep(
       payload: { text: step.text },
     });
   } else if (step.kind === "tool_use") {
-    const fields = redactions.get(step.name);
-    const input = fields ? redactInput(step.input, fields) : step.input;
+    const input = redactToolInput(step.name, step.input);
     opts.bus.publish({
       type: "chat.tool-call",
       hostId: opts.hostId,

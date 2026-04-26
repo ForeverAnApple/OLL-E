@@ -34,6 +34,8 @@ function mockExtensions(): ExtensionHost {
     reload: async () => {
       throw new Error("unused");
     },
+    smokeTest: async () => ({ ok: true }),
+    inventory: async () => [],
     reportFailure: () => {},
     tools: () => [
       {

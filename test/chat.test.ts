@@ -7,6 +7,7 @@ import { openStore, tables } from "../src/store/index.ts";
 import { ulid } from "../src/id/index.ts";
 import { startAgentLoop } from "../src/agent/chat.ts";
 import type { Completion, CompletionRequest, Llm } from "../src/llm/types.ts";
+import type { ExtensionHost, ToolDef } from "../src/extensions/index.ts";
 
 function mockLlm(script: Completion[]): Llm {
   return {
@@ -31,6 +32,58 @@ function endTurn(text: string): Completion {
       cacheCreationInputTokens: 0,
       totalTokens: 2,
     },
+  };
+}
+
+function toolUseTurn(name: string, input: Record<string, unknown>): Completion {
+  return {
+    content: [{ type: "tool_use", id: `${name}-1`, name, input }],
+    stopReason: "tool_use",
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      totalTokens: 2,
+    },
+  };
+}
+
+function fakeLiveExtensionHost(opts: {
+  loaded: Set<string>;
+  extensionName: string;
+  tool: ToolDef;
+}): ExtensionHost {
+  const record = {
+    id: opts.extensionName,
+    manifest: { name: opts.extensionName, version: "0.1.0" },
+    path: `/tmp/${opts.extensionName}`,
+    status: "active" as const,
+    failures: 0,
+  };
+  return {
+    list: () => (opts.loaded.has(opts.extensionName) ? [record] : []),
+    get: (name) => (name === opts.extensionName && opts.loaded.has(name) ? record : undefined),
+    discover: async () => [],
+    inventory: async () => [],
+    load: async (name) => {
+      opts.loaded.add(name);
+      return record;
+    },
+    unload: async (name) => {
+      opts.loaded.delete(name);
+    },
+    reload: async (name) => {
+      opts.loaded.add(name);
+      return record;
+    },
+    smokeTest: async () => ({ ok: true }),
+    reportFailure: () => {},
+    tools: () =>
+      opts.loaded.has(opts.extensionName)
+        ? [{ extensionId: opts.extensionName, tool: opts.tool }]
+        : [],
+    triggers: () => [],
   };
 }
 
@@ -334,6 +387,90 @@ describe("agent loop over the mailbox", () => {
         "utf8",
       );
       expect(sanitized).toContain("messages");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts sensitive inputs for tools registered and called in the same turn", async () => {
+    const r = rig();
+    const dir = mkdtempSync(join(tmpdir(), "olle-threads-"));
+    try {
+      const loaded = new Set<string>();
+      const secretTool: ToolDef<Record<string, unknown>, string> = {
+        name: "secret_tool",
+        description: "uses a secret",
+        inputSchema: {
+          type: "object",
+          properties: {
+            token: { type: "string" },
+            label: { type: "string" },
+          },
+        },
+        sensitiveInputFields: ["token"],
+        execute: () => "ok",
+      };
+      const extensions = fakeLiveExtensionHost({
+        loaded,
+        extensionName: "secret-ext",
+        tool: secretTool,
+      });
+      const registerExtension: ToolDef<{ name: string }, { status: string }> = {
+        name: "register_extension",
+        description: "register",
+        inputSchema: {
+          type: "object",
+          properties: { name: { type: "string" } },
+          required: ["name"],
+        },
+        execute: async ({ name }) => {
+          loaded.add(name);
+          return { status: "active" };
+        },
+      };
+      const llm = mockLlm([
+        toolUseTurn("register_extension", { name: "secret-ext" }),
+        toolUseTurn("secret_tool", { token: "raw-secret", label: "kept" }),
+        endTurn("done"),
+      ]);
+      const seenToolCalls: unknown[] = [];
+      r.bus.subscribe("chat.tool-call", (e) => {
+        seenToolCalls.push(e.payload);
+      });
+      startAgentLoop({
+        bus: r.bus,
+        store: r.store,
+        hostId: r.hostId,
+        llm,
+        agentId: r.agentId,
+        coreTools: [registerExtension],
+        extensions,
+        threadsDir: dir,
+      });
+
+      const done = new Promise<void>((resolve) => {
+        r.bus.subscribe("chat.turn-end", () => resolve());
+      });
+      r.bus.publish({
+        type: "chat.input",
+        hostId: r.hostId,
+        actorId: "cli",
+        durable: true,
+        toAgentId: r.agentId,
+        threadId: "redact-live",
+        payload: { text: "register then call" },
+      });
+      await done;
+
+      const secretCall = seenToolCalls.find(
+        (p) => (p as { name?: string }).name === "secret_tool",
+      ) as { input: Record<string, unknown> } | undefined;
+      expect(secretCall?.input).toEqual({ token: "[redacted]", label: "kept" });
+
+      const snapPath = join(dir, "root", "redact-live.json");
+      const snapshot = readFileSync(snapPath, "utf8");
+      expect(snapshot).not.toContain("raw-secret");
+      expect(snapshot).toContain("[redacted]");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -27,6 +27,14 @@ export interface AgentRunOptions {
    *  sidebar). */
   system?: string | SystemSegment[];
   tools?: ToolDef[];
+  /** Live tool getter, called fresh at the start of every round-trip.
+   *  Use this when the tool surface can mutate inside a turn (e.g. an
+   *  agent calls `register_extension` mid-turn — the new tool needs to
+   *  appear in the LLM's tool list and become dispatchable on the very
+   *  next round-trip). When omitted, falls back to the static `tools`
+   *  array (legacy behavior; fine for callers whose tool set is fixed
+   *  for the whole turn, like tests). */
+  getTools?: () => ToolDef[];
   /** Per-turn filter deciding which tools' schemas reach the LLM. Returns
    *  true for names whose schema should be sent on the next round-trip.
    *  Tools with `alwaysLoaded: true` are included regardless. The full
@@ -71,18 +79,24 @@ export interface AgentResult {
 export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   const model = opts.model ?? opts.llm.defaultModel;
   const maxTurns = opts.maxTurns ?? 10;
-  // Pre-flight: catch duplicate tool names before the provider 400s. Boot
-  // invariants check this at daemon start, but extension hot-reload can
-  // still introduce a collision with a core tool mid-session — re-checking
-  // here turns a generic provider 400 into a named local error.
-  const toolByName = new Map<string, ToolDef>();
-  for (const t of opts.tools ?? []) {
-    if (toolByName.has(t.name)) {
-      throw new Error(
-        `runAgent: duplicate tool name "${t.name}" in registry — refusing to call provider`,
-      );
+
+  // Resolve the tool surface for the next round-trip. `getTools` (when
+  // supplied) is re-read each call so a mid-turn register/unload becomes
+  // visible immediately. Duplicate-name check runs here, not at function
+  // entry, so a hot-reload collision surfaces as a named local error
+  // instead of a generic provider 400.
+  function resolveTools(): { tools: ToolDef[]; byName: Map<string, ToolDef> } {
+    const tools = opts.getTools ? opts.getTools() : opts.tools ?? [];
+    const byName = new Map<string, ToolDef>();
+    for (const t of tools) {
+      if (byName.has(t.name)) {
+        throw new Error(
+          `runAgent: duplicate tool name "${t.name}" in registry — refusing to call provider`,
+        );
+      }
+      byName.set(t.name, t);
     }
-    toolByName.set(t.name, t);
+    return { tools, byName };
   }
 
   const messages: Message[] = [...opts.messages];
@@ -95,10 +109,8 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   };
 
   for (let turn = 0; turn < maxTurns; turn++) {
-    // Filter the tool surface per round-trip so a `load_tools` call
-    // mutating the loaded set (external to runAgent) becomes visible
-    // on the very next LLM call without rebuilding the runtime.
-    const visibleTools = filterVisibleTools(opts.tools, opts.isLoaded);
+    const { tools: roundTools, byName: toolByName } = resolveTools();
+    const visibleTools = filterVisibleTools(roundTools, opts.isLoaded);
     const toolSpecs: ToolSpec[] | undefined = visibleTools?.map(toToolSpec);
     const req: CompletionRequest = {
       model,

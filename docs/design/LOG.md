@@ -585,6 +585,26 @@ Three design calls embedded:
 
 ---
 
+## 2026-04-26 — Extension authoring loop: smoke fresh, dispatch live, register auto-loads
+
+A real run inside OLL-E surfaced three structural bugs in the propose → write → smoke → hot-load loop — the load-bearing self-modification mechanism. The agent burned ~6 turns on wrong theories because the world was lying to it. Three fixes landed:
+
+1. **Smoke runs fresh every call.** `run_smoke_test` was importing `smoke.ts` with a `?t=${Date.now()}` query string, but Bun's ESM cache keys on resolved file path and ignores the query, so re-edits kept seeing the first version's error. The runtime's `load()` already solves this by staging into a ULID-suffixed temp dir before importing — same trick now exposes through a public `ExtensionHost.smokeTest(name)`. The meta-tool became a thin wrapper, deleting a duplicate (and subtly divergent) secret-resolution path that also happened to pass `undefined` where the runtime passes `opts.bus`. Single source of truth for smoke staging + secrets.
+
+2. **`list_extensions` for on-disk-but-unregistered extensions.** `query_host_context` and `olle extension list` both showed only loaded extensions, so an agent could entirely forget it had authored an extension in a prior session. New `ExtensionHost.inventory()` returns `{name, status: registered | unregistered | broken, path, lastCommit}` for everything under `~/.olle/extensions/` with a manifest. Wired into a new core `list_extensions` tool AND the existing CLI subcommand — observability rule says every CLI surface has a parallel agent tool, both reading the same layer. The "agent forgets they built X" failure mode was tempting to solve with a system-authored memory note ("you built X on date Y"); rejected. **Memory is identity. The system writing identity-bearing memory on the agent's behalf would be the system speaking *as* the agent — same category of mistake as a privileged human dashboard, just inverted.** The right answer is to make the world queryable; the agent decides what's worth a memory note.
+
+3. **Live tool surface in chat.ts; `runAgent` re-resolves per round-trip.** The chat loop snapshotted the tool list once at turn start (`coreTools = collectTools(opts)` at `chat.ts:175`) and the snapshot fed both the LLM tool list and the dispatch table. Mid-turn `register_extension` therefore left the new tool invisible to the LLM, "unknown" to the dispatcher, and unfindable by `load_tools`; a renamed-away tool stayed dispatchable because it was still in the snapshot even though the host's internal map (correctly) cleaned it up. Replaced the snapshot with a live `getTools()` getter that re-reads `opts.extensions.tools()`. Threaded the getter into `runAgent` so it rebuilds `toolByName` and the visible-tool filter at the start of every round-trip. The catalog stays turn-stable on purpose — it lives in the cached system prefix, and invalidating it mid-turn defeats the cache architecture (an agent that just registered already knows the tool exists; the catalog being one-turn-stale is acceptable).
+
+Two design calls embedded:
+
+1. **`register_extension` auto-loads its declared tools into the calling thread's `loadedTools` and surfaces their schemas in the result.** ARCHITECTURE.md says "lazy by default" for the loadout — that rationale is about prefix-token cost for tools the agent *might* want. Irrelevant to a tool the agent just authored: write+smoke+register is explicit cost paid with intent to use. Forcing a separate `load_tools` hop is exactly the papercut habitat philosophy is supposed to delete. `unload_tools` remains the cheap path back if the agent regrets the inflation. Per-thread runtime state, not durable identity — same model as `load_tools` itself.
+
+2. **Reject the auto-stub-memory shortcut for "you authored X."** See above — making the world observable (`list_extensions`) is the more-agentic path. The agent retains agency over its own identity surface; the system supplies a queryable world.
+
+`[DEFERRED-to-v0.1]` Tool prefix-cost surface. Auto-load on register (and `load_tools` by hand) silently commits the agent to shipping tool schemas in every subsequent turn's prefix. There is no surface that says "loading X costs N prefix tokens/turn" — the agent has to estimate from `inputSchema` size. Possible shapes: per-tool prefix-byte estimates in the catalog, in the `load_tools` / `register_extension` result, or in `query_self.loaded`. **Resurrect when:** the first agent files an inbox proposal about loaded-set bloat, OR ledger evidence shows recurring loads that could have been avoided.
+
+---
+
 ## 2026-04-26 — Caller identity for `retargetThread` (resolved same day)
 
 The `retarget_thread` meta-tool now passes `ctx.actorId` through to `manager.retargetThread`, so `thread.retargeted` events attribute to the agent that requested the redirect rather than to the manager process. `callerId` is required on the manager API; the previous `agentFromCall()` placeholder is removed. The earlier same-day [DEFERRED-to-v0.1] entry is retired — promoted in the same review pass that flagged the dead-weight parameter.

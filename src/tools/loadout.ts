@@ -21,11 +21,28 @@ export interface LoadoutDeps {
   allTools: () => ToolDef[];
 }
 
-interface LoadResultEntry {
+export interface LoadResultEntry {
   name: string;
   status: "loaded" | "already-loaded" | "unknown" | "always-loaded";
   description?: string;
   inputSchema?: Record<string, unknown>;
+}
+
+/** Mutate `loadedTools` to include `tool` (unless it's always-on or already
+ *  loaded) and return a result entry describing the outcome. Shared by
+ *  `load_tools` and the auto-load-on-register wrapper so both surfaces
+ *  report the same shape. Never returns `"unknown"` — the caller resolves
+ *  names against the catalog before calling. */
+export function markLoaded(loadedTools: Set<string>, tool: ToolDef): LoadResultEntry {
+  const base = {
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  };
+  if (tool.alwaysLoaded) return { ...base, status: "always-loaded" };
+  if (loadedTools.has(tool.name)) return { ...base, status: "already-loaded" };
+  loadedTools.add(tool.name);
+  return { ...base, status: "loaded" };
 }
 
 interface UnloadResultEntry {
@@ -55,43 +72,11 @@ export function buildLoadoutTools(deps: LoadoutDeps): ToolDef[] {
       additionalProperties: false,
     },
     execute: async ({ names }) => {
-      const tools = deps.allTools();
-      const byName = new Map(tools.map((t) => [t.name, t]));
-      const results: LoadResultEntry[] = [];
-      for (const name of names) {
+      const byName = new Map(deps.allTools().map((t) => [t.name, t]));
+      const results: LoadResultEntry[] = names.map((name) => {
         const t = byName.get(name);
-        if (!t) {
-          results.push({ name, status: "unknown" });
-          continue;
-        }
-        if (t.alwaysLoaded) {
-          // Already in every turn; loading is a no-op but worth surfacing
-          // so the agent doesn't waste a load slot on it.
-          results.push({
-            name,
-            status: "always-loaded",
-            description: t.description,
-            inputSchema: t.inputSchema,
-          });
-          continue;
-        }
-        if (deps.loadedTools.has(name)) {
-          results.push({
-            name,
-            status: "already-loaded",
-            description: t.description,
-            inputSchema: t.inputSchema,
-          });
-          continue;
-        }
-        deps.loadedTools.add(name);
-        results.push({
-          name,
-          status: "loaded",
-          description: t.description,
-          inputSchema: t.inputSchema,
-        });
-      }
+        return t ? markLoaded(deps.loadedTools, t) : { name, status: "unknown" };
+      });
       return { results };
     },
   };

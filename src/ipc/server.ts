@@ -242,16 +242,12 @@ async function dispatch(
           send({ id: req.id, ok: true, value: [] });
           return;
         }
-        send({
-          id: req.id,
-          ok: true,
-          value: opts.extensions.list().map((e) => ({
-            name: e.manifest.name,
-            version: e.manifest.version,
-            status: e.status,
-            failures: e.failures,
-          })),
-        });
+        // Inventory rather than `list()` — surfaces on-disk-but-unregistered
+        // extensions so the CLI shows the same picture the agent's
+        // list_extensions tool does. Two surfaces, one source of truth per
+        // the observability rule.
+        const inv = await opts.extensions.inventory();
+        send({ id: req.id, ok: true, value: inv });
         return;
       }
       case "extensions.reload": {

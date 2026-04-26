@@ -264,4 +264,96 @@ describe("runAgent", () => {
     });
     expect(seen).toEqual(["true:n must be a number"]);
   });
+
+  it("getTools is consulted per round-trip — new tools become callable mid-turn", async () => {
+    const llm = mockLlm([
+      toolUse("t1", "register", {}),
+      toolUse("t2", "newcomer", { x: 1 }),
+      endTurn("done."),
+    ]);
+    const tools: ToolDef[] = [
+      {
+        name: "register",
+        description: "register the newcomer tool",
+        inputSchema: { type: "object", properties: {} },
+        execute: () => {
+          tools.push({
+            name: "newcomer",
+            description: "added mid-turn",
+            inputSchema: { type: "object", properties: { x: { type: "number" } } },
+            execute: (args) => `newcomer:${(args as { x: number }).x}`,
+          });
+          return "registered";
+        },
+      },
+    ];
+    const r = await runAgent({
+      llm,
+      toolCtx: ctx,
+      getTools: () => [...tools],
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(r.stopReason).toBe("end_turn");
+    // First LLM call sees only `register`. Second call (after register ran)
+    // must see both, AND the tool_use for newcomer must dispatch
+    // successfully — not "unknown tool".
+    const firstReqTools = (llm.calls[0]!.tools ?? []).map((t) => t.name);
+    const secondReqTools = (llm.calls[1]!.tools ?? []).map((t) => t.name);
+    expect(firstReqTools).toEqual(["register"]);
+    expect(secondReqTools.sort()).toEqual(["newcomer", "register"]);
+    const allBlocks = llm.calls[2]!.messages.flatMap((m) =>
+      Array.isArray(m.content) ? m.content : [],
+    );
+    const newcomerResult = allBlocks.find(
+      (b) => b.type === "tool_result" && (b as { tool_use_id: string }).tool_use_id === "t2",
+    );
+    expect(newcomerResult).toBeDefined();
+    expect((newcomerResult as { content: string }).content).toBe("newcomer:1");
+    expect((newcomerResult as { is_error?: boolean }).is_error).toBeUndefined();
+  });
+
+  it("getTools removes a renamed-away tool from dispatch on the next round", async () => {
+    const llm = mockLlm([
+      toolUse("t1", "rename", {}),
+      toolUse("t2", "old_name", {}),
+      endTurn("done."),
+    ]);
+    let live: ToolDef[] = [
+      {
+        name: "old_name",
+        description: "to be replaced",
+        inputSchema: { type: "object", properties: {} },
+        execute: () => "old",
+      },
+      {
+        name: "rename",
+        description: "swap old_name for new_name",
+        inputSchema: { type: "object", properties: {} },
+        execute: () => {
+          live = [
+            {
+              name: "new_name",
+              description: "replacement",
+              inputSchema: { type: "object", properties: {} },
+              execute: () => "new",
+            },
+            live.find((t) => t.name === "rename")!,
+          ];
+          return "renamed";
+        },
+      },
+    ];
+    const seen: string[] = [];
+    await runAgent({
+      llm,
+      toolCtx: ctx,
+      getTools: () => live,
+      messages: [{ role: "user", content: "go" }],
+      onStep: (s) => {
+        if (s.kind === "tool_result") seen.push(`${s.name}:${s.isError}:${s.content}`);
+      },
+    });
+    expect(seen[0]).toBe("rename:false:renamed");
+    expect(seen[1]).toBe("old_name:true:unknown tool: old_name");
+  });
 });

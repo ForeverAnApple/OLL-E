@@ -204,6 +204,105 @@ describe("smoke gate", () => {
     const ext = await host.load("ok");
     expect(ext.status).toBe("active");
   });
+
+  it("smokeTest re-reads source after edits — no ESM cache stickiness", async () => {
+    const r = rig();
+    writeExt(tmp, "iterate", {
+      index: `export function register() {}`,
+      smoke: `export async function smokeTest() { throw new Error("v1"); }`,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    const first = await host.smokeTest("iterate");
+    expect(first.ok).toBe(false);
+    if (!first.ok) expect(first.error).toMatch(/v1/);
+
+    writeFileSync(
+      join(tmp, "iterate", "smoke.ts"),
+      `export async function smokeTest() { throw new Error("v2"); }`,
+    );
+    const second = await host.smokeTest("iterate");
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.error).toMatch(/v2/);
+
+    writeFileSync(
+      join(tmp, "iterate", "smoke.ts"),
+      `export async function smokeTest() { return; }`,
+    );
+    const third = await host.smokeTest("iterate");
+    expect(third.ok).toBe(true);
+  });
+
+  it("smokeTest reports missing extension dir without throwing", async () => {
+    const r = rig();
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    const result = await host.smokeTest("nope");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/not found on disk/);
+  });
+});
+
+describe("inventory", () => {
+  it("surfaces registered, unregistered, and broken extensions", async () => {
+    const r = rig();
+    writeExt(tmp, "loaded-ext", {
+      index: `export function register() {}`,
+    });
+    writeExt(tmp, "unloaded-ext", {
+      index: `export function register() {}`,
+    });
+    // Broken: manifest exists but is invalid JSON.
+    const brokenDir = join(tmp, "broken-ext");
+    mkdirSync(brokenDir, { recursive: true });
+    writeFileSync(join(brokenDir, "manifest.json"), "{ not-valid json");
+
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("loaded-ext");
+
+    const inv = await host.inventory();
+    const byName = Object.fromEntries(inv.map((e) => [e.name, e]));
+    expect(byName["loaded-ext"]?.status).toBe("registered");
+    expect(byName["unloaded-ext"]?.status).toBe("unregistered");
+    // Broken-manifest entries are surfaced under the directory name (the
+    // manifest can't be trusted to give a name) with an error attached.
+    expect(byName["broken-ext"]?.status).toBe("broken");
+    expect(byName["broken-ext"]?.error).toBeDefined();
+  });
+
+  it("ignores hidden dirs and bare directories without a manifest", async () => {
+    const r = rig();
+    // Hidden dir — the .git dir would otherwise leak through.
+    mkdirSync(join(tmp, ".git"), { recursive: true });
+    // Random scratch dir without a manifest — not yet an extension.
+    mkdirSync(join(tmp, "scratchpad"), { recursive: true });
+    writeExt(tmp, "real", { index: `export function register() {}` });
+
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    const inv = await host.inventory();
+    expect(inv.map((e) => e.name)).toEqual(["real"]);
+  });
+
+  it("marks manifest-name mismatches as broken under the directory name", async () => {
+    const r = rig();
+    writeExt(tmp, "actual-dir", {
+      manifest: { name: "advertised-name", version: "0.1.0" },
+      index: `export function register() {}`,
+    });
+    writeExt(tmp, "advertised-name", {
+      index: `export function register() {}`,
+    });
+
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("advertised-name");
+
+    const inv = await host.inventory();
+    const byPath = Object.fromEntries(inv.map((e) => [e.path, e]));
+    const mismatch = byPath[join(tmp, "actual-dir")]!;
+    expect(mismatch.name).toBe("actual-dir");
+    expect(mismatch.status).toBe("broken");
+    expect(mismatch.error).toMatch(/manifest name "advertised-name" != dir "actual-dir"/);
+    expect(inv.filter((e) => e.name === "advertised-name")).toHaveLength(1);
+    expect(inv.find((e) => e.name === "advertised-name")?.status).toBe("registered");
+  });
 });
 
 describe("hot reload + failure tracking", () => {

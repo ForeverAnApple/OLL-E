@@ -23,6 +23,7 @@ import { tables } from "../store/index.ts";
 import { ulid } from "../id/index.ts";
 import { eq } from "drizzle-orm";
 import { readManifest } from "./manifest.ts";
+import { latestCommitsBySubtree } from "./git.ts";
 import type { Scheduler } from "../scheduler/index.ts";
 import { checkTool } from "../permissions/index.ts";
 import type { AgentScope } from "../store/schema.ts";
@@ -60,6 +61,21 @@ export interface ExtensionHostOptions {
   resolveMailbox?: (threadId: string) => string | undefined;
 }
 
+export type SmokeResult = { ok: true } | { ok: false; error: string };
+
+export interface ExtensionInventoryEntry {
+  name: string;
+  /** "registered" — currently loaded into the runtime.
+   *  "unregistered" — present on disk with a valid manifest but never
+   *    loaded (e.g. authored in a prior session, never call to register).
+   *  "broken" — present on disk but the manifest is invalid or does not
+   *    match the directory name; `error` carries the message. */
+  status: "registered" | "unregistered" | "broken";
+  path: string;
+  error?: string;
+  lastCommit?: { sha: string; author: string; date: number; subject: string };
+}
+
 export interface ExtensionHost {
   list(): LoadedExtension[];
   get(name: string): LoadedExtension | undefined;
@@ -67,6 +83,17 @@ export interface ExtensionHost {
   load(name: string): Promise<LoadedExtension>;
   unload(name: string): Promise<void>;
   reload(name: string): Promise<LoadedExtension>;
+  /** Full picture of what's on disk: registered, on-disk-but-unregistered,
+   *  and broken/unloadable manifest cases. Lets agents (and the `olle extension list`
+   *  CLI) discover extensions they authored in a prior session — without
+   *  this they have to remember on their own that they exist. */
+  inventory(): Promise<ExtensionInventoryEntry[]>;
+  /** Run an extension's smoke gate without activating. Always stages a
+   *  fresh copy (Bun's ESM cache is keyed by resolved path, so reusing
+   *  the on-disk path would import a stale module after edits). Same
+   *  staging + secret resolution path that `load()` uses, so a smoke
+   *  that passes here will pass on register. */
+  smokeTest(name: string): Promise<SmokeResult>;
   /** Called by task handlers when an extension tool or trigger throws.
    *  Increments failure count and auto-disables past the threshold. */
   reportFailure(name: string, err: unknown): void;
@@ -535,6 +562,78 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     return load(name);
   }
 
+  async function inventory(): Promise<ExtensionInventoryEntry[]> {
+    const entries = existsSync(opts.extensionsDir) ? readdirSync(opts.extensionsDir) : [];
+    // One git call total, then look up by entry name. Inventory is read-
+    // only — git failure is tolerated (empty map = no lastCommit fields).
+    const lastCommits = existsSync(join(opts.extensionsDir, ".git"))
+      ? safeLatestCommits(opts.extensionsDir)
+      : new Map();
+    const out: ExtensionInventoryEntry[] = [];
+    for (const entry of entries) {
+      if (entry.startsWith(".")) continue;
+      const dir = join(opts.extensionsDir, entry);
+      let stat;
+      try {
+        stat = statSync(dir);
+      } catch {
+        continue;
+      }
+      if (!stat.isDirectory()) continue;
+      // A scratch/in-progress dir without a manifest is invisible until the
+      // author drops one in.
+      if (!existsSync(join(dir, "manifest.json"))) continue;
+
+      let inv: ExtensionInventoryEntry;
+      try {
+        const manifest = readManifest(dir);
+        if (manifest.name !== entry) {
+          throw new Error(`extensions: manifest name "${manifest.name}" != dir "${entry}"`);
+        }
+        inv = {
+          name: manifest.name,
+          status: loaded.has(manifest.name) ? "registered" : "unregistered",
+          path: dir,
+        };
+      } catch (err) {
+        inv = { name: entry, status: "broken", path: dir, error: (err as Error).message };
+      }
+
+      const recent = lastCommits.get(entry);
+      if (recent) inv.lastCommit = recent;
+
+      out.push(inv);
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return out;
+  }
+
+  async function smokeTest(name: string): Promise<SmokeResult> {
+    const extDir = resolve(opts.extensionsDir, name);
+    if (!existsSync(extDir)) {
+      return { ok: false, error: `extensions: ${name} not found on disk` };
+    }
+    let manifest: Manifest;
+    try {
+      manifest = readManifest(extDir);
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+    if (manifest.name !== name) {
+      return {
+        ok: false,
+        error: `extensions: manifest name "${manifest.name}" != dir "${name}"`,
+      };
+    }
+    try {
+      const stagedDir = stage(extDir, name);
+      await runSmoke(stagedDir, manifest);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
   function reportFailure(name: string, err: unknown): void {
     const record = loaded.get(name);
     if (!record) return;
@@ -578,7 +677,27 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     return [...triggersByExt.values()].flat();
   }
 
-  return { list, get, discover, load, unload, reload, reportFailure, tools, triggers };
+  return {
+    list,
+    get,
+    discover,
+    inventory,
+    load,
+    unload,
+    reload,
+    smokeTest,
+    reportFailure,
+    tools,
+    triggers,
+  };
+}
+
+function safeLatestCommits(dir: string): Map<string, { sha: string; author: string; date: number; subject: string }> {
+  try {
+    return latestCommitsBySubtree(dir);
+  } catch {
+    return new Map();
+  }
 }
 
 function loadScopeForAgent(store: Store, agentId: string): AgentScope {

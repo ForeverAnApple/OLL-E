@@ -156,14 +156,24 @@ async function cmdExtension(args: string[]): Promise<void> {
       case undefined:
       case "list": {
         const list = await client.call<
-          Array<{ name: string; version: string; status: string; failures: number }>
+          Array<{
+            name: string;
+            status: "registered" | "unregistered" | "broken";
+            path: string;
+            error?: string;
+            lastCommit?: { sha: string; date: number; subject: string };
+          }>
         >("extensions.list");
         if (list.length === 0) {
-          console.log("(no extensions loaded)");
+          console.log("(no extensions on disk)");
           return;
         }
         for (const e of list) {
-          console.log(`${e.name}@${e.version}  ${e.status}  fail=${e.failures}`);
+          const last = e.lastCommit
+            ? ` (${e.lastCommit.sha.slice(0, 7)} ${new Date(e.lastCommit.date).toISOString().slice(0, 10)})`
+            : "";
+          const detail = e.status === "broken" && e.error ? `  err=${e.error}` : "";
+          console.log(`${e.name}  ${e.status}${last}${detail}`);
         }
         return;
       }

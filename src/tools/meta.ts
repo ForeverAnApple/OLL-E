@@ -20,8 +20,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
-import type { ExtensionHost, ToolDef } from "../extensions/index.ts";
+import type { ExtensionHost, ExtensionInventoryEntry, ToolDef } from "../extensions/index.ts";
 import type { AgentManager } from "../agent/index.ts";
 import type { AgentScope } from "../store/schema.ts";
 import type { OllePaths } from "../paths.ts";
@@ -32,7 +31,6 @@ import {
   revertSubtree,
 } from "../extensions/git.ts";
 import { validateManifest } from "../extensions/manifest.ts";
-import type { SmokeTest } from "../extensions/types.ts";
 import { installStarter, listStarters } from "../starters/index.ts";
 
 export interface MetaToolsOptions {
@@ -156,7 +154,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     category: "extension authoring",
     shortClause: "run an extension's smoke test without activating it",
     description:
-      "Run an extension's smoke test without activating it. Resolves the extension's declared secrets the same way a register/reload would, so a smoke that passes here will pass on load.",
+      "Run an extension's smoke test without activating it. Stages a fresh copy and resolves the extension's declared secrets the same way register would, so the result here matches what register would see — including immediately after a write_extension edit.",
     inputSchema: {
       type: "object",
       properties: { name: { type: "string" } },
@@ -164,39 +162,10 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
       additionalProperties: false,
     },
     execute: async ({ name }) => {
-      const smokePath = join(extensionsDir, name, "smoke.ts");
-      if (!existsSync(smokePath)) return { ok: true } as const;
-      try {
-        // Resolve secrets the same way the runtime does at load: read the
-        // manifest's `secrets` list, then pull each from ~/.olle/secrets.
-        // No env fallback — secrets have one source of truth (the file
-        // store), so a missing secret here mirrors what the live load-time
-        // smoke would see.
-        const secrets: Record<string, string> = {};
-        const manifestPath = join(extensionsDir, name, "manifest.json");
-        if (existsSync(manifestPath) && opts.secretsDir) {
-          try {
-            const mf = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-              secrets?: string[];
-            };
-            for (const s of mf.secrets ?? []) {
-              const p = join(opts.secretsDir, s);
-              if (existsSync(p)) secrets[s] = readFileSync(p, "utf8").trim();
-            }
-          } catch {
-            /* manifest unreadable — smoke will surface the real error */
-          }
-        }
-        const mod = (await import(pathToFileURL(smokePath).href + `?t=${Date.now()}`)) as {
-          smokeTest?: SmokeTest;
-        };
-        if (typeof mod.smokeTest === "function") {
-          await mod.smokeTest(undefined as never, { secrets });
-        }
-        return { ok: true } as const;
-      } catch (err) {
-        return { ok: false, error: (err as Error).message } as const;
+      if (!/^[a-z0-9][a-z0-9-_]*$/.test(name)) {
+        throw new Error(`run_smoke_test: invalid name "${name}"`);
       }
+      return extensions.smokeTest(name);
     },
   };
 
@@ -391,6 +360,17 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     },
   };
 
+  const listExtensions: ToolDef<Record<string, never>, ExtensionInventoryEntry[]> = {
+    name: "list_extensions",
+    tier: "operational",
+    category: "extension authoring",
+    shortClause: "list every extension on disk — registered, unregistered, broken",
+    description:
+      "List every extension under ~/.olle/extensions/, regardless of whether it's currently loaded. Status is registered (loaded), unregistered (on disk with valid loadable manifest, never loaded — common after a daemon restart or work from a prior session), or broken (manifest invalid or unloadable; error is attached). lastCommit is the most recent git commit touching the extension subtree. Use this to discover what you've already authored before reaching for write_extension.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    execute: async () => extensions.inventory(),
+  };
+
   const installStarterT: ToolDef<
     { name: string; overwrite?: boolean },
     { name: string; filesWritten: number; alreadyExisted: boolean; commit: string | null }
@@ -431,6 +411,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     runSmoke,
     readExtFile,
     queryHostContext,
+    listExtensions,
     register,
     revert,
     history,

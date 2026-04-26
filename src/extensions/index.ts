@@ -3,6 +3,8 @@ export {
   writeExtensionFile,
   type ExtensionHost,
   type ExtensionHostOptions,
+  type ExtensionInventoryEntry,
+  type SmokeResult,
 } from "./runtime.ts";
 export { readManifest, validateManifest } from "./manifest.ts";
 export { ensureRepo, commitSubtree, history, revertSubtree, git } from "./git.ts";

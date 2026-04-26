@@ -70,6 +70,39 @@ export interface HistoryEntry {
   subject: string;
 }
 
+/** Latest commit per top-level subtree, in one `git log` invocation.
+ *  Avoids N spawn(git) calls when callers want a "last touched" tag for
+ *  many subtrees at once (inventory()). Map is keyed by the first path
+ *  segment of each touched file. */
+export function latestCommitsBySubtree(cwd: string): Map<string, HistoryEntry> {
+  const out = new Map<string, HistoryEntry>();
+  // \x1e (record sep) prefixes commit headers so we can tell them apart
+  // from file lines without a second pass.
+  const r = git(cwd, ["log", "--name-only", "--format=%x1e%H%x1f%an%x1f%at%x1f%s"]);
+  if (r.status !== 0) return out;
+  let current: HistoryEntry | null = null;
+  for (const raw of r.stdout.split("\n")) {
+    if (!raw) continue;
+    if (raw.startsWith("\x1e")) {
+      const [sha, author, date, subject] = raw.slice(1).split("\x1f");
+      current = sha
+        ? {
+            sha,
+            author: author ?? "",
+            date: Number.parseInt(date ?? "0", 10) * 1000,
+            subject: subject ?? "",
+          }
+        : null;
+      continue;
+    }
+    if (!current) continue;
+    const top = raw.split("/")[0];
+    if (!top || out.has(top)) continue;
+    out.set(top, current);
+  }
+  return out;
+}
+
 export function history(cwd: string, subpath: string, limit = 50): HistoryEntry[] {
   const r = git(cwd, [
     "log",
