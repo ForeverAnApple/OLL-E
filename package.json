@@ -11,8 +11,8 @@
     "olle": "bun run ./src/cli/index.ts",
     "daemon": "bun run ./src/daemon/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test test",
-    "test:ci": "bun test test --reporter=junit --reporter-outfile=.artifacts/junit.xml",
+    "test": "bun test test --parallel",
+    "test:ci": "bun test test --parallel --reporter=junit --reporter-outfile=.artifacts/junit.xml",
     "db:generate": "drizzle-kit generate",
     "build": "bash scripts/build.sh"
   },
