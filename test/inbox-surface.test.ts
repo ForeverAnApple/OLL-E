@@ -24,6 +24,7 @@ import { eq } from "drizzle-orm";
 let daemon: Daemon;
 let client: IpcClient;
 let tmp: string;
+let tools: ReturnType<typeof buildInboxTools>;
 
 // Daemon lifecycle is shared across the file; only inbox state resets per test.
 // Per-test daemon spinup was ~200ms × 13 tests = ~2.5s of pure setup.
@@ -31,11 +32,17 @@ beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "olle-inbox-surface-"));
   daemon = await startDaemon({ root: tmp, version: "test", quiet: true });
   client = await connectIpc(daemon.paths.socketFile);
+  tools = buildInboxTools({
+    inbox: daemon.inbox,
+    principalId: daemon.rootPrincipalId,
+    bus: daemon.bus,
+    hostId: daemon.hostId,
+    store: daemon.store,
+  });
 });
 
 beforeEach(() => {
-  daemon.store.raw.exec("DELETE FROM approvals");
-  daemon.store.raw.exec("DELETE FROM decisions");
+  daemon.store.raw.exec("DELETE FROM approvals; DELETE FROM decisions;");
 });
 
 afterAll(async () => {
@@ -137,7 +144,6 @@ describe("mail_* core tools", () => {
   // Tool surface mirrors IPC: same Inbox instance, so rows are identical.
   it("mail_list returns the same rows as inbox.list", async () => {
     seedDecision(daemon, "via tools");
-    const tools = buildInboxTools({ inbox: daemon.inbox, principalId: daemon.rootPrincipalId });
     const list = tools.find((t) => t.name === "mail_list")!;
     const ipcRows = await client.call<Decision[]>("inbox.list");
     const toolRows = (await list.execute({}, makeCtx(daemon))) as Decision[];
@@ -148,7 +154,6 @@ describe("mail_* core tools", () => {
     const { id } = seedDecision(daemon);
     seedDecision(daemon, "still-open");
     await client.call("inbox.respond", { id, vote: "deny" });
-    const tools = buildInboxTools({ inbox: daemon.inbox, principalId: daemon.rootPrincipalId });
     const list = tools.find((t) => t.name === "mail_list")!;
     const all = (await list.execute({ includeResolved: true }, makeCtx(daemon))) as Decision[];
     expect(all).toHaveLength(2);
@@ -159,7 +164,6 @@ describe("mail_* core tools", () => {
 
   it("mail_respond resolves a decision and stamps actorId from ctx", async () => {
     const { id } = seedDecision(daemon);
-    const tools = buildInboxTools({ inbox: daemon.inbox, principalId: daemon.rootPrincipalId });
     const respond = tools.find((t) => t.name === "mail_respond")!;
     const updated = (await respond.execute(
       { id, vote: "approve", message: "lgtm" },
@@ -177,7 +181,6 @@ describe("mail_* core tools", () => {
 
   it("mail_respond modify requires payloadOverride", () => {
     const { id } = seedDecision(daemon);
-    const tools = buildInboxTools({ inbox: daemon.inbox, principalId: daemon.rootPrincipalId });
     const respond = tools.find((t) => t.name === "mail_respond")!;
     // execute() throws synchronously — wrap in a thunk so expect can catch it.
     expect(() => respond.execute({ id, vote: "modify" }, makeCtx(daemon))).toThrow(
@@ -186,13 +189,6 @@ describe("mail_* core tools", () => {
   });
 
   it("mail_list is alwaysLoaded; mail_respond and mail_propose are deferred", () => {
-    const tools = buildInboxTools({
-      inbox: daemon.inbox,
-      principalId: daemon.rootPrincipalId,
-      bus: daemon.bus,
-      hostId: daemon.hostId,
-      store: daemon.store,
-    });
     const list = tools.find((t) => t.name === "mail_list")!;
     const respond = tools.find((t) => t.name === "mail_respond")!;
     const propose = tools.find((t) => t.name === "mail_propose")!;
@@ -226,13 +222,6 @@ describe("mail_list direction filter", () => {
 
   it("'in' (default) matches existing behavior", async () => {
     rootSeedDecision(daemon, "alpha");
-    const tools = buildInboxTools({
-      inbox: daemon.inbox,
-      principalId: daemon.rootPrincipalId,
-      bus: daemon.bus,
-      hostId: daemon.hostId,
-      store: daemon.store,
-    });
     const list = tools.find((t) => t.name === "mail_list")!;
     const rows = (await list.execute({}, makeCtx(daemon))) as Decision[];
     expect(rows.map((r) => r.summary)).toEqual(["alpha"]);
@@ -271,13 +260,6 @@ describe("mail_list direction filter", () => {
     // Also seed a proposal by root that should NOT show up in child's 'out'.
     rootSeedDecision(daemon, "root-only");
 
-    const tools = buildInboxTools({
-      inbox: daemon.inbox,
-      principalId: daemon.rootPrincipalId,
-      bus: daemon.bus,
-      hostId: daemon.hostId,
-      store: daemon.store,
-    });
     const list = tools.find((t) => t.name === "mail_list")!;
     const childCtx = { ...makeCtx(daemon), actorId: childId };
     const openRows = (await list.execute({ direction: "out" }, childCtx)) as Decision[];
@@ -295,13 +277,6 @@ describe("mail_list direction filter", () => {
     // Root proposes; the row is BOTH addressed to root's principal AND
     // proposed by root. 'both' must surface it once.
     rootSeedDecision(daemon, "shared");
-    const tools = buildInboxTools({
-      inbox: daemon.inbox,
-      principalId: daemon.rootPrincipalId,
-      bus: daemon.bus,
-      hostId: daemon.hostId,
-      store: daemon.store,
-    });
     const list = tools.find((t) => t.name === "mail_list")!;
     const rows = (await list.execute({ direction: "both" }, makeCtx(daemon))) as Decision[];
     expect(rows.map((r) => r.summary)).toEqual(["shared"]);
@@ -338,13 +313,6 @@ describe("mail_propose tool", () => {
       .where(eq(tables.agents.id, daemon.rootAgentId))
       .run();
     const child = makeChild(daemon);
-    const tools = buildInboxTools({
-      inbox: daemon.inbox,
-      principalId: daemon.rootPrincipalId,
-      bus: daemon.bus,
-      hostId: daemon.hostId,
-      store: daemon.store,
-    });
     const propose = tools.find((t) => t.name === "mail_propose")!;
 
     const before = daemon.inbox.listOpen(daemon.rootPrincipalId).length;
@@ -359,13 +327,6 @@ describe("mail_propose tool", () => {
 
   it("queues to the principal when no ancestor has authority", async () => {
     const child = makeChild(daemon, []);
-    const tools = buildInboxTools({
-      inbox: daemon.inbox,
-      principalId: daemon.rootPrincipalId,
-      bus: daemon.bus,
-      hostId: daemon.hostId,
-      store: daemon.store,
-    });
     const propose = tools.find((t) => t.name === "mail_propose")!;
 
     const before = daemon.inbox.listOpen(daemon.rootPrincipalId).length;
@@ -395,13 +356,6 @@ describe("mail_propose tool", () => {
     // back off the auto-approved event payload — same code path that would
     // fire if the proposal queued, just at a different ancestor.
     const child = makeChild(daemon, []);
-    const tools = buildInboxTools({
-      inbox: daemon.inbox,
-      principalId: daemon.rootPrincipalId,
-      bus: daemon.bus,
-      hostId: daemon.hostId,
-      store: daemon.store,
-    });
     const propose = tools.find((t) => t.name === "mail_propose")!;
 
     const seen: Array<{ tier: string; payload: unknown }> = [];
@@ -420,6 +374,7 @@ describe("mail_propose tool", () => {
     expect(seen[0]!.payload).toEqual({});
   });
 });
+
 
 function makeCtx(d: Daemon) {
   return {
