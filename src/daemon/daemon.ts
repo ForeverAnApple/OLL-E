@@ -79,11 +79,10 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // agent spawn, etc.) so nothing is lost before the subscriber is live.
   const memoryProjector: MemoryProjector = startMemoryProjector({ bus, store, hostId });
 
-  // Late-bound manager reference: extensions are created before the
-  // agent manager (which needs the LLM adapter, conditionally built),
-  // but the resolveMailbox callback captures a closure that reads the
-  // manager once it exists.
-  let agentManager: AgentManager | undefined;
+  // Late-bound manager reference: extensions are created and loaded before
+  // the agent manager decision. During that boot window, mailbox resolution
+  // intentionally returns undefined so bridges use rootAgentId.
+  const managerHolder: { ref: AgentManager | undefined } = { ref: undefined };
 
   ensureRepo(paths.extensionsDir);
   const extensions = createExtensionHost({
@@ -94,7 +93,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     scheduler,
     defaultTaskAgentId: rootAgentId,
     secrets: (name) => readSecret(paths.secretsDir, name),
-    resolveMailbox: (threadId) => agentManager?.resolveMailbox(threadId),
+    resolveMailbox: (threadId) => managerHolder.ref?.resolveMailbox(threadId),
   });
   const ledger = createLedger({ bus, store, hostId });
 
@@ -151,7 +150,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     const llm = createAnthropicAdapter({ apiKey: anthropicKey });
     // Manager first — meta-tools need a reference so spawn_agent etc.
     // resolve. The root loop gets registered into it after start.
-    agentManager = createAgentManager({
+    const agentManager = createAgentManager({
       bus,
       store,
       hostId,
@@ -163,6 +162,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       threadsDir: paths.threadsDir,
       hostContext: buildHostContextPrompt(paths, hostId),
     });
+    managerHolder.ref = agentManager;
     const coreTools = [
       ...buildMetaTools({
         extensions,
@@ -321,7 +321,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     // Manager shutdown stops every tracked loop (including the root);
     // explicit chat?.stop() is redundant when the manager owns it, but
     // safe if the manager never came up (no API key).
-    agentManager?.shutdown();
+    managerHolder.ref?.shutdown();
     chatHealth?.stop();
     chat?.stop();
     memoryProjector.stop();
@@ -359,7 +359,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     rootPrincipalId,
     chat,
     chatAgentId,
-    agentManager,
+    agentManager: managerHolder.ref,
     shutdown,
   };
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, type Daemon } from "../src/daemon/daemon.ts";
@@ -106,5 +106,49 @@ describe("daemon + ipc", () => {
     });
     expect(events.length).toBeGreaterThan(0);
     expect(events[0]!.type).toBe("obs.test");
+  });
+
+  it("lets boot-time extensions fall back to root mailbox before manager startup", async () => {
+    client.close();
+    await daemon.shutdown();
+    rmSync(tmp, { recursive: true, force: true });
+
+    tmp = mkdtempSync(join(tmpdir(), "olle-test-"));
+    const extDir = join(tmp, "extensions", "boot-bridge");
+    mkdirSync(extDir, { recursive: true });
+    writeFileSync(
+      join(extDir, "manifest.json"),
+      JSON.stringify(
+        { name: "boot-bridge", version: "0.1.0", description: "boot bridge regression test" },
+        null,
+        2,
+      ),
+    );
+    writeFileSync(
+      join(extDir, "index.ts"),
+      `
+        export function register(api) {
+          const threadId = "boot-bridge:thread";
+          const target = api.resolveMailbox?.(threadId) ?? api.rootAgentId;
+          api.publish("chat.input", { text: "hello from boot" }, {
+            durable: true,
+            toAgentId: target,
+            threadId,
+          });
+        }
+      `,
+    );
+
+    daemon = await startDaemon({ root: tmp, version: "test", quiet: true });
+    client = await connectIpc(daemon.paths.socketFile);
+
+    const rows = daemon.store.raw
+      .query<{ to_agent_id: string | null }, [string]>(
+        "SELECT to_agent_id FROM events WHERE type = ? ORDER BY created_at LIMIT 1",
+      )
+      .all("chat.input");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.to_agent_id).toBe(daemon.rootAgentId);
+    expect(daemon.extensions.get("boot-bridge")?.status).toBe("active");
   });
 });

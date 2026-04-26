@@ -43,11 +43,15 @@ export function checkCoreInvariants(tools: ToolDef[]): InvariantResult {
   // the same name can come from independent registrations (e.g. core
   // bundles each adding their own `mail_list`). Provider rejects the
   // request before the agent gets a turn.
-  const byName = new Map<string, number>();
+  const dupes: string[] = [];
+  const seen = new Set<string>();
   for (const t of tools) {
-    byName.set(t.name, (byName.get(t.name) ?? 0) + 1);
+    if (seen.has(t.name)) {
+      if (!dupes.includes(t.name)) dupes.push(t.name);
+    } else {
+      seen.add(t.name);
+    }
   }
-  const dupes = [...byName.entries()].filter(([, n]) => n > 1).map(([name]) => name);
   if (dupes.length > 0) {
     failures.push({
       code: "duplicate-tool-name",
