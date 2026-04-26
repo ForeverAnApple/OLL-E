@@ -583,7 +583,10 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
 
 function loadScopeForAgent(store: Store, agentId: string): AgentScope {
   const row = store.select().from(tables.agents).where(eq(tables.agents.id, agentId)).all()[0];
-  return (row?.scope as AgentScope) ?? {};
+  if (!row) {
+    throw new Error(`extensions: unknown acting agent "${agentId}" — refusing to run unscoped`);
+  }
+  return (row.scope as AgentScope) ?? {};
 }
 
 function upsertRow(store: Store, manifest: Manifest, path: string): string {
