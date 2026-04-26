@@ -68,7 +68,10 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
   const client =
     opts.client ??
     new Anthropic({
-      apiKey: opts.apiKey ?? process.env.ANTHROPIC_API_KEY,
+      // Caller (the daemon) resolves the key from the secrets store and
+      // passes it explicitly. No env fallback — secrets have one source of
+      // truth (~/.olle/secrets/), env is reserved for behavior toggles.
+      apiKey: opts.apiKey,
       maxRetries: 0,
     });
   const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;

@@ -70,22 +70,15 @@ install_binary() {
 
 write_launchd_plist() {
   mkdir -p "$(dirname "$PLIST_PATH")" "$OLLE_HOME/logs"
-  local env_block=""
-  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    env_block="  <key>EnvironmentVariables</key>
-  <dict>
-    <key>ANTHROPIC_API_KEY</key>
-    <string>$ANTHROPIC_API_KEY</string>
-    <key>OLLE_HOME</key>
-    <string>$OLLE_HOME</string>
-  </dict>"
-  else
-    env_block="  <key>EnvironmentVariables</key>
+  # Env block carries behavior config only — never secrets. Secrets live in
+  # ~/.olle/secrets/ and are resolved by the daemon at startup. Embedding
+  # ANTHROPIC_API_KEY here was the bug: it snapshotted whatever env install.sh
+  # ran with, then silently rotted relative to the secrets store.
+  local env_block="  <key>EnvironmentVariables</key>
   <dict>
     <key>OLLE_HOME</key>
     <string>$OLLE_HOME</string>
   </dict>"
-  fi
   cat >"$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -121,7 +114,6 @@ After=network.target
 Type=simple
 ExecStart=$BIN_DIR/olle run
 Environment=OLLE_HOME=$OLLE_HOME
-${ANTHROPIC_API_KEY:+Environment=ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY}
 Restart=always
 RestartSec=3
 

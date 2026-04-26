@@ -168,11 +168,10 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
       if (!existsSync(smokePath)) return { ok: true } as const;
       try {
         // Resolve secrets the same way the runtime does at load: read the
-        // manifest's `secrets` list, then pull each from ~/.olle/secrets
-        // with process.env as fallback. Without this the agent-callable
-        // smoke sees a different world than the actual load-time smoke —
-        // which silently masks "you forgot to set a secret" as a generic
-        // env-var miss.
+        // manifest's `secrets` list, then pull each from ~/.olle/secrets.
+        // No env fallback — secrets have one source of truth (the file
+        // store), so a missing secret here mirrors what the live load-time
+        // smoke would see.
         const secrets: Record<string, string> = {};
         const manifestPath = join(extensionsDir, name, "manifest.json");
         if (existsSync(manifestPath) && opts.secretsDir) {
@@ -182,10 +181,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
             };
             for (const s of mf.secrets ?? []) {
               const p = join(opts.secretsDir, s);
-              const v = existsSync(p)
-                ? readFileSync(p, "utf8").trim()
-                : process.env[s];
-              if (v != null) secrets[s] = v;
+              if (existsSync(p)) secrets[s] = readFileSync(p, "utf8").trim();
             }
           } catch {
             /* manifest unreadable — smoke will surface the real error */

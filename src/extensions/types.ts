@@ -191,8 +191,9 @@ export interface ExtensionModule {
 /** Context passed to smoke.ts smokeTest — so smoke can read its extension's
  *  declared secrets without resorting to process.env scraping. */
 export interface SmokeContext {
-  /** Resolved values for the manifest's `secrets` list (file-backed first,
-   *  process.env as fallback). Missing secrets are absent from the record. */
+  /** Resolved values for the manifest's `secrets` list (file-backed in
+   *  ~/.olle/secrets/). Missing secrets are absent from the record. Env
+   *  is intentionally not consulted — secrets have one source of truth. */
   secrets: Record<string, string>;
 }
 

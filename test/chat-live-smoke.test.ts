@@ -8,7 +8,7 @@
 // Pinned to Haiku + a tiny maxTokens so a run costs fractions of a cent.
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, type Daemon } from "../src/daemon/daemon.ts";
@@ -25,6 +25,14 @@ let tmp: string;
 beforeAll(async () => {
   if (!HAS_KEY) return;
   tmp = mkdtempSync(join(tmpdir(), "olle-smoke-"));
+  // Daemon reads the API key from the secrets store, never env. Seed the
+  // temp store with the key the test runner was launched with so the chat
+  // agent boots; this mirrors how a user would `olle secret set` in prod.
+  const secretsDir = join(tmp, "secrets");
+  mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(secretsDir, "ANTHROPIC_API_KEY"), process.env.ANTHROPIC_API_KEY!, {
+    mode: 0o600,
+  });
   // Smaller max tokens via env so the haiku call is fast & cheap.
   process.env.OLLE_SMOKE = "1";
   daemon = await startDaemon({ root: tmp, version: "smoke", quiet: true });

@@ -1,7 +1,14 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { Database } from "bun:sqlite";
+
+// Static imports so `bun build --compile` embeds the SQL into the binary.
+// readdirSync against `/$bunfs/root/migrations` returns ENOENT — the bundler
+// only carries files reachable through the import graph. Add new migrations
+// here in numeric order; the array is the manifest.
+import migration0001 from "./migrations/0001_init.sql" with { type: "text" };
+import migration0002 from "./migrations/0002_task_runs.sql" with { type: "text" };
+import migration0003 from "./migrations/0003_event_mailbox.sql" with { type: "text" };
+import migration0004 from "./migrations/0004_memory_surface.sql" with { type: "text" };
+import migration0005 from "./migrations/0005_ledger_visibility.sql" with { type: "text" };
 
 export interface MigrationFile {
   readonly index: number;
@@ -9,30 +16,19 @@ export interface MigrationFile {
   readonly sql: string;
 }
 
-const MIGRATIONS_DIR = (() => {
-  const here = dirname(fileURLToPath(import.meta.url));
-  return join(here, "migrations");
-})();
+const MIGRATIONS: readonly MigrationFile[] = [
+  { index: 1, name: "init", sql: migration0001 },
+  { index: 2, name: "task_runs", sql: migration0002 },
+  { index: 3, name: "event_mailbox", sql: migration0003 },
+  { index: 4, name: "memory_surface", sql: migration0004 },
+  { index: 5, name: "ledger_visibility", sql: migration0005 },
+];
 
-// Match `NNNN_name.sql`. Order by the numeric prefix.
-const MIGRATION_PATTERN = /^(\d{4})_([^.]+)\.sql$/;
-
-export function listMigrations(dir: string = MIGRATIONS_DIR): MigrationFile[] {
-  const out: MigrationFile[] = [];
-  for (const entry of readdirSync(dir)) {
-    const m = MIGRATION_PATTERN.exec(entry);
-    if (!m) continue;
-    out.push({
-      index: Number.parseInt(m[1]!, 10),
-      name: m[2]!,
-      sql: readFileSync(join(dir, entry), "utf8"),
-    });
-  }
-  out.sort((a, b) => a.index - b.index);
-  return out;
+export function listMigrations(): readonly MigrationFile[] {
+  return MIGRATIONS;
 }
 
-export function runMigrations(db: Database, dir: string = MIGRATIONS_DIR): number {
+export function runMigrations(db: Database): number {
   db.exec(
     `CREATE TABLE IF NOT EXISTS _migrations (
        idx INTEGER PRIMARY KEY,
@@ -44,7 +40,7 @@ export function runMigrations(db: Database, dir: string = MIGRATIONS_DIR): numbe
     (db.query("SELECT idx FROM _migrations").all() as Array<{ idx: number }>).map((r) => r.idx),
   );
   let count = 0;
-  for (const m of listMigrations(dir)) {
+  for (const m of MIGRATIONS) {
     if (applied.has(m.index)) continue;
     const tx = db.transaction(() => {
       db.exec(m.sql);

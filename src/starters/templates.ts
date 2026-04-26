@@ -567,11 +567,11 @@ export function unload() {
     "smoke.ts":
 `// Smoke: validate DISCORD_TOKEN by calling /users/@me. Doesn't open the
 // gateway (heavier, side-effecting) — just confirms the token is accepted.
-// Prefers the file-backed secret resolved by the daemon, falls back to env
-// for dev runs where the daemon isn't managing secrets.
+// Token comes from the secrets store only; env is reserved for behavior
+// config, never secrets (one source of truth).
 
 export async function smokeTest(_bus, ctx) {
-  const token = ctx?.secrets?.DISCORD_TOKEN ?? process.env.DISCORD_TOKEN;
+  const token = ctx?.secrets?.DISCORD_TOKEN;
   if (!token) {
     throw new Error("discord smoke: DISCORD_TOKEN not set. Ask olle to store it (set_secret tool) or run: printf %s \\"\\$TOKEN\\" | olle secret set DISCORD_TOKEN");
   }
@@ -753,10 +753,11 @@ export function unload() {
 `,
     "smoke.ts":
 `// Smoke: confirm GH_TOKEN is accepted by calling /user. Doesn't mutate
-// anything. Prefers file-backed secret from the daemon; falls back to env.
+// anything. Token comes from the secrets store only; env is reserved for
+// behavior config, never secrets.
 
 export async function smokeTest(_bus, ctx) {
-  const token = ctx?.secrets?.GH_TOKEN ?? process.env.GH_TOKEN;
+  const token = ctx?.secrets?.GH_TOKEN;
   if (!token) {
     throw new Error("github smoke: GH_TOKEN not set. Ask olle to store it (set_secret tool) or run: printf %s \\"\\$TOKEN\\" | olle secret set GH_TOKEN");
   }
