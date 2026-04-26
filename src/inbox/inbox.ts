@@ -14,7 +14,7 @@ import { tables } from "../store/index.ts";
 import type { Decision } from "../store/schema.ts";
 import { ulid } from "../id/index.ts";
 import type { Tier } from "../scheduler/index.ts";
-import { and, eq, inArray, lt } from "drizzle-orm";
+import { and, desc, eq, inArray, like, lt } from "drizzle-orm";
 
 export type DecisionStatus = "open" | "approved" | "denied" | "modified" | "stale";
 export type Vote = "approve" | "deny" | "modify";
@@ -43,7 +43,14 @@ export interface RespondInput {
 export interface Inbox {
   propose(p: Proposal): { id: string; deadlineAt?: number };
   listOpen(principalId: string): Decision[];
+  /** All decisions for a principal, regardless of status, newest first.
+   *  Backs `olle inbox --all` and audit reads. */
+  listAll(principalId: string, limit?: number): Decision[];
   get(id: string): Decision | undefined;
+  /** Resolve a full id or unique prefix to a Decision. Returns undefined
+   *  when nothing matches; throws when the prefix is ambiguous. The CLI
+   *  shows truncated ids, so callers commonly pass a prefix. */
+  resolve(idOrPrefix: string): Decision | undefined;
   respond(input: RespondInput): Decision;
   sweepStale(nowMs?: number): number;
 }
@@ -105,9 +112,39 @@ export function createInbox(opts: InboxOptions): Inbox {
       .all();
   }
 
+  function listAll(principalId: string, limit = 100): Decision[] {
+    return store
+      .select()
+      .from(tables.decisions)
+      .where(eq(tables.decisions.principalId, principalId))
+      .orderBy(desc(tables.decisions.createdAt))
+      .limit(limit)
+      .all();
+  }
+
   function get(id: string): Decision | undefined {
     const rows = store.select().from(tables.decisions).where(eq(tables.decisions.id, id)).all();
     return rows[0];
+  }
+
+  function resolve(idOrPrefix: string): Decision | undefined {
+    // Cheap path: exact match. Avoids a LIKE scan when callers already
+    // hand over the full ULID (agents typically do; CLI users rarely).
+    const exact = get(idOrPrefix);
+    if (exact) return exact;
+    // ULIDs are 26 chars Crockford base32; anything longer can't match.
+    if (idOrPrefix.length === 0 || idOrPrefix.length >= 26) return undefined;
+    const matches = store
+      .select()
+      .from(tables.decisions)
+      .where(like(tables.decisions.id, `${idOrPrefix}%`))
+      .limit(2)
+      .all();
+    if (matches.length === 0) return undefined;
+    if (matches.length > 1) {
+      throw new Error(`inbox: prefix ${idOrPrefix} is ambiguous (matches multiple decisions)`);
+    }
+    return matches[0];
   }
 
   function respond(input: RespondInput): Decision {
@@ -197,5 +234,5 @@ export function createInbox(opts: InboxOptions): Inbox {
     return ids.length;
   }
 
-  return { propose, listOpen, get, respond, sweepStale };
+  return { propose, listOpen, listAll, get, resolve, respond, sweepStale };
 }

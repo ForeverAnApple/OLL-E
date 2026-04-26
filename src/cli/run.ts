@@ -71,6 +71,9 @@ export async function runCli(args: string[]): Promise<void> {
     case "inspect":
       await cmdInspect(rest);
       return;
+    case "inbox":
+      await cmdInbox(rest);
+      return;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
@@ -316,10 +319,17 @@ async function cmdChat(): Promise<void> {
     .call<AgentSelf | null>("observability.self", { agentId: rootAgentId })
     .catch(() => null);
   const agentName = self?.name?.trim() || "agent";
+  // Inbox count is the channel-of-first-contact's nudge: if proposals are
+  // waiting, surface them before the user types anything. Failing this
+  // call shouldn't block chat — older daemons don't expose inbox.count.
+  const inboxOpen = await client
+    .call<{ open: number }>("inbox.count")
+    .then((r) => r.open)
+    .catch(() => 0);
   const threadId = `cli:${Math.random().toString(36).slice(2, 10)}`;
   const sub = client.stream("tail", { type: "*" });
 
-  const ui = createChatUI({ agentId: rootAgentId, agentName, threadId });
+  const ui = createChatUI({ agentId: rootAgentId, agentName, threadId, inboxOpen });
   ui.banner();
 
   let turnBusy = false;
@@ -489,6 +499,10 @@ export interface ChatUIOpts {
   agentId: string;
   agentName: string;
   threadId: string;
+  /** Open decision-inbox count at session start. When > 0 the banner
+   *  prints a one-line nudge so the channel-of-first-contact actually
+   *  surfaces async work waiting on the principal. */
+  inboxOpen?: number;
   /** Test injection point. Defaults to process.stdout. */
   out?: ChatUIOut;
 }
@@ -736,6 +750,15 @@ export function createChatUI(opts: ChatUIOpts) {
       out.write(`${top}\n`);
       out.write(row(title));
       out.write(row(hint));
+      const n = opts.inboxOpen ?? 0;
+      if (n > 0) {
+        const word = n === 1 ? "item" : "items";
+        const inbox = color(
+          ANSI.yellow,
+          `${n} ${word} in your inbox — \`olle inbox\` to review`,
+        );
+        out.write(row(inbox));
+      }
       out.write(`${bot}\n\n`);
     },
 
@@ -1118,6 +1141,113 @@ async function cmdInspect(args: string[]): Promise<void> {
   }
 }
 
+interface InboxRow {
+  id: string;
+  principalId: string;
+  proposingAgentId: string;
+  tier: string;
+  summary: string;
+  payload: Record<string, unknown>;
+  status: string;
+  staleness: number | null;
+  createdAt: number;
+  resolvedAt: number | null;
+}
+
+function fmtAge(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
+}
+
+async function cmdInbox(args: string[]): Promise<void> {
+  const [sub = "list", ...rest] = args;
+  const paths = resolvePaths();
+  const client = await connectIpc(paths.socketFile);
+  try {
+    switch (sub) {
+      case "list": {
+        const all = rest.includes("--all");
+        const rows = await client.call<InboxRow[]>("inbox.list", {
+          status: all ? "all" : undefined,
+        });
+        if (rows.length === 0) {
+          console.log(all ? "(no inbox items)" : "(no open inbox items)");
+          return;
+        }
+        const now = Date.now();
+        for (const r of rows) {
+          const age = fmtAge(now - r.createdAt);
+          const tag = r.status === "open" ? r.tier : `${r.tier}/${r.status}`;
+          console.log(`${r.id.slice(0, 10)}  ${tag.padEnd(20)}  ${age.padStart(4)}  ${r.summary}`);
+        }
+        return;
+      }
+      case "show": {
+        const id = rest[0];
+        if (!id) throw new Error("usage: olle inbox show <id>");
+        const r = await client.call<InboxRow>("inbox.get", { id });
+        const now = Date.now();
+        console.log(`id:        ${r.id}`);
+        console.log(`status:    ${r.status}`);
+        console.log(`tier:      ${r.tier}`);
+        console.log(`from:      ${r.proposingAgentId}`);
+        console.log(`principal: ${r.principalId}`);
+        console.log(`age:       ${fmtAge(now - r.createdAt)}`);
+        if (r.staleness != null) {
+          const remaining = r.staleness - now;
+          const dl = remaining > 0 ? `in ${fmtAge(remaining)}` : `${fmtAge(-remaining)} ago`;
+          console.log(`stale:     ${dl}`);
+        }
+        if (r.resolvedAt != null) {
+          console.log(`resolved:  ${new Date(r.resolvedAt).toISOString()}`);
+        }
+        console.log(`summary:   ${r.summary}`);
+        console.log("payload:");
+        console.log(JSON.stringify(r.payload, null, 2));
+        return;
+      }
+      case "respond": {
+        const [id, vote, ...flags] = rest;
+        if (!id || !vote) {
+          throw new Error(
+            'usage: olle inbox respond <id> approve|deny|modify [--message "..."] [--payload \'{json}\']',
+          );
+        }
+        if (vote !== "approve" && vote !== "deny" && vote !== "modify") {
+          throw new Error("vote must be approve, deny, or modify");
+        }
+        let message: string | undefined;
+        let payloadOverride: Record<string, unknown> | undefined;
+        for (let i = 0; i < flags.length; i++) {
+          const f = flags[i]!;
+          if (f === "--message" && flags[i + 1]) {
+            message = flags[++i];
+          } else if (f === "--payload" && flags[i + 1]) {
+            payloadOverride = JSON.parse(flags[++i]!) as Record<string, unknown>;
+          }
+        }
+        if (vote === "modify" && !payloadOverride) {
+          throw new Error("modify requires --payload '{json}'");
+        }
+        const updated = await client.call<InboxRow>("inbox.respond", {
+          id,
+          vote,
+          message,
+          payloadOverride,
+        });
+        console.log(`${updated.id.slice(0, 10)} ${updated.status}`);
+        return;
+      }
+      default:
+        throw new Error(`unknown inbox subcommand: ${sub}`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 function printHelp(): void {
   console.log(
     [
@@ -1140,6 +1270,11 @@ function printHelp(): void {
       "  secret list                 list secret names (values never shown)",
       "  secret set <NAME> [value]   store a secret (or pipe on stdin)",
       "  secret remove <NAME>        remove a stored secret",
+      "",
+      "  Inbox — async decisions awaiting your response (paired with mail_* tools):",
+      "  inbox [list] [--all]                          list open (or all) decisions",
+      "  inbox show <id>                               full decision payload",
+      "  inbox respond <id> approve|deny|modify [--message ...] [--payload {json}]",
       "",
       "  Observability — same data agents see via their query_my_* tools:",
       "  stats [--agent X] [--thread X] [--since 1h]   token + USD rollup",

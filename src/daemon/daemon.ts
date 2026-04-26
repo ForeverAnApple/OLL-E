@@ -14,6 +14,7 @@ import {
 } from "../agent/index.ts";
 import { buildMetaTools } from "../tools/meta.ts";
 import { buildObservabilityTools } from "../tools/observability.ts";
+import { buildInboxTools } from "../tools/inbox.ts";
 import {
   buildMemoryTools,
   startMemoryProjector,
@@ -103,6 +104,8 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     paths,
     store,
     rootAgentId,
+    rootPrincipalId,
+    inbox,
   });
   await ipc.listen();
 
@@ -161,6 +164,11 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       // budget, and self-state through these. Same query layer the CLI
       // uses (no privileged human read surface).
       ...buildObservabilityTools({ store }),
+      // Decision-inbox surface — same Inbox the askUp chain writes to and
+      // the CLI (`olle inbox`) reads from. mail_list is always-loaded
+      // (orientation tool); mail_respond is deferred (only needed when
+      // voting on a proposal).
+      ...buildInboxTools({ inbox, principalId: rootPrincipalId }),
     ];
     // Children inherit the same tool set so they can themselves spawn,
     // read extension files, etc. Scope still gates what they get to use.

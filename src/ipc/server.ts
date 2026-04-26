@@ -14,6 +14,7 @@ import { history, revertSubtree } from "../extensions/git.ts";
 import { installStarter, listStarters } from "../starters/index.ts";
 import type { OllePaths } from "../paths.ts";
 import type { Store } from "../store/index.ts";
+import type { Inbox, Vote } from "../inbox/index.ts";
 import {
   agentSelf,
   budgetStatus,
@@ -40,6 +41,12 @@ export interface IpcServerOptions {
   /** Root agent id, returned by `status.rootAgent` so clients (CLI chat,
    *  bridges) can address their mailbox publishes. */
   rootAgentId?: string;
+  /** Root principal id — addressee for the human's decision inbox. The
+   *  `inbox.*` methods default to this when no principalId is supplied. */
+  rootPrincipalId?: string;
+  /** Decision-inbox handle. Wired so the CLI surface (`olle inbox`) and the
+   *  agent core tools (mail_list/mail_respond) hit the same query layer. */
+  inbox?: Inbox;
 }
 
 export interface IpcServer {
@@ -454,6 +461,96 @@ async function dispatch(
           id: req.id,
           ok: true,
           value: recentEvents(opts.store, (req.params ?? {}) as Parameters<typeof recentEvents>[1]),
+        });
+        return;
+      }
+      // Decision-inbox surface — same Inbox the askUp chain writes to. CLI
+      // (`olle inbox`) and agent core tools (mail_list/mail_respond) both
+      // dispatch through here so the parallel-tool-surface rule holds.
+      case "inbox.list": {
+        if (!opts.inbox) {
+          send({ id: req.id, ok: false, error: { message: "inbox unavailable" } });
+          return;
+        }
+        const principalId =
+          (req.params?.principalId as string | undefined) ?? opts.rootPrincipalId;
+        if (!principalId) {
+          send({ id: req.id, ok: false, error: { message: "principalId required" } });
+          return;
+        }
+        const status = req.params?.status as string | undefined;
+        const rows =
+          status === "all" ? opts.inbox.listAll(principalId) : opts.inbox.listOpen(principalId);
+        send({ id: req.id, ok: true, value: rows });
+        return;
+      }
+      case "inbox.get": {
+        if (!opts.inbox) {
+          send({ id: req.id, ok: false, error: { message: "inbox unavailable" } });
+          return;
+        }
+        const id = req.params?.id as string | undefined;
+        if (!id) {
+          send({ id: req.id, ok: false, error: { message: "id required" } });
+          return;
+        }
+        const row = opts.inbox.resolve(id);
+        if (!row) {
+          send({ id: req.id, ok: false, error: { message: `decision ${id} not found` } });
+          return;
+        }
+        send({ id: req.id, ok: true, value: row });
+        return;
+      }
+      case "inbox.respond": {
+        if (!opts.inbox) {
+          send({ id: req.id, ok: false, error: { message: "inbox unavailable" } });
+          return;
+        }
+        const id = req.params?.id as string | undefined;
+        const vote = req.params?.vote as Vote | undefined;
+        const actorId =
+          (req.params?.actorId as string | undefined) ?? opts.rootPrincipalId ?? "principal";
+        if (!id || !vote) {
+          send({ id: req.id, ok: false, error: { message: "id and vote required" } });
+          return;
+        }
+        if (vote !== "approve" && vote !== "deny" && vote !== "modify") {
+          send({ id: req.id, ok: false, error: { message: "vote must be approve|deny|modify" } });
+          return;
+        }
+        // Resolve prefix → full id so users can paste what `olle inbox`
+        // displays (10 chars) rather than retyping the whole ULID.
+        const target = opts.inbox.resolve(id);
+        if (!target) {
+          send({ id: req.id, ok: false, error: { message: `decision ${id} not found` } });
+          return;
+        }
+        const updated = opts.inbox.respond({
+          decisionId: target.id,
+          actorId,
+          vote,
+          message: req.params?.message as string | undefined,
+          payloadOverride: req.params?.payloadOverride as Record<string, unknown> | undefined,
+        });
+        send({ id: req.id, ok: true, value: updated });
+        return;
+      }
+      case "inbox.count": {
+        if (!opts.inbox) {
+          send({ id: req.id, ok: true, value: { open: 0 } });
+          return;
+        }
+        const principalId =
+          (req.params?.principalId as string | undefined) ?? opts.rootPrincipalId;
+        if (!principalId) {
+          send({ id: req.id, ok: true, value: { open: 0 } });
+          return;
+        }
+        send({
+          id: req.id,
+          ok: true,
+          value: { open: opts.inbox.listOpen(principalId).length },
         });
         return;
       }

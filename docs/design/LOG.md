@@ -533,6 +533,24 @@ The shape: every tool defaults `alwaysLoaded: false`. Each turn the runtime send
 
 ---
 
+## 2026-04-25 — Decision inbox: human-facing surface + symmetric agent tools
+
+The decision-inbox primitive (`src/inbox/inbox.ts`) had been built and used for ask-up routing, but the human-facing surface was missing: no `olle inbox` CLI subcommand, no `mail_list`/`mail_respond` core tools (both already named in ARCHITECTURE.md, including `mail_list` in the always-loaded core list). A proposal would land in SQLite with no read path. The "humans never block" semantics rests on the inbox being legible to the principal; until this gap closed, the demo's step-4 ("agent proposes via the decision inbox") was a paper claim.
+
+The cut shipped today is the smallest one that makes both surfaces live and symmetric:
+- IPC: `inbox.list`, `inbox.get`, `inbox.respond`, `inbox.count` on the daemon, defaulting `principalId` to the host's root principal when omitted.
+- CLI: `olle inbox` (list open), `olle inbox show <id>`, `olle inbox respond <id> approve|deny|modify [--message] [--payload]`. Help text updated.
+- Core tools: `mail_list` (always-loaded, `category: "mailbox"`) and `mail_respond` (deferred). Both go through the same `Inbox` instance the CLI uses — parallel-tool-surface rule preserved (no privileged human read path).
+- `olle chat` banner now mentions the count of open inbox items so the channel-of-first-contact actually surfaces the queue.
+
+Two design calls embedded:
+1. **Addressee resolution.** Today's schema still has `decisions.principal_id`. "Your inbox" resolves by looking up the caller's agent row → its principalId. In single-principal v0, that resolves to the root principal. When the principals→agents collapse from 2026-04-23 lands, the surface stays identical — the lookup becomes "decisions addressed to me as agent."
+2. **`mail_list` returns decisions, not chat threads.** Chat threads remain on `query_my_threads`. Lumping them under one "mailbox" tool would muddy the semantics; the existing observability tool already covers thread inventory.
+
+Authority on `respond` is still un-checked at the API boundary — anyone with IPC access can resolve any decision. v0 is solo-principal on a localhost socket, so this is consistent with the rest of the surface; multi-principal/team auth is a v1+ seam called out elsewhere.
+
+---
+
 ## 2026-04-25 — Stable host coordinates in prompt; live context as a tool
 
 Agents were guessing extension paths, current directories, and subprocess availability, then receiving opaque tool failures like `ENOENT: no such file or directory, posix_spawn 'claude'`. The fix is a split: stable coordinates (`host_id`, OLL-E home, extensions/config/memory/log paths) are injected into the base prompt for root and default child agents, while dynamic facts (process cwd, PATH, loaded extensions/tools, executable availability) live behind the operational `query_host_context` tool. This follows the world-legibility rule without making the human CLI privileged: agents get the same map and can inspect live state themselves. We deliberately do not put PATH or loaded extension state in the cached prompt because hot-loads, daemon restarts, and shell environments can change them; stale dynamic context is worse than no context.
