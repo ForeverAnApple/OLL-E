@@ -14,7 +14,7 @@ import { history, revertSubtree } from "../extensions/git.ts";
 import { installStarter, listStarters } from "../starters/index.ts";
 import type { OllePaths } from "../paths.ts";
 import type { Store } from "../store/index.ts";
-import { enrichDecision, enrichDecisions, type Inbox, type Vote } from "../inbox/index.ts";
+import { enrichDecision, enrichDecisions, type Inbox, type UserVote } from "../inbox/index.ts";
 import {
   agentSelf,
   budgetStatus,
@@ -259,7 +259,7 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: "extensions unavailable" } });
           return;
         }
-        const name = req.params?.name as string | undefined;
+        const { name } = (req.params ?? {}) as { name?: string };
         if (!name) {
           send({ id: req.id, ok: false, error: { message: "name required" } });
           return;
@@ -273,13 +273,12 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: "extensions unavailable" } });
           return;
         }
-        const name = req.params?.name as string | undefined;
+        const { name, limit } = (req.params ?? {}) as { name?: string; limit?: number };
         if (!name) {
           send({ id: req.id, ok: false, error: { message: "name required" } });
           return;
         }
-        const limit = (req.params?.limit as number | undefined) ?? 20;
-        const hist = history(opts.paths.extensionsDir, name, limit);
+        const hist = history(opts.paths.extensionsDir, name, limit ?? 20);
         send({ id: req.id, ok: true, value: hist });
         return;
       }
@@ -406,57 +405,18 @@ async function dispatch(
       }
       // Observability surface — same query layer the agent-callable
       // tools use. CLI subcommands wrap these (AGENTS.md vision-check).
-      case "observability.usage": {
-        if (!opts.store) {
-          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
-          return;
-        }
-        send({
-          id: req.id,
-          ok: true,
-          value: usageStats(opts.store, (req.params ?? {}) as Parameters<typeof usageStats>[1]),
-        });
+      case "observability.usage":
+        observabilityCall(req, opts, send, (store, params) => usageStats(store, params));
         return;
-      }
-      case "observability.budget": {
-        if (!opts.store) {
-          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
-          return;
-        }
-        send({
-          id: req.id,
-          ok: true,
-          value: budgetStatus(opts.store, (req.params ?? {}) as Parameters<typeof budgetStatus>[1]),
-        });
+      case "observability.budget":
+        observabilityCall(req, opts, send, (store, params) => budgetStatus(store, params));
         return;
-      }
-      case "observability.runs": {
-        if (!opts.store) {
-          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
-          return;
-        }
-        send({
-          id: req.id,
-          ok: true,
-          value: runHistory(opts.store, (req.params ?? {}) as Parameters<typeof runHistory>[1]),
-        });
+      case "observability.runs":
+        observabilityCall(req, opts, send, (store, params) => runHistory(store, params));
         return;
-      }
-      case "observability.threads": {
-        if (!opts.store) {
-          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
-          return;
-        }
-        send({
-          id: req.id,
-          ok: true,
-          value: threadInventory(
-            opts.store,
-            (req.params ?? {}) as Parameters<typeof threadInventory>[1],
-          ),
-        });
+      case "observability.threads":
+        observabilityCall(req, opts, send, (store, params) => threadInventory(store, params));
         return;
-      }
       case "observability.self": {
         if (!opts.store) {
           send({ id: req.id, ok: false, error: { message: "store unavailable" } });
@@ -470,18 +430,9 @@ async function dispatch(
         send({ id: req.id, ok: true, value: agentSelf(opts.store, agentId) });
         return;
       }
-      case "observability.events": {
-        if (!opts.store) {
-          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
-          return;
-        }
-        send({
-          id: req.id,
-          ok: true,
-          value: recentEvents(opts.store, (req.params ?? {}) as Parameters<typeof recentEvents>[1]),
-        });
+      case "observability.events":
+        observabilityCall(req, opts, send, (store, params) => recentEvents(store, params));
         return;
-      }
       // Decision-inbox surface — same Inbox the askUp chain writes to. CLI
       // (`olle inbox`) and agent core tools (mail_list/mail_respond) both
       // dispatch through here so the parallel-tool-surface rule holds.
@@ -530,31 +481,35 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: "inbox unavailable" } });
           return;
         }
-        const id = req.params?.id as string | undefined;
-        const vote = req.params?.vote as Vote | undefined;
-        const actorId =
-          (req.params?.actorId as string | undefined) ?? opts.rootPrincipalId ?? "principal";
-        if (!id || !vote) {
+        const p = (req.params ?? {}) as {
+          id?: string;
+          vote?: UserVote;
+          actorId?: string;
+          message?: string;
+          payloadOverride?: Record<string, unknown>;
+        };
+        const actorId = p.actorId ?? opts.rootPrincipalId ?? "principal";
+        if (!p.id || !p.vote) {
           send({ id: req.id, ok: false, error: { message: "id and vote required" } });
           return;
         }
-        if (vote !== "approve" && vote !== "deny" && vote !== "modify") {
+        if (p.vote !== "approve" && p.vote !== "deny" && p.vote !== "modify") {
           send({ id: req.id, ok: false, error: { message: "vote must be approve|deny|modify" } });
           return;
         }
         // Resolve prefix → full id so users can paste what `olle inbox`
         // displays (10 chars) rather than retyping the whole ULID.
-        const target = opts.inbox.resolve(id);
+        const target = opts.inbox.resolve(p.id);
         if (!target) {
-          send({ id: req.id, ok: false, error: { message: `decision ${id} not found` } });
+          send({ id: req.id, ok: false, error: { message: `decision ${p.id} not found` } });
           return;
         }
         const updated = opts.inbox.respond({
           decisionId: target.id,
           actorId,
-          vote,
-          message: req.params?.message as string | undefined,
-          payloadOverride: req.params?.payloadOverride as Record<string, unknown> | undefined,
+          vote: p.vote,
+          message: p.message,
+          payloadOverride: p.payloadOverride,
         });
         send({ id: req.id, ok: true, value: updated });
         return;
@@ -591,4 +546,21 @@ async function dispatch(
       error: { message: (err as Error).message },
     });
   }
+}
+
+// Shared shape for the observability.* dispatch arms: every one needs the
+// store, every one threads `req.params ?? {}` into a query function whose
+// own type carries the filter shape. The cast here is the same one each
+// call site used inline — kept narrow to this file.
+function observabilityCall<T>(
+  req: Request,
+  opts: IpcServerOptions,
+  send: (r: Response) => void,
+  run: (store: Store, params: never) => T,
+): void {
+  if (!opts.store) {
+    send({ id: req.id, ok: false, error: { message: "store unavailable" } });
+    return;
+  }
+  send({ id: req.id, ok: true, value: run(opts.store, (req.params ?? {}) as never) });
 }
