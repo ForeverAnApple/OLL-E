@@ -89,34 +89,26 @@ function fmtAge(ms: number): string {
   return `${Math.round(ms / 86_400_000)}d`;
 }
 
+const STATUS_GLYPHS: Record<string, string> = {
+  open: `${ANSI.yellow}●${ANSI.reset}`,
+  approved: `${ANSI.green}✓${ANSI.reset}`,
+  denied: `${ANSI.red}✗${ANSI.reset}`,
+  modified: `${ANSI.cyan}±${ANSI.reset}`,
+  stale: `${ANSI.gray}·${ANSI.reset}`,
+};
+
 function statusGlyph(status: string): string {
-  switch (status) {
-    case "open":
-      return `${ANSI.yellow}●${ANSI.reset}`;
-    case "approved":
-      return `${ANSI.green}✓${ANSI.reset}`;
-    case "denied":
-      return `${ANSI.red}✗${ANSI.reset}`;
-    case "modified":
-      return `${ANSI.cyan}±${ANSI.reset}`;
-    case "stale":
-      return `${ANSI.gray}·${ANSI.reset}`;
-    default:
-      return ` `;
-  }
+  return STATUS_GLYPHS[status] ?? " ";
 }
 
+const TIER_COLORS: Record<string, string> = {
+  vision: ANSI.magenta,
+  strategic: ANSI.cyan,
+  operational: ANSI.gray,
+};
+
 function tierColor(tier: string): string {
-  switch (tier) {
-    case "vision":
-      return ANSI.magenta;
-    case "strategic":
-      return ANSI.cyan;
-    case "operational":
-      return ANSI.gray;
-    default:
-      return "";
-  }
+  return TIER_COLORS[tier] ?? "";
 }
 
 /** Visible width, ignoring ANSI sequences. Single-byte assumption is OK

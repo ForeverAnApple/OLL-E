@@ -1,6 +1,7 @@
 import { startDaemon } from "../daemon/daemon.ts";
 import { resolvePaths } from "../paths.ts";
-import { connectIpc } from "../ipc/client.ts";
+import { connectIpc, type IpcClient } from "../ipc/client.ts";
+import { withIpc } from "./ipc-helper.ts";
 import { plainTheme, renderMarkdown } from "./markdown.ts";
 import type {
   AgentSelf,
@@ -350,11 +351,53 @@ async function cmdChat(): Promise<void> {
 
   let turnBusy = false;
   let stopping = false;
-  let prompt = () => undefined as void;
+
+  // Slash command surface. Tiny on purpose; agent-authored extension
+  // commands are not v0 — those would be tools, not chat shortcuts.
+  const slashCommands: Array<{ name: string; description: string }> = [
+    { name: "/help", description: "show available commands" },
+    { name: "/clear", description: "clear scrollback" },
+    { name: "/exit", description: "exit chat" },
+    { name: "/quit", description: "exit chat" },
+  ];
+  const matchSlash = (input: string) => {
+    if (!input.startsWith("/")) return [];
+    // Match against the first whitespace-bounded token only; once the
+    // user has typed `/help arg…` we leave the buffer alone.
+    const head = input.split(/\s/, 1)[0]!.toLowerCase();
+    return slashCommands.filter((c) => c.name.toLowerCase().startsWith(head));
+  };
+  const aboveFor = (text: string): string | null => {
+    if (text.startsWith("/")) return ui.formatSuggestions(matchSlash(text));
+    return ui.formatStatus();
+  };
+
+  const { LineEditor } = await import("./line-editor.ts");
+  const editor = new LineEditor({
+    in: process.stdin,
+    out: process.stdout,
+    prompt: ui.promptString(),
+    promptCont: ui.promptContString(),
+    callbacks: {
+      onSubmit: handleSubmit,
+      onAbort: () => void stop(),
+      onEof: () => void stop(),
+      onTab: (text) => {
+        const matches = matchSlash(text);
+        if (matches.length !== 1) return null;
+        // Replace the leading `/foo` token with the canonical name + space.
+        const rest = text.slice(text.split(/\s/, 1)[0]!.length);
+        return matches[0]!.name + (rest.startsWith(" ") ? rest : ` ${rest.trimStart()}`);
+      },
+      onChange: (text) => editor.setAboveLine(aboveFor(text)),
+    },
+  });
 
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    editor.close();
+    process.stdout.write(color(ANSI.dim, "bye.") + "\n");
     try {
       current.close();
     } catch {
@@ -364,28 +407,30 @@ async function cmdChat(): Promise<void> {
   };
   process.on("SIGINT", stop);
 
-  const rl = (await import("node:readline")).createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  prompt = () => {
-    if (stopping || turnBusy) return;
-    ui.statusLine();
-    rl.setPrompt(ui.promptString());
-    rl.prompt();
-  };
-  rl.on("line", async (line) => {
-    const text = line.trim();
+  async function handleSubmit(raw: string): Promise<void> {
+    const text = raw.replace(/\s+$/, "");
     if (!text) {
-      prompt();
+      editor.refresh();
       return;
     }
-    if (text === "/exit" || text === "/quit") {
-      await stop();
+    const slash = slashCommands.find((c) => c.name === text);
+    if (slash) {
+      ui.commitUserInput(text);
+      if (slash.name === "/exit" || slash.name === "/quit") {
+        await stop();
+        return;
+      }
+      if (slash.name === "/help") ui.printSlashHelp(slashCommands);
+      else if (slash.name === "/clear") ui.clearScrollback();
+      if (!stopping) {
+        editor.setAboveLine(ui.formatStatus());
+        editor.refresh();
+      }
       return;
     }
+    ui.commitUserInput(text);
     turnBusy = true;
-    ui.afterUserInput();
+    editor.suspend();
     try {
       await current.call("publish", {
         type: "chat.input",
@@ -401,9 +446,17 @@ async function cmdChat(): Promise<void> {
       // once we're back on the bus.
       ui.error(`send failed: ${(e as Error).message}`);
       turnBusy = false;
+      reprompt();
     }
-  });
-  rl.on("close", stop);
+  }
+
+  function reprompt(): void {
+    if (stopping || turnBusy) return;
+    editor.setAboveLine(ui.formatStatus());
+    editor.refresh();
+  }
+
+  editor.start();
 
   // Outer reconnect loop. Each iteration subscribes to the tail and
   // drains events until the underlying socket closes, then reconnects
@@ -420,7 +473,7 @@ async function cmdChat(): Promise<void> {
       continue;
     }
     backoff = 250;
-    prompt();
+    reprompt();
 
     try {
       for await (const ev of sub.events) {
@@ -455,11 +508,11 @@ async function cmdChat(): Promise<void> {
             model: typeof p.model === "string" ? p.model : "",
           });
           turnBusy = false;
-          prompt();
+          reprompt();
         } else if (ev.type === "chat.error") {
           ui.error(String(p.error ?? ""));
           turnBusy = false;
-          prompt();
+          reprompt();
         }
       }
     } catch {
@@ -475,6 +528,7 @@ async function cmdChat(): Promise<void> {
   }
 
   async function reconnect(): Promise<void> {
+    editor.suspend();
     process.stdout.write(
       color(ANSI.yellow, "  ⟳ daemon disconnected — reconnecting…") + "\n",
     );
@@ -516,7 +570,10 @@ const ANSI = {
   bold: "\x1b[1m",
   dim: "\x1b[2m",
   red: "\x1b[31m",
+  green: "\x1b[32m",
   yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  magenta: "\x1b[35m",
   cyan: "\x1b[36m",
   gray: "\x1b[90m",
 };
@@ -633,8 +690,8 @@ export function createChatUI(opts: ChatUIOpts) {
   }
 
   function maxPendingRows(): number {
-    // Reserve a few rows for the readline prompt + statusline so an
-    // expanding tail never quite fills the viewport before we cap it.
+    // Reserve a few rows for the prompt + statusline so an expanding
+    // tail never quite fills the viewport before we cap it.
     return Math.max(4, termHeight() - 4);
   }
 
@@ -825,7 +882,7 @@ export function createChatUI(opts: ChatUIOpts) {
       const bot = color(ANSI.cyan, `╰${"─".repeat(inner)}╯`);
       const side = color(ANSI.cyan, "│");
       const title = `${ANSI.bold}${opts.agentName}${ANSI.reset}`;
-      const hint = color(ANSI.dim, "/exit to quit · Ctrl-C to interrupt");
+      const hint = color(ANSI.dim, "/help for commands · Ctrl-C to exit");
       const row = (s: string) => `${side} ${padLine(s, inner - 2)} ${side}\n`;
       out.write(`${top}\n`);
       out.write(row(title));
@@ -845,12 +902,46 @@ export function createChatUI(opts: ChatUIOpts) {
     promptString(): string {
       return color(`${ANSI.bold}${ANSI.cyan}`, "❯ ");
     },
+    promptContString(): string {
+      // Two visible spaces — same width as `❯ `, no glyph. Aligns
+      // continuation-line text with the first line's content column.
+      return "  ";
+    },
 
-    /** Called right after the user submits a line. Readline already
-     *  echoed the input next to the prompt, so we just drop a separator
-     *  before the assistant block lands. */
-    afterUserInput(): void {
+    /** Write the user's submitted message into scrollback as a styled
+     *  gutter block. Multi-line messages get one gutter mark on the
+     *  first line and a blank-prefix indent on continuation lines, so
+     *  the entire message reads as one visually grouped chunk. */
+    commitUserInput(text: string): void {
+      if (!out.isTTY) {
+        out.write(text);
+        out.write("\n");
+        return;
+      }
+      const lines = text.split("\n");
+      const gutter = color(`${ANSI.bold}${ANSI.green}`, "▎");
+      for (let i = 0; i < lines.length; i++) {
+        out.write(i === 0 ? `${gutter} ${lines[i]}\n` : `  ${lines[i]}\n`);
+      }
       out.write("\n");
+    },
+
+    /** Print the slash command list as a small agent-style help block. */
+    printSlashHelp(cmds: Array<{ name: string; description: string }>): void {
+      out.write(color(`${ANSI.bold}${ANSI.cyan}`, "◆ commands") + "\n");
+      const w = Math.max(...cmds.map((c) => c.name.length));
+      for (const c of cmds) {
+        out.write(
+          `  ${color(ANSI.cyan, c.name.padEnd(w))}  ${color(ANSI.dim, c.description)}\n`,
+        );
+      }
+      out.write("\n");
+    },
+
+    /** Wipe screen + scrollback. */
+    clearScrollback(): void {
+      if (!out.isTTY) return;
+      out.write("\x1b[H\x1b[2J\x1b[3J");
     },
 
     /** Stream a chunk of assistant text. Each delta extends the pending
@@ -919,10 +1010,10 @@ export function createChatUI(opts: ChatUIOpts) {
     },
 
     /** Accumulate per-turn usage into running session totals. The
-     *  rendered output is deferred to statusLine(), which the prompt
-     *  loop calls right before each readline prompt — so the user
-     *  sees one quiet line rather than a noisy border after every
-     *  reply. */
+     *  rendered output is deferred to formatStatus(), which the editor
+     *  paints into its above-prompt slot between turns — so the user
+     *  sees one quiet line above the prompt rather than a noisy border
+     *  after every reply. */
     turnEnd(stats: {
       inputTokens: number;
       outputTokens: number;
@@ -946,11 +1037,11 @@ export function createChatUI(opts: ChatUIOpts) {
       }
     },
 
-    /** Single-line dim status, rendered just above the next prompt.
-     *  Left side: cumulative tokens + cost. Right side: model name.
-     *  Suppressed entirely when there's nothing meaningful to show
-     *  (first prompt, before any turn has completed). */
-    statusLine(): void {
+    /** Format the dim cumulative status line. Returns null when there's
+     *  nothing meaningful to show (first prompt, before any turn
+     *  completed). The caller passes the result to the editor's
+     *  setAboveLine() — rendering is the editor's responsibility. */
+    formatStatus(): string | null {
       const parts: string[] = [];
       if (sessionStats.inputTokens) parts.push(`↑${formatTokens(sessionStats.inputTokens)}`);
       if (sessionStats.outputTokens) parts.push(`↓${formatTokens(sessionStats.outputTokens)}`);
@@ -959,11 +1050,29 @@ export function createChatUI(opts: ChatUIOpts) {
       if (sessionStats.usdMicros) parts.push(formatUsd(sessionStats.usdMicros));
       const left = parts.join(" ");
       const right = sessionStats.model;
-      if (!left && !right) return;
+      if (!left && !right) return null;
       const w = termWidth();
       const padNeeded = Math.max(1, w - visibleLen(left) - visibleLen(right));
       const line = `${left}${" ".repeat(padNeeded)}${right}`;
-      out.write(color(ANSI.dim, line) + "\n");
+      return color(ANSI.dim, line);
+    },
+
+    /** Format matching slash-command suggestions for the above-prompt
+     *  slot. Returns a single-line styled string. */
+    formatSuggestions(matches: Array<{ name: string; description: string }>): string {
+      if (matches.length === 0) return color(ANSI.dim, "no matches");
+      const w = Math.max(20, termWidth());
+      const items = matches
+        .slice(0, 5)
+        .map((c) => `${color(ANSI.cyan, c.name)}${color(ANSI.dim, ` ${c.description}`)}`);
+      const sep = color(ANSI.dim, "  ·  ");
+      let acc = "";
+      for (const it of items) {
+        const next = acc ? acc + sep + it : it;
+        if (visibleLen(next) > w - 2) break;
+        acc = next;
+      }
+      return acc || items[0]!;
     },
   };
 }
@@ -1017,166 +1126,160 @@ function fmtPct(p: number): string {
   return `${(p * 100).toFixed(1)}%`;
 }
 
-async function cmdStats(args: string[]): Promise<void> {
+// Shared shape for the simple observability commands: parse obs flags +
+// any extras, run one IPC call, hand the result to a formatter. Commands
+// that need a second call (cmdStats' optional budget pull) take an
+// `extra` hook with the live client. Everyone goes through withIpc.
+async function runObsCmd<T>(
+  args: string[],
+  spec: {
+    method: string;
+    buildParams: (flags: ObsFlags, args: string[]) => Record<string, unknown>;
+    format: (value: T) => void;
+    extra?: (client: IpcClient, flags: ObsFlags) => Promise<void>;
+  },
+): Promise<void> {
   const flags = parseObsFlags(args);
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
-    const stats = await client.call<UsageStats>("observability.usage", {
-      actorId: flags.agent,
-      threadId: flags.thread,
-      since: flags.since,
-    });
-    const t = stats.totals;
-    console.log(
-      `tokens: in=${t.inputTokens} out=${t.outputTokens} cache_read=${t.cacheReadTokens} cache_create=${t.cacheCreationTokens}`,
-    );
-    console.log(`hit_ratio: ${fmtPct(t.cacheHitRatio)}`);
-    console.log(`usd: ${fmtUsd(t.usdMicros)} (${stats.rows} ledger rows scanned)`);
-    if (stats.byModel.length > 0) {
-      console.log("by model:");
-      for (const m of stats.byModel) {
-        const tag = m.pricePosted ? "" : " (fallback price)";
-        console.log(
-          `  ${m.provider}/${m.model}: ${m.calls} calls, in=${m.inputTokens} out=${m.outputTokens} cache_r=${m.cacheReadTokens} hit=${fmtPct(m.cacheHitRatio)} ${fmtUsd(m.usdMicros)}${tag}`,
-        );
-      }
-    }
-    // Budget side, same call shape if --agent given.
-    if (flags.agent) {
-      const b = await client.call<BudgetStatus>("observability.budget", {
-        actorId: flags.agent,
-      });
-      if (b.rows.length > 0) {
-        console.log("budget:");
-        for (const r of b.rows) {
-          const cap = r.capUsd != null ? fmtUsd(r.capUsd) : "-";
-          const pct = r.percentUsd != null ? fmtPct(r.percentUsd) : "-";
-          console.log(`  ${r.period}: ${fmtUsd(r.spentUsd)} / ${cap}  (${pct})`);
+  await withIpc(paths.socketFile, async (client) => {
+    const value = await client.call<T>(spec.method, spec.buildParams(flags, args));
+    spec.format(value);
+    if (spec.extra) await spec.extra(client, flags);
+  });
+}
+
+function parseFlagValue(args: string[], name: string): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === name && args[i + 1]) return args[i + 1];
+  }
+  return undefined;
+}
+
+async function cmdStats(args: string[]): Promise<void> {
+  await runObsCmd<UsageStats>(args, {
+    method: "observability.usage",
+    buildParams: (f) => ({ actorId: f.agent, threadId: f.thread, since: f.since }),
+    format: (stats) => {
+      const t = stats.totals;
+      console.log(
+        `tokens: in=${t.inputTokens} out=${t.outputTokens} cache_read=${t.cacheReadTokens} cache_create=${t.cacheCreationTokens}`,
+      );
+      console.log(`hit_ratio: ${fmtPct(t.cacheHitRatio)}`);
+      console.log(`usd: ${fmtUsd(t.usdMicros)} (${stats.rows} ledger rows scanned)`);
+      if (stats.byModel.length > 0) {
+        console.log("by model:");
+        for (const m of stats.byModel) {
+          const tag = m.pricePosted ? "" : " (fallback price)";
+          console.log(
+            `  ${m.provider}/${m.model}: ${m.calls} calls, in=${m.inputTokens} out=${m.outputTokens} cache_r=${m.cacheReadTokens} hit=${fmtPct(m.cacheHitRatio)} ${fmtUsd(m.usdMicros)}${tag}`,
+          );
         }
       }
-    }
-  } finally {
-    client.close();
-  }
+    },
+    // Budget side, same call shape if --agent given.
+    extra: async (client, f) => {
+      if (!f.agent) return;
+      const b = await client.call<BudgetStatus>("observability.budget", { actorId: f.agent });
+      if (b.rows.length === 0) return;
+      console.log("budget:");
+      for (const r of b.rows) {
+        const cap = r.capUsd != null ? fmtUsd(r.capUsd) : "-";
+        const pct = r.percentUsd != null ? fmtPct(r.percentUsd) : "-";
+        console.log(`  ${r.period}: ${fmtUsd(r.spentUsd)} / ${cap}  (${pct})`);
+      }
+    },
+  });
 }
 
 async function cmdCache(args: string[]): Promise<void> {
   // Cache-focused rollup — just the cache columns + hit ratio.
-  const flags = parseObsFlags(args);
-  const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
-    const stats = await client.call<UsageStats>("observability.usage", {
-      actorId: flags.agent,
-      threadId: flags.thread,
-      since: flags.since,
-    });
-    const t = stats.totals;
-    console.log(`hit_ratio: ${fmtPct(t.cacheHitRatio)}`);
-    console.log(
-      `cache_read=${t.cacheReadTokens} cache_create=${t.cacheCreationTokens} input=${t.inputTokens}`,
-    );
-    if (stats.byModel.length === 0) {
-      console.log("(no ledger rows)");
-      return;
-    }
-    console.log("by model:");
-    for (const m of stats.byModel) {
+  await runObsCmd<UsageStats>(args, {
+    method: "observability.usage",
+    buildParams: (f) => ({ actorId: f.agent, threadId: f.thread, since: f.since }),
+    format: (stats) => {
+      const t = stats.totals;
+      console.log(`hit_ratio: ${fmtPct(t.cacheHitRatio)}`);
       console.log(
-        `  ${m.provider}/${m.model}: hit=${fmtPct(m.cacheHitRatio)} read=${m.cacheReadTokens} create=${m.cacheCreationTokens} (${m.calls} calls)`,
+        `cache_read=${t.cacheReadTokens} cache_create=${t.cacheCreationTokens} input=${t.inputTokens}`,
       );
-    }
-  } finally {
-    client.close();
-  }
+      if (stats.byModel.length === 0) {
+        console.log("(no ledger rows)");
+        return;
+      }
+      console.log("by model:");
+      for (const m of stats.byModel) {
+        console.log(
+          `  ${m.provider}/${m.model}: hit=${fmtPct(m.cacheHitRatio)} read=${m.cacheReadTokens} create=${m.cacheCreationTokens} (${m.calls} calls)`,
+        );
+      }
+    },
+  });
 }
 
 async function cmdRuns(args: string[]): Promise<void> {
-  const flags = parseObsFlags(args);
-  let status: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--status" && args[i + 1]) {
-      status = args[++i];
-    }
-  }
-  const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
-    const runs = await client.call<RunHistoryRow[]>("observability.runs", {
-      actorId: flags.agent,
-      status,
-      since: flags.since,
-      limit: flags.limit,
-    });
-    if (runs.length === 0) {
-      console.log("(no runs)");
-      return;
-    }
-    for (const r of runs) {
-      const dur = r.durationMs != null ? `${r.durationMs}ms` : "running";
-      const err = r.error ? `  err=${r.error}` : "";
-      const when = new Date(r.startedAt).toISOString();
-      console.log(`${when}  ${r.status.padEnd(9)}  ${r.taskId}  ${dur}${err}`);
-    }
-  } finally {
-    client.close();
-  }
+  await runObsCmd<RunHistoryRow[]>(args, {
+    method: "observability.runs",
+    buildParams: (f, raw) => ({
+      actorId: f.agent,
+      status: parseFlagValue(raw, "--status"),
+      since: f.since,
+      limit: f.limit,
+    }),
+    format: (runs) => {
+      if (runs.length === 0) {
+        console.log("(no runs)");
+        return;
+      }
+      for (const r of runs) {
+        const dur = r.durationMs != null ? `${r.durationMs}ms` : "running";
+        const err = r.error ? `  err=${r.error}` : "";
+        const when = new Date(r.startedAt).toISOString();
+        console.log(`${when}  ${r.status.padEnd(9)}  ${r.taskId}  ${dur}${err}`);
+      }
+    },
+  });
 }
 
 async function cmdThreads(args: string[]): Promise<void> {
-  const flags = parseObsFlags(args);
-  const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
-    const threads = await client.call<ThreadInventoryRow[]>("observability.threads", {
-      toAgentId: flags.agent,
-      limit: flags.limit,
-    });
-    if (threads.length === 0) {
-      console.log("(no threads)");
-      return;
-    }
-    for (const t of threads) {
-      const when = new Date(t.lastEventAt).toISOString();
-      console.log(
-        `${when}  ${t.threadId}  events=${t.events}  hit=${fmtPct(t.cacheHitRatio)}  last=${t.lastType}`,
-      );
-    }
-  } finally {
-    client.close();
-  }
+  await runObsCmd<ThreadInventoryRow[]>(args, {
+    method: "observability.threads",
+    buildParams: (f) => ({ toAgentId: f.agent, limit: f.limit }),
+    format: (threads) => {
+      if (threads.length === 0) {
+        console.log("(no threads)");
+        return;
+      }
+      for (const t of threads) {
+        const when = new Date(t.lastEventAt).toISOString();
+        console.log(
+          `${when}  ${t.threadId}  events=${t.events}  hit=${fmtPct(t.cacheHitRatio)}  last=${t.lastType}`,
+        );
+      }
+    },
+  });
 }
 
 async function cmdEvents(args: string[]): Promise<void> {
   // Single-shot event-log query (the streaming variant is `olle tail`).
-  const flags = parseObsFlags(args);
-  let type: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--type" && args[i + 1]) {
-      type = args[++i];
-    }
-  }
-  const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
-    const events = await client.call<RecentEventRow[]>("observability.events", {
-      actorId: flags.agent,
-      type,
-      threadId: flags.thread,
-      since: flags.since,
-      limit: flags.limit,
-    });
-    if (events.length === 0) {
-      console.log("(no events)");
-      return;
-    }
-    for (const e of events) {
-      console.log(`${e.hlc} ${e.type} actor=${e.actorId} payload=${JSON.stringify(e.payload)}`);
-    }
-  } finally {
-    client.close();
-  }
+  await runObsCmd<RecentEventRow[]>(args, {
+    method: "observability.events",
+    buildParams: (f, raw) => ({
+      actorId: f.agent,
+      type: parseFlagValue(raw, "--type"),
+      threadId: f.thread,
+      since: f.since,
+      limit: f.limit,
+    }),
+    format: (events) => {
+      if (events.length === 0) {
+        console.log("(no events)");
+        return;
+      }
+      for (const e of events) {
+        console.log(`${e.hlc} ${e.type} actor=${e.actorId} payload=${JSON.stringify(e.payload)}`);
+      }
+    },
+  });
 }
 
 async function cmdInspect(args: string[]): Promise<void> {
@@ -1185,8 +1288,7 @@ async function cmdInspect(args: string[]): Promise<void> {
     throw new Error("usage: olle inspect agent <agent-id>");
   }
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
+  await withIpc(paths.socketFile, async (client) => {
     const self = await client.call<AgentSelf | null>("observability.self", {
       agentId: target,
     });
@@ -1216,9 +1318,7 @@ async function cmdInspect(args: string[]): Promise<void> {
       console.log("---");
       console.log(self.systemPrompt);
     }
-  } finally {
-    client.close();
-  }
+  });
 }
 
 interface InboxRow {
@@ -1241,6 +1341,46 @@ function fmtAge(ms: number): string {
   return `${Math.round(ms / 86_400_000)}d`;
 }
 
+type InboxVote = "approve" | "deny" | "modify";
+
+interface RespondArgs {
+  id: string;
+  vote: InboxVote;
+  message?: string;
+  payloadOverride?: Record<string, unknown>;
+}
+
+function validateVote(v: string): InboxVote {
+  if (v !== "approve" && v !== "deny" && v !== "modify") {
+    throw new Error("vote must be approve, deny, or modify");
+  }
+  return v;
+}
+
+function parseRespondArgs(rest: string[]): RespondArgs {
+  const [id, vote, ...flags] = rest;
+  if (!id || !vote) {
+    throw new Error(
+      'usage: olle inbox respond <id> approve|deny|modify [--message "..."] [--payload \'{json}\']',
+    );
+  }
+  const v = validateVote(vote);
+  let message: string | undefined;
+  let payloadOverride: Record<string, unknown> | undefined;
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === "--message" && flags[i + 1]) {
+      message = flags[++i];
+    } else if (f === "--payload" && flags[i + 1]) {
+      payloadOverride = JSON.parse(flags[++i]!) as Record<string, unknown>;
+    }
+  }
+  if (v === "modify" && !payloadOverride) {
+    throw new Error("modify requires --payload '{json}'");
+  }
+  return { id, vote: v, message, payloadOverride };
+}
+
 async function cmdInbox(args: string[]): Promise<void> {
   // Default form (`olle inbox` with no subcommand) drops into the
   // mutt-style TUI on a TTY. Pipes / scripts fall through to `list`
@@ -1248,8 +1388,7 @@ async function cmdInbox(args: string[]): Promise<void> {
   const ttyDefault = process.stdout.isTTY && process.stdin.isTTY;
   const [sub = ttyDefault ? "tui" : "list", ...rest] = args;
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
+  await withIpc(paths.socketFile, async (client) => {
     switch (sub) {
       case "tui": {
         if (!process.stdout.isTTY || !process.stdin.isTTY) {
@@ -1301,43 +1440,15 @@ async function cmdInbox(args: string[]): Promise<void> {
         return;
       }
       case "respond": {
-        const [id, vote, ...flags] = rest;
-        if (!id || !vote) {
-          throw new Error(
-            'usage: olle inbox respond <id> approve|deny|modify [--message "..."] [--payload \'{json}\']',
-          );
-        }
-        if (vote !== "approve" && vote !== "deny" && vote !== "modify") {
-          throw new Error("vote must be approve, deny, or modify");
-        }
-        let message: string | undefined;
-        let payloadOverride: Record<string, unknown> | undefined;
-        for (let i = 0; i < flags.length; i++) {
-          const f = flags[i]!;
-          if (f === "--message" && flags[i + 1]) {
-            message = flags[++i];
-          } else if (f === "--payload" && flags[i + 1]) {
-            payloadOverride = JSON.parse(flags[++i]!) as Record<string, unknown>;
-          }
-        }
-        if (vote === "modify" && !payloadOverride) {
-          throw new Error("modify requires --payload '{json}'");
-        }
-        const updated = await client.call<InboxRow>("inbox.respond", {
-          id,
-          vote,
-          message,
-          payloadOverride,
-        });
+        const parsed = parseRespondArgs(rest);
+        const updated = await client.call<InboxRow>("inbox.respond", { ...parsed });
         console.log(`${updated.id.slice(0, 10)} ${updated.status}`);
         return;
       }
       default:
         throw new Error(`unknown inbox subcommand: ${sub}`);
     }
-  } finally {
-    client.close();
-  }
+  });
 }
 
 function printHelp(): void {
