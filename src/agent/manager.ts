@@ -42,6 +42,8 @@ export interface AgentManagerDeps {
   /** Default model the manager starts children with. Omit to use the
    *  llm adapter's defaultModel. */
   model?: string;
+  /** Stable host coordinates injected into default child prompts. */
+  hostContext?: string;
 }
 
 export interface SpawnOptions {
@@ -215,8 +217,9 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
         [
           `You are ${opts.name}, a child agent spawned to complete a specific mission.`,
           `Your parent is agent ${opts.parentAgentId}.`,
+          deps.hostContext,
           `Your replies flow back in thread ${threadId}; keep them focused and terminate when the mission is complete.`,
-        ].join(" "),
+        ].filter(Boolean).join(" "),
     });
     loops.set(childId, loop);
 

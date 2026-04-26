@@ -13,15 +13,18 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import type { ExtensionHost, ToolDef } from "../extensions/index.ts";
 import type { AgentManager } from "../agent/index.ts";
 import type { AgentScope } from "../store/schema.ts";
+import type { OllePaths } from "../paths.ts";
 import {
   commitSubtree,
   ensureRepo,
@@ -45,9 +48,51 @@ export interface MetaToolsOptions {
    *  spawning agent id is taken from `authorName` — the chat loop
    *  already sets this to the acting agent. */
   agentManager?: AgentManager;
+  /** Host paths surfaced through query_host_context so agents do not
+   *  have to guess where their habitat lives. */
+  paths?: OllePaths;
 }
 
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+function describePath(path: string): {
+  path: string;
+  exists: boolean;
+  kind: "file" | "dir" | "missing" | "other";
+  realpath?: string;
+} {
+  if (!existsSync(path)) return { path, exists: false, kind: "missing" };
+  const st = statSync(path);
+  const kind = st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
+  let realpath: string | undefined;
+  try {
+    realpath = realpathSync(path);
+  } catch {
+    /* best-effort */
+  }
+  return { path, exists: true, kind, realpath };
+}
+
+function resolveCommand(command: string): {
+  command: string;
+  path: string | null;
+  ok: boolean;
+  error?: string;
+} {
+  if (!/^[A-Za-z0-9._+-]+$/.test(command)) {
+    return { command, path: null, ok: false, error: "invalid executable name" };
+  }
+  const r = spawnSync("which", [command], { encoding: "utf8" });
+  if (r.status === 0 && r.stdout.trim()) {
+    return { command, path: r.stdout.trim().split(/\r?\n/)[0]!, ok: true };
+  }
+  return {
+    command,
+    path: null,
+    ok: false,
+    error: r.stderr.trim() || `${command} not found on PATH`,
+  };
+}
 
 export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   const { extensions, extensionsDir, authorName } = opts;
@@ -275,6 +320,65 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     execute: async () => listStarters().map(({ name, description }) => ({ name, description })),
   };
 
+  const queryHostContext: ToolDef<
+    { commands?: string[] },
+    {
+      process: { cwd: string; platform: string; path: string | null };
+      olle: Partial<OllePaths>;
+      extensions: Array<{ name: string; status: string; path: string; tools: string[] }>;
+      files: Array<{ path: string; exists: boolean; kind: "file" | "dir" | "missing" | "other"; realpath?: string }>;
+      commands: Array<{ command: string; path: string | null; ok: boolean; error?: string }>;
+    }
+  > = {
+    name: "query_host_context",
+    tier: "operational",
+    description:
+      "Inspect the local host context before making filesystem or subprocess tool calls. Returns OLL-E data paths, process cwd/PATH, loaded extensions/tools, and whether requested commands are available on PATH. Use this instead of guessing extension/config paths or why a subprocess failed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        commands: {
+          type: "array",
+          items: { type: "string" },
+          description: "Executable names to resolve on PATH. Defaults to claude, git, bun.",
+        },
+      },
+      additionalProperties: false,
+    },
+    execute: async ({ commands }) => {
+      const requested = [...new Set((commands?.length ? commands : ["claude", "git", "bun"]).slice(0, 20))];
+      const pathsToCheck = [
+        opts.paths?.root,
+        opts.paths?.configFile,
+        opts.paths?.extensionsDir ?? extensionsDir,
+        opts.paths?.memoryDir,
+        opts.paths?.logsDir,
+        opts.paths?.secretsDir ?? opts.secretsDir,
+        opts.paths?.threadsDir,
+      ].filter((p): p is string => Boolean(p));
+      return {
+        process: {
+          cwd: process.cwd(),
+          platform: process.platform,
+          path: process.env.PATH ?? null,
+        },
+        olle: opts.paths ?? { extensionsDir, secretsDir: opts.secretsDir },
+        extensions: extensions.list().map((ext) => ({
+          name: ext.manifest.name,
+          status: ext.status,
+          path: ext.path,
+          tools: extensions
+            .tools()
+            .filter((entry) => entry.extensionId === ext.id)
+            .map((entry) => entry.tool.name)
+            .sort(),
+        })),
+        files: pathsToCheck.map(describePath),
+        commands: requested.map(resolveCommand),
+      };
+    },
+  };
+
   const installStarterT: ToolDef<
     { name: string; overwrite?: boolean },
     { name: string; filesWritten: number; alreadyExisted: boolean; commit: string | null }
@@ -312,6 +416,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     writeExt,
     runSmoke,
     readExtFile,
+    queryHostContext,
     register,
     revert,
     history,

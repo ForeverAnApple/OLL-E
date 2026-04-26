@@ -145,6 +145,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       inbox,
       principalId: rootPrincipalId,
       threadsDir: paths.threadsDir,
+      hostContext: buildHostContextPrompt(paths, hostId),
     });
     const coreTools = [
       ...buildMetaTools({
@@ -153,6 +154,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         authorName: chatAgentId,
         secretsDir: paths.secretsDir,
         agentManager,
+        paths,
       }),
       ...buildMemoryTools({ bus, store, hostId }),
       // World legibility — agents read their own ledger, runs, threads,
@@ -175,26 +177,16 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       inbox,
       principalId: rootPrincipalId,
       threadsDir: paths.threadsDir,
-      system:
-        "You are olle, a helpful assistant living inside OLL-E — a habitat " +
-        "built for agents like you. Your job is to accomplish what the human " +
-        "asks. OLL-E is yours to reshape: when the world is missing something " +
-        "you need, extend it. Tools for modifying your habitat: write_extension, " +
-        "run_smoke_test, register_extension, revert_extension, extension_history, " +
-        "read_extension_file (inspect manifest / index.ts / smoke.ts before guessing " +
-        "at error strings), set_secret / list_secrets / remove_secret for credentials " +
-        "(call set_secret yourself when the human gives you a token — don't shell out " +
-        "to external CLIs). Delegation: spawn_agent / kill_agent / list_agents / " +
-        "retarget_thread — hire children for work that shouldn't block the " +
-        "conversation; never block a human waiting for a slow task, delegate. " +
-        "Mailbox awareness: the sidebar each turn shows your active threads; " +
-        "call mail_list for a durable view (e.g. to check on children's progress). " +
-        "Self-audit: query_my_usage / query_my_budget / query_my_runs / " +
-        "query_my_threads / query_self / query_events let you read your own " +
-        "world — token cost, cache hit rate, recent failures, your own scope " +
-        "and tools. When something feels off, look first; when caching seems " +
-        "wasteful, propose a strategy revision through the inbox. " +
-        "Be concise.",
+      system: [
+        "You are olle, a helpful assistant living inside OLL-E — a habitat built for agents like you.",
+        "Your job is to accomplish what the human asks. OLL-E is yours to reshape: when the world is missing something you need, extend it.",
+        buildHostContextPrompt(paths, hostId),
+        "Tools for modifying your habitat: write_extension, run_smoke_test, register_extension, revert_extension, extension_history, read_extension_file (inspect manifest / index.ts / smoke.ts before guessing at error strings), query_host_context (live cwd/PATH, loaded extensions, and executable availability), set_secret / list_secrets / remove_secret for credentials (call set_secret yourself when the human gives you a token — don't shell out to external CLIs).",
+        "Delegation: spawn_agent / kill_agent / list_agents / retarget_thread — hire children for work that shouldn't block the conversation; never block a human waiting for a slow task, delegate.",
+        "Mailbox awareness: the sidebar each turn shows your active threads; call mail_list for a durable view (e.g. to check on children's progress).",
+        "Self-audit: query_my_usage / query_my_budget / query_my_runs / query_my_threads / query_self / query_events let you read your own world — token cost, cache hit rate, recent failures, your own scope and tools.",
+        "When something feels off, look first; when caching seems wasteful, propose a strategy revision through the inbox. Be concise.",
+      ].join("\n\n"),
     });
     agentManager.register(chatAgentId, chat);
   } else if (!opts.quiet) {
@@ -270,6 +262,18 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     agentManager,
     shutdown,
   };
+}
+
+function buildHostContextPrompt(paths: OllePaths, hostId: string): string {
+  return [
+    `Stable host context: host_id=${hostId}.`,
+    `OLL-E home: ${paths.root}.`,
+    `Extensions directory: ${paths.extensionsDir}.`,
+    `Config file: ${paths.configFile}.`,
+    `Memory directory: ${paths.memoryDir}.`,
+    `Logs directory: ${paths.logsDir}.`,
+    "These are stable coordinates, not proof that a specific file, extension, cwd, or executable exists right now. Before filesystem/subprocess work, call query_host_context or the relevant read/list tool to verify live state.",
+  ].join(" ");
 }
 
 function checkNotRunning(paths: OllePaths): void {
