@@ -79,6 +79,19 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
       console.error(`[scheduler] ${t.id} on ${ev.type} threw:`, e);
     });
 
+  // Bun sqlite tags FK violations with this code. Real schema bugs surface
+  // any other error code/shape and must rethrow so they don't get buried.
+  function isFkMiss(err: unknown): boolean {
+    return (err as { code?: string } | null)?.code === "SQLITE_CONSTRAINT_FOREIGNKEY";
+  }
+  function logFkMiss(where: string, task: TaskDef, err: unknown, event?: Event): void {
+    const evPart = event ? ` event=${event.id} type=${event.type}` : "";
+    // eslint-disable-next-line no-console -- scheduler is infra
+    console.warn(
+      `[scheduler] ${where} skipped FK miss for task=${task.id}${evPart}: ${(err as Error).message}`,
+    );
+  }
+
   function persistTask(task: TaskDef): void {
     // Idempotent: onConflictDoNothing handles both re-registrations and
     // shared task ids across test rigs. Outer try swallows FK misses in
@@ -98,8 +111,9 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
         })
         .onConflictDoNothing()
         .run();
-    } catch {
-      /* FK miss in test scaffolding — ignore */
+    } catch (err) {
+      if (!isFkMiss(err)) throw err;
+      logFkMiss("persistTask", task, err);
     }
   }
 
@@ -117,8 +131,9 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
           status,
         })
         .run();
-    } catch {
-      /* FK miss in test scaffolding — ignore */
+    } catch (err) {
+      if (!isFkMiss(err)) throw err;
+      logFkMiss("recordClaim", task, err, event);
     }
   }
 
@@ -138,13 +153,20 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
         })
         .run();
       return id;
-    } catch {
-      // FK miss in tests where agent/task/event rows aren't seeded.
+    } catch (err) {
+      if (!isFkMiss(err)) throw err;
+      logFkMiss("startRun", task, err, event);
       return null;
     }
   }
 
-  function endRun(runId: string | null, status: "succeeded" | "failed", error?: string): void {
+  function endRun(
+    runId: string | null,
+    task: TaskDef,
+    event: Event,
+    status: "succeeded" | "failed",
+    error?: string,
+  ): void {
     if (!runId) return;
     try {
       opts.store
@@ -152,8 +174,9 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
         .set({ status, endedAt: Date.now(), error: error ?? null })
         .where(eq(tables.taskRuns.id, runId))
         .run();
-    } catch {
-      /* row vanished — ignore */
+    } catch (err) {
+      if (!isFkMiss(err)) throw err;
+      logFkMiss("endRun", task, err, event);
     }
   }
 
@@ -189,7 +212,7 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
       onErr(err, task, event);
     } finally {
       const errMsg = err instanceof Error ? err.message : err != null ? String(err) : undefined;
-      endRun(runId, err ? "failed" : "succeeded", errMsg);
+      endRun(runId, task, event, err ? "failed" : "succeeded", errMsg);
       // Done-event convention: subscribers can wait on these without
       // coupling to scheduler internals or the runs table.
       opts.bus.publish({
