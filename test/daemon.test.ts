@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,13 +9,16 @@ let daemon: Daemon;
 let client: IpcClient;
 let tmp: string;
 
-beforeEach(async () => {
+// Daemon shared across the file. Tests 1-8 are pure reads or write isolated
+// event types; the boot-bridge regression test reassigns daemon/client/tmp
+// after tearing the shared instance down, and afterAll cleans whatever's left.
+beforeAll(async () => {
   tmp = mkdtempSync(join(tmpdir(), "olle-test-"));
   daemon = await startDaemon({ root: tmp, version: "test", quiet: true });
   client = await connectIpc(daemon.paths.socketFile);
 });
 
-afterEach(async () => {
+afterAll(async () => {
   client.close();
   await daemon.shutdown();
   rmSync(tmp, { recursive: true, force: true });
