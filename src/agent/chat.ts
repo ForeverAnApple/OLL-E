@@ -171,11 +171,12 @@ async function runTurn(
     // Loadout meta-tools capture this thread's loadedTools set in closure
     // so load_tools / unload_tools mutate the right thread. Built per-turn
     // because the closure is per-thread; the cost is two object literals.
+    const coreTools = collectTools(opts);
     const loadoutTools = buildLoadoutTools({
       loadedTools: thread.loadedTools,
-      allTools: () => [...collectTools(opts), ...loadoutTools],
+      allTools: () => tools,
     });
-    const tools = [...collectTools(opts), ...loadoutTools];
+    const tools = [...coreTools, ...loadoutTools];
     // Hot-reload pruning: if an extension was unloaded since last turn and
     // its tool was in this thread's loaded set, drop the entry silently
     // and emit a warning event. Otherwise the agent's loaded list lies.

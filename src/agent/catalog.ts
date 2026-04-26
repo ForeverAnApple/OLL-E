@@ -137,7 +137,7 @@ function groupByCategory(tools: ToolDef[]): Map<string, ToolDef[]> {
   // Stable name-sort within each category for deterministic output.
   const sorted = [...tools].sort((a, b) => a.name.localeCompare(b.name));
   for (const t of sorted) {
-    const cat = t.category && t.category.length > 0 ? t.category : MISC;
+    const cat = t.category || MISC;
     let list = out.get(cat);
     if (!list) {
       list = [];
@@ -168,7 +168,7 @@ function orderedCategories(grouped: Map<string, ToolDef[]>): string[] {
 }
 
 function clauseFor(t: ToolDef): string {
-  if (t.shortClause && t.shortClause.length > 0) return t.shortClause;
+  if (t.shortClause) return t.shortClause;
   // Fall back to the description, truncated. Keeps catalog entries tight
   // when a tool author hasn't written a purposive clause.
   const desc = t.description ?? "";
