@@ -485,16 +485,15 @@ interface ChatUIOpts {
 function createChatUI(opts: ChatUIOpts) {
   const out = process.stdout;
   const headerLabel = `◆ ${opts.agentName}`;
-  // Track open assistant block so consecutive deltas/chunks land under
-  // one header instead of restamping it each time. Also tracks
-  // whether the last byte we wrote ended on a newline — important for
-  // streaming deltas, which can arrive mid-line and need a leading "  "
-  // indent only at the start of a fresh line.
+  // Per-block accumulator: deltas append to this and the whole block is
+  // re-rendered as markdown on every chunk (opencode-style streaming).
+  // Cleared when the block closes (tool call, error, turn end).
+  let assistantBuffer = "";
   let assistantOpen = false;
   let atLineStart = true;
   // Visual line and column tracking inside the open assistant block,
   // including the header line. Used to rewind+redraw with markdown
-  // when the authoritative chat.assistant-text arrives.
+  // on every streamed chunk and on the authoritative chat.assistant-text.
   let visualLines = 0; // total visual lines consumed (header + content + wraps)
   let col = 0; // cursor column, 0-based; ANSI escapes don't bump this
 
@@ -536,11 +535,29 @@ function createChatUI(opts: ChatUIOpts) {
     }
   }
 
-  function ensureAssistantHeader(): void {
-    if (assistantOpen) return;
+  function rewindAssistant(): void {
+    // Cursor up to the start of the header line, then clear forward.
+    // Skipped on non-TTY because cursor codes don't make sense in a logfile.
+    if (!out.isTTY) return;
+    if (visualLines > 0) out.write(`\x1b[${visualLines}F`);
+    out.write("\x1b[0J");
+    visualLines = 0;
+    col = 0;
+    atLineStart = true;
+  }
+
+  function paintAssistantBlock(text: string): void {
+    // Rewinds (if open) and prints the header + markdown-rendered text.
+    // Caller is responsible for setting/keeping assistantOpen=true after.
+    if (assistantOpen) rewindAssistant();
     trackedWrite(color(`${ANSI.bold}${ANSI.cyan}`, headerLabel) + "\n");
-    trackedWrite("  "); // first-line indent
-    assistantOpen = true;
+    if (text.length === 0) return;
+    const lines = renderMarkdown(text, Math.max(20, termWidth() - 2));
+    for (const line of lines) {
+      trackedWrite("  ");
+      trackedWrite(line);
+      trackedWrite("\n");
+    }
   }
 
   function closeAssistant(): void {
@@ -550,6 +567,7 @@ function createChatUI(opts: ChatUIOpts) {
     atLineStart = true;
     visualLines = 0;
     col = 0;
+    assistantBuffer = "";
     out.write("\n");
   }
 
@@ -584,57 +602,24 @@ function createChatUI(opts: ChatUIOpts) {
       out.write("\n");
     },
 
-    /** Stream a chunk of assistant text. Maintains a running "is the
-     *  cursor at the start of a fresh line?" so we only emit the "  "
-     *  indent at line breaks — important when the model emits a single
-     *  word at a time. */
+    /** Stream a chunk of assistant text. Appends to the per-block buffer
+     *  and re-renders the whole block as markdown on every chunk. On a
+     *  TTY this gives live formatted output; on non-TTY we silently
+     *  buffer and let assistantText() emit the rendered block once. */
     assistantDelta(text: string): void {
       if (!text) return;
-      ensureAssistantHeader();
-      // Walk the chunk on newlines so multi-line deltas get re-indented;
-      // everything else writes through tracked.
-      const parts = text.split("\n");
-      for (let i = 0; i < parts.length; i++) {
-        const part = parts[i]!;
-        if (atLineStart && part.length > 0) {
-          trackedWrite("  ");
-        }
-        if (part.length > 0) trackedWrite(part);
-        if (i < parts.length - 1) trackedWrite("\n");
-      }
+      assistantBuffer += text;
+      if (!out.isTTY) return;
+      paintAssistantBlock(assistantBuffer);
+      assistantOpen = true;
     },
 
-    /** Authoritative full text. Rewinds the streamed plaintext and
-     *  re-emits the same block with markdown rendering applied. On
-     *  non-TTY (piping) we leave the streamed text alone — terminal
-     *  redraw codes don't make sense in a logfile. */
+    /** Authoritative full text. Repaints with the canonical text (which
+     *  may differ slightly from the concatenated deltas) and closes the
+     *  block. On non-TTY this is when the markdown actually lands on
+     *  stdout, since deltas don't print in that mode. */
     assistantText(full: string): void {
-      if (!assistantOpen) {
-        // No streamed deltas — render straight from the full text.
-        if (!full) return;
-        ensureAssistantHeader();
-        // Reset the "  " indent we just wrote; we'll re-prefix below.
-        // Easier path: just close and rewrite the rendered block from
-        // scratch via the redraw path.
-      }
-      const lines = renderMarkdown(full, Math.max(20, termWidth() - 2));
-      if (out.isTTY && assistantOpen) {
-        // Move cursor up to the header line and clear to end of screen.
-        // \x1b[<n>F: cursor up n lines, to column 1.
-        // \x1b[0J: clear from cursor to end of screen.
-        if (visualLines > 0) out.write(`\x1b[${visualLines}F`);
-        out.write("\x1b[0J");
-        visualLines = 0;
-        col = 0;
-        atLineStart = true;
-      }
-      // Reprint the header + rendered markdown.
-      trackedWrite(color(`${ANSI.bold}${ANSI.cyan}`, headerLabel) + "\n");
-      for (const line of lines) {
-        trackedWrite("  ");
-        trackedWrite(line);
-        trackedWrite("\n");
-      }
+      paintAssistantBlock(full);
       assistantOpen = true;
       closeAssistant();
     },

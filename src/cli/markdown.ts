@@ -9,6 +9,7 @@
 // one place (the chat UI), and lets non-chat callers reuse the renderer.
 
 import { marked, type Token, type Tokens } from "marked";
+import { highlightCodeLine, normalizeLang } from "./highlight.ts";
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -21,6 +22,7 @@ const ANSI = {
   magenta: "\x1b[35m",
   green: "\x1b[32m",
   yellow: "\x1b[33m",
+  blue: "\x1b[34m",
   gray: "\x1b[90m",
 };
 
@@ -159,12 +161,18 @@ function renderBlock(token: Token, width: number, theme: Theme): string[] {
     }
     case "code": {
       const c = token as Tokens.Code;
-      const lang = c.lang ?? "";
-      const out = [theme.codeFence(`\`\`\`${lang}`)];
-      for (const ln of c.text.split("\n")) out.push(theme.codeBlock(ln));
+      const lang = normalizeLang(c.lang ?? "");
+      const out = [theme.codeFence(`\`\`\`${c.lang ?? ""}`)];
+      for (const ln of c.text.split("\n")) {
+        out.push(lang ? highlightCodeLine(ln, lang) : theme.codeBlock(ln));
+      }
       out.push(theme.codeFence("```"));
       out.push("");
       return out;
+    }
+    case "table": {
+      const t = token as Tokens.Table;
+      return renderTable(t, width, theme);
     }
     case "list": {
       const l = token as Tokens.List;
@@ -223,6 +231,104 @@ function renderBlock(token: Token, width: number, theme: Theme): string[] {
 function flowLines(text: string, width: number): string[] {
   const out: string[] = [];
   for (const seg of text.split("\n")) out.push(...wrap(seg, width));
+  return out;
+}
+
+/** Pad a styled string with spaces to a target visible width. */
+function padTo(s: string, width: number): string {
+  const need = Math.max(0, width - visibleLen(s));
+  return s + " ".repeat(need);
+}
+
+/** Render a markdown table. Slim port of pi-mono's renderTable: computes
+ *  natural column widths from header + cells, shrinks proportionally when
+ *  total exceeds available width, wraps cell content per-column, draws
+ *  light-box borders. Falls back to rendering the raw markdown when the
+ *  available width can't even fit one column per cell. */
+function renderTable(t: Tokens.Table, available: number, theme: Theme): string[] {
+  const cols = t.header.length;
+  if (cols === 0) return [];
+
+  // Border overhead: "│ " + (cols-1) * " │ " + " │" = 3*cols + 1.
+  const borderOverhead = 3 * cols + 1;
+  const cellBudget = available - borderOverhead;
+  if (cellBudget < cols) {
+    // Too narrow — fall back to raw.
+    return [...wrap(t.raw ?? "", available), ""];
+  }
+
+  // Render every cell to a styled inline string up front so we can
+  // measure visible widths accurately.
+  const headerCells = t.header.map((h) => renderInline(h.tokens || [], theme));
+  const rowCells = t.rows.map((row) => row.map((c) => renderInline(c.tokens || [], theme)));
+
+  // Natural width per column = max visible width of header + any row cell.
+  const natural: number[] = headerCells.map(visibleLen);
+  for (const row of rowCells) {
+    for (let i = 0; i < cols; i++) {
+      natural[i] = Math.max(natural[i] ?? 0, visibleLen(row[i] ?? ""));
+    }
+  }
+
+  // Shrink proportionally if natural total exceeds budget. Floor each
+  // column at 1 cell so the layout never collapses to zero-width.
+  let widths: number[];
+  const naturalTotal = natural.reduce((a, b) => a + b, 0);
+  if (naturalTotal <= cellBudget) {
+    widths = natural.slice();
+  } else {
+    const ratio = cellBudget / naturalTotal;
+    widths = natural.map((n) => Math.max(1, Math.floor(n * ratio)));
+    // Distribute leftover from rounding.
+    let leftover = cellBudget - widths.reduce((a, b) => a + b, 0);
+    for (let i = 0; leftover > 0 && i < cols; i++) {
+      widths[i]!++;
+      leftover--;
+    }
+  }
+
+  // Wrap each cell to its column width, return per-cell line arrays.
+  const wrapCell = (cell: string, w: number): string[] => {
+    const out: string[] = [];
+    for (const seg of cell.split("\n")) out.push(...wrap(seg, w));
+    return out.length > 0 ? out : [""];
+  };
+
+  const headerLines = headerCells.map((c, i) => wrapCell(c, widths[i]!));
+  const rowsLines = rowCells.map((row) => row.map((c, i) => wrapCell(c, widths[i]!)));
+
+  const dim = (s: string) => `${ANSI.dim}${s}${ANSI.reset}`;
+  const out: string[] = [];
+
+  const border = (l: string, m: string, r: string) =>
+    dim(l + widths.map((w) => "─".repeat(w + 2)).join(m) + r);
+
+  out.push(border("┌", "┬", "┐"));
+
+  // Header rows. Bold each cell's wrapped lines.
+  const headerHeight = Math.max(...headerLines.map((c) => c.length));
+  for (let lineIdx = 0; lineIdx < headerHeight; lineIdx++) {
+    const parts = headerLines.map((cellLines, ci) => {
+      const text = cellLines[lineIdx] ?? "";
+      return theme.bold(padTo(text, widths[ci]!));
+    });
+    out.push(`${dim("│")} ${parts.join(` ${dim("│")} `)} ${dim("│")}`);
+  }
+  out.push(border("├", "┼", "┤"));
+
+  for (let r = 0; r < rowsLines.length; r++) {
+    const row = rowsLines[r]!;
+    const rowHeight = Math.max(...row.map((c) => c.length));
+    for (let lineIdx = 0; lineIdx < rowHeight; lineIdx++) {
+      const parts = row.map((cellLines, ci) => {
+        const text = cellLines[lineIdx] ?? "";
+        return padTo(text, widths[ci]!);
+      });
+      out.push(`${dim("│")} ${parts.join(` ${dim("│")} `)} ${dim("│")}`);
+    }
+  }
+  out.push(border("└", "┴", "┘"));
+  out.push("");
   return out;
 }
 
