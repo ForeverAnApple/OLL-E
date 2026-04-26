@@ -174,7 +174,7 @@ describe("cultural pass-on at spawn", () => {
         .run();
     }
     const principle = await write.execute(
-      { title: "be kind", bodyMd: "", role: "principle" },
+      { title: "be kind", bodyMd: "treat people as ends, not means", role: "principle" },
       ctxFor(parentId, r.hostId),
     );
     const skill = await write.execute(
