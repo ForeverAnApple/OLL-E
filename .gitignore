@@ -165,3 +165,5 @@ docs/design/*
 .lastty-worktrees/
 .lastty-shared/
 .claude/
+!.claude/skills/
+!.claude/skills/**
