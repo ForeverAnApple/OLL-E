@@ -51,6 +51,13 @@ export interface Inbox {
   /** All decisions for a principal, regardless of status, newest first.
    *  Backs `olle inbox --all` and audit reads. */
   listAll(principalId: string, limit?: number): Decision[];
+  /** Decisions proposed by this actor, newest first. Backs `mail_list`'s
+   *  outgoing direction so a proposer can see "did my asks get answered?"
+   *  Default skips resolved rows (status='open' only) so the agent's
+   *  attention lands on what's still pending; pass includeResolved=true
+   *  to include resolved/stale entries (for audit / catching missed
+   *  replies on restart). */
+  listProposedBy(actorId: string, opts?: { includeResolved?: boolean; limit?: number }): Decision[];
   get(id: string): Decision | undefined;
   /** Resolve a full id or unique prefix to a Decision. Returns undefined
    *  when nothing matches; throws when the prefix is ambiguous. The CLI
@@ -122,6 +129,26 @@ export function createInbox(opts: InboxOptions): Inbox {
       .select()
       .from(tables.decisions)
       .where(eq(tables.decisions.principalId, principalId))
+      .orderBy(desc(tables.decisions.createdAt))
+      .limit(limit)
+      .all();
+  }
+
+  function listProposedBy(
+    actorId: string,
+    opts: { includeResolved?: boolean; limit?: number } = {},
+  ): Decision[] {
+    const { includeResolved = false, limit = 100 } = opts;
+    const where = includeResolved
+      ? eq(tables.decisions.proposingAgentId, actorId)
+      : and(
+          eq(tables.decisions.proposingAgentId, actorId),
+          eq(tables.decisions.status, "open"),
+        );
+    return store
+      .select()
+      .from(tables.decisions)
+      .where(where)
       .orderBy(desc(tables.decisions.createdAt))
       .limit(limit)
       .all();
@@ -239,5 +266,5 @@ export function createInbox(opts: InboxOptions): Inbox {
     return ids.length;
   }
 
-  return { propose, listOpen, listAll, get, resolve, respond, sweepStale };
+  return { propose, listOpen, listAll, listProposedBy, get, resolve, respond, sweepStale };
 }

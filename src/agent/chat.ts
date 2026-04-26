@@ -61,6 +61,10 @@ export interface AgentLoopOptions {
   /** Root directory for per-thread message snapshots. Per agent, per
    *  thread. Omit to disable persistence. */
   threadsDir?: string;
+  /** Debounce window for mail wake (ms). Override in tests; default
+   *  MAIL_WAKE_DEBOUNCE_MS. Set to 0 to fire synchronously per event
+   *  (useful in tests that don't want to await timers). */
+  mailWakeDebounceMs?: number;
 }
 
 interface Thread {
@@ -84,6 +88,23 @@ export interface AgentLoop {
   stop(): void;
   threads(): string[];
 }
+
+/** Per-agent stable thread id where mail-wake notes are delivered. The
+ *  agent's loop subscribes to `decision.resolved` (LOG 2026-04-26) where it
+ *  was the proposer; on fire (debounced), a synthetic `chat.input` is
+ *  injected on this thread so the agent reads "you have replies" as input
+ *  and can decide what to do. The thread is stable so context accumulates
+ *  across mail interactions without spawning a new thread per ping; mail
+ *  exchanges are short so bloat is bounded. */
+export function mailboxThreadId(agentId: string): string {
+  return `mailbox:${agentId}`;
+}
+
+/** Quiet window for collapsing a burst of `decision.resolved` events into a
+ *  single wake. Tuned to amortize the case where a parent's many children
+ *  finish near-simultaneously without making the agent feel sluggish for
+ *  one-off replies. */
+const MAIL_WAKE_DEBOUNCE_MS = 2_000;
 
 export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
   const threads = new Map<string, Thread>();
@@ -140,8 +161,53 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
     }
   });
 
+  // Mail wake — subscribe to decision.resolved where this agent was the
+  // proposer, debounce a burst into one synthetic chat.input on the
+  // agent's stable mailbox thread. Pull-side (mail_list) still works any
+  // time; this is the push-side that wakes idle agents whose proposals
+  // got an answer (LOG 2026-04-26).
+  const debounceMs = opts.mailWakeDebounceMs ?? MAIL_WAKE_DEBOUNCE_MS;
+  let mailPending: { count: number; ids: string[] } = { count: 0, ids: [] };
+  let mailTimer: ReturnType<typeof setTimeout> | undefined;
+  const flushMailWake = () => {
+    mailTimer = undefined;
+    const { count, ids } = mailPending;
+    mailPending = { count: 0, ids: [] };
+    if (count === 0) return;
+    const noun = count === 1 ? "reply" : "replies";
+    const text = `📬 ${count} ${noun} to your proposal${count === 1 ? "" : "s"} — call mail_list({direction:"out", includeResolved:true}) to read.`;
+    opts.bus.publish({
+      type: "chat.input",
+      hostId: opts.hostId,
+      actorId: opts.hostId,
+      durable: true,
+      toAgentId: opts.agentId,
+      threadId: mailboxThreadId(opts.agentId),
+      payload: { text, mailWake: true, decisionIds: ids },
+    });
+  };
+  const unsubMail = opts.bus.subscribe("decision.resolved", (ev) => {
+    const p = ev.payload as { proposingAgentId?: string; decisionId?: string } | undefined;
+    if (!p || p.proposingAgentId !== opts.agentId) return;
+    mailPending.count += 1;
+    if (p.decisionId) mailPending.ids.push(p.decisionId);
+    if (debounceMs <= 0) {
+      flushMailWake();
+      return;
+    }
+    if (mailTimer) clearTimeout(mailTimer);
+    mailTimer = setTimeout(flushMailWake, debounceMs);
+  });
+
   return {
-    stop: () => unsub(),
+    stop: () => {
+      unsub();
+      unsubMail();
+      if (mailTimer) {
+        clearTimeout(mailTimer);
+        mailTimer = undefined;
+      }
+    },
     threads: () => [...threads.keys()],
   };
 }

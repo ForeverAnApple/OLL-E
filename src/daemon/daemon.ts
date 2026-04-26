@@ -181,7 +181,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       // the CLI (`olle inbox`) reads from. mail_list is always-loaded
       // (orientation tool); mail_respond is deferred (only needed when
       // voting on a proposal).
-      ...buildInboxTools({ inbox, principalId: rootPrincipalId, store }),
+      ...buildInboxTools({ inbox, principalId: rootPrincipalId, bus, hostId, store }),
     ];
     // Boot invariants — last gate before chat goes live. Tool-name
     // duplication, malformed schemas, etc. surface here as a named

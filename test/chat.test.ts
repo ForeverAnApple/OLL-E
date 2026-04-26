@@ -476,3 +476,150 @@ describe("agent loop over the mailbox", () => {
     }
   });
 });
+
+describe("mail wake — decision.resolved synthesizes chat.input on mailbox thread", () => {
+  // The push-side of mail_propose / mail_list (LOG 2026-04-26): when a
+  // proposal addressed up the chain comes back with a vote (or expires
+  // stale), the proposing agent's loop wakes by injecting a synthetic
+  // chat.input on a stable per-agent mailbox thread. The wake fires for
+  // events where proposingAgentId === my agentId; debounced to coalesce
+  // bursts.
+
+  function publishResolved(
+    bus: ReturnType<typeof createBus>,
+    hostId: string,
+    proposingAgentId: string,
+    decisionId = ulid(),
+  ) {
+    bus.publish({
+      type: "decision.resolved",
+      hostId,
+      actorId: "principal",
+      durable: true,
+      payload: {
+        decisionId,
+        principalId: "p1",
+        proposingAgentId,
+        status: "approved",
+        vote: "approve",
+      },
+    });
+  }
+
+  it("wakes the proposer's loop by injecting chat.input on the mailbox thread", async () => {
+    const r = rig();
+    // Loop never runs the LLM in this test — we're observing only the
+    // injected chat.input event. Use empty script; if the wake erroneously
+    // routed straight to a turn, the script would throw "exhausted".
+    const llm = mockLlm([endTurn("never called in this test")]);
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      mailWakeDebounceMs: 0, // fire synchronously, no setTimeout race
+    });
+    try {
+      const seen: Array<{ threadId?: string; payload: unknown }> = [];
+      r.bus.subscribe("chat.input", (e) => {
+        if ((e.payload as { mailWake?: boolean })?.mailWake) {
+          seen.push({ threadId: e.threadId, payload: e.payload });
+        }
+      });
+      publishResolved(r.bus, r.hostId, r.agentId);
+      // Synchronous flush at debounce=0; one wake.
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.threadId).toBe(`mailbox:${r.agentId}`);
+      const payload = seen[0]!.payload as {
+        text: string;
+        mailWake: boolean;
+        decisionIds: string[];
+      };
+      expect(payload.mailWake).toBe(true);
+      expect(payload.text).toContain("1 reply");
+      expect(payload.text).toContain("mail_list");
+      expect(payload.decisionIds).toHaveLength(1);
+    } finally {
+      loop.stop();
+    }
+  });
+
+  it("ignores decision.resolved for other agents' proposals", async () => {
+    const r = rig();
+    const llm = mockLlm([endTurn("unused")]);
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      mailWakeDebounceMs: 0,
+    });
+    try {
+      const seen: unknown[] = [];
+      r.bus.subscribe("chat.input", (e) => {
+        if ((e.payload as { mailWake?: boolean })?.mailWake) seen.push(e);
+      });
+      publishResolved(r.bus, r.hostId, "some-other-agent");
+      expect(seen).toHaveLength(0);
+    } finally {
+      loop.stop();
+    }
+  });
+
+  it("debounces a burst of resolutions into a single wake", async () => {
+    const r = rig();
+    const llm = mockLlm([endTurn("unused")]);
+    const debounceMs = 25;
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      mailWakeDebounceMs: debounceMs,
+    });
+    try {
+      const seen: Array<{ payload: unknown }> = [];
+      r.bus.subscribe("chat.input", (e) => {
+        if ((e.payload as { mailWake?: boolean })?.mailWake) {
+          seen.push({ payload: e.payload });
+        }
+      });
+      // Burst of 5 resolutions for our agent within the debounce window.
+      for (let i = 0; i < 5; i++) publishResolved(r.bus, r.hostId, r.agentId);
+      // Before the timer fires, no wake yet.
+      expect(seen).toHaveLength(0);
+      await new Promise((resolve) => setTimeout(resolve, debounceMs + 20));
+      expect(seen).toHaveLength(1);
+      const payload = seen[0]!.payload as { text: string; decisionIds: string[] };
+      expect(payload.text).toContain("5 replies");
+      expect(payload.decisionIds).toHaveLength(5);
+    } finally {
+      loop.stop();
+    }
+  });
+
+  it("stop() cancels a pending wake (no leaked timer firing post-shutdown)", async () => {
+    const r = rig();
+    const llm = mockLlm([endTurn("unused")]);
+    const debounceMs = 30;
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      mailWakeDebounceMs: debounceMs,
+    });
+    const seen: unknown[] = [];
+    r.bus.subscribe("chat.input", (e) => {
+      if ((e.payload as { mailWake?: boolean })?.mailWake) seen.push(e);
+    });
+    publishResolved(r.bus, r.hostId, r.agentId);
+    loop.stop();
+    await new Promise((resolve) => setTimeout(resolve, debounceMs + 20));
+    expect(seen).toHaveLength(0);
+  });
+});

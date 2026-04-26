@@ -611,6 +611,36 @@ The `retarget_thread` meta-tool now passes `ctx.actorId` through to `manager.ret
 
 ---
 
+## 2026-04-26 — `mail_propose`: agent-initiated decisions, symmetric wake on reply
+
+The decision inbox primitive existed and was wired into `askUp()`, but `askUp()` only fired *as a side effect* of the permission gate denying a call. No agent — child or root — had a tool to **proactively** open an ask up the chain. The asymmetry the running olle agent surfaced ("children have a more reliable way to reach me than I have to reach you") is real, but the deeper diagnosis is that *no* agent has the capability today; root just feels it most because no scheduler ever denies anything on its behalf. Fixing it for root alone would re-introduce the special-cased human path the architecture is moving away from. Fix it universally instead.
+
+**The shape that landed:**
+
+- **`mail_propose` core tool** (`src/tools/inbox.ts`), `category: "mailbox"`, `tier: "strategic"`, deferred-loaded (catalog-visible; loaded on use). Wraps `askUp()` from the caller's `actorId` toward `opts.principalId`. Returns `{kind: "auto-approved" | "queued", decisionId?, approverAgentId?}` so the caller knows what happened and can store the id to correlate later.
+- **`mail_list({direction})` filter** — `'in' | 'out' | 'both'`, default `'in'` (back-compat). `'out'` returns decisions where `proposingAgentId === ctx.actorId`; lets a proposer check "did my asks get answered?" without inventing a new tool. New `Inbox.listProposedBy()` query is a one-line WHERE; `'both'` is union-deduped on id.
+- **Bus-subscribe wake on the agent loop** for `decision.resolved` where `proposingAgentId === me`. Debounced (~2s quiet window) → synthesizes a `chat.input` event on a stable per-agent thread `mailbox:<agentId>` with text "📬 N reply/replies — `mail_list({direction:'out',includeResolved:true})` to view." The existing `chat.input` handler picks it up and runs a turn on the mailbox thread. The agent reads the wake as input and decides what to do.
+
+**The four design calls locked in conversation:**
+
+1. **Debounced wake, not per-event.** A parent with 8 active children resolving asks in the same second gets one wake, not eight. Per-event is a perf tax with no semantic gain.
+2. **Mailbox thread, not active thread, not in-place interrupt.** `mailbox:<agentId>` is a stable per-agent thread for processing inbound mail; it doesn't interrupt the agent's current work thread. The agent already pre-loads `mail_list` (always-loaded core) so the wake's only job is "you have a reason to think now."
+3. **No reminder pings before staleness.** Deadlines are visible in `mail_list`; pinging twice is the chase pattern in a friendlier coat. Staleness is the absence contract — the proposing agent declares how long it can wait, the system fires `decision.resolved` with `vote: "stale"` on expiry, the proposer's `on_stale` runs.
+4. **No synthetic seed principles.** Same answer LOG 2026-04-23 reached for "Serve your principal": the binary doesn't plant the *posture* of when to mail-propose. The principal teaches it in conversation; cultural-pass-on inherits the principle to children. Capability is core (it can't be missing); posture is grown.
+
+**The two `[DEFERRED]` items embedded:**
+
+- **`toAgentId` parameter on `mail_propose`** that addresses a specific ancestor (not just "run askUp"). Today addressing an ancestor (vs the principal) requires a new `addressed_agent_id` column on `decisions` plus the wake subscription extending to `decision.proposed` filtered by it. Dropped from this cut because the principals→agents collapse from LOG 2026-04-23 will subsume the work — once principal is just the topmost agent, "addressed to ancestor X" becomes the natural shape and the schema bump happens then. v0 callers get the askUp behavior unchanged: child-tier-delegated → resolves at parent silently; otherwise lands on principal. **Resurrect when:** the principals→agents collapse migration is being drafted.
+- **`decision.escalated` events at each propagation hop**, so an ancestor whose chain a proposal walks past gets read-only awareness without being the addressee. Not needed today (nobody subscribes), useful when v0.1 introduces the `addressed_agent_id` shape above. **Resurrect when:** the same migration above lands.
+
+**Why this is core, not extension:** the inbox primitive is core, attribution + redaction events are emitted by the runtime, and the `actorId` provenance comes from the live tool-execute context. An extension synthesizing principal mail would be lying about provenance — same reasoning that put `mail_list`/`mail_respond` in core (LOG 2026-04-25 design call #2). The propose tool joins them on the same boundary.
+
+**Why no system cron sweeping mailboxes:** would be a concession that we don't trust the bus and a framework imposition (we decide when agents check). Anti-agentic. If a particular agent wants belt-and-suspenders polling, it authors a userspace trigger via the extension loop — the more-agentic path.
+
+**Why the human's wake is not in this PR:** the human is just an agent whose mailbox subscriber is a *bridge*, not a loop. The CLI banner already subscribes to `decision.proposed` for the principal (LOG 2026-04-25); future Discord / Telegram / email bridges are extension territory, authored through the standard propose → write → smoke → register loop. Same `decision.proposed` event, transport-agnostic. The propose tool doesn't know or care which transport delivered.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.
