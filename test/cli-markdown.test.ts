@@ -25,4 +25,14 @@ describe("CLI markdown rendering", () => {
     expect(output).toContain("Use bold, code, and docs (https://example.test).");
     expect(output).toContain("const x = 1;");
   });
+
+  it("renders tables as width-bounded pipe rows", () => {
+    const lines = renderMarkdown(
+      ["| Name | Notes |", "| --- | --- |", "| root | short |"].join("\n"),
+      40,
+      plainTheme,
+    );
+
+    expect(lines).toEqual(["| Name | Notes |", "|------|-------|", "| root | short |"]);
+  });
 });

@@ -570,9 +570,7 @@ function numFrom(v: unknown): number {
 // ───────────────────────────────────────────────────────────────────────
 // Chat UI — light ANSI dressing for `olle chat`. No TUI framework, no
 // alternate screen; just a vocabulary of styled lines so the agent's
-// turn structure is legible. Inspiration taken from pi-mono's interactive
-// mode (role headers, dim tool execution, footer status line) without
-// pulling in the framework that drives them.
+// turn structure is legible.
 // ───────────────────────────────────────────────────────────────────────
 
 const ANSI = {

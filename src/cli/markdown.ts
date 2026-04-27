@@ -1,8 +1,7 @@
 // Tiny markdown → ANSI renderer for `olle chat`. Walks marked's token
-// tree and emits styled terminal lines. Inspired by pi-mono's TUI
-// component (references/pi-mono/packages/tui/src/components/markdown.ts)
-// but stripped to what a streaming CLI actually needs: headings,
-// bold/italic, inline + fenced code, lists, blockquotes, links, hr.
+// tree and emits styled terminal lines for what a streaming CLI needs:
+// headings, bold/italic, inline + fenced code, lists, blockquotes, links,
+// tables, and hr.
 //
 // Lines are returned without the assistant block's "  " indent —
 // the caller is expected to prefix it. This keeps wrapping logic in
@@ -257,94 +256,62 @@ function padTo(s: string, width: number): string {
   return s + " ".repeat(need);
 }
 
-/** Render a markdown table. Slim port of pi-mono's renderTable: computes
- *  natural column widths from header + cells, shrinks proportionally when
- *  total exceeds available width, wraps cell content per-column, draws
- *  light-box borders. Falls back to rendering the raw markdown when the
- *  available width can't even fit one column per cell. */
+/** Render a markdown table as width-capped pipe rows. */
 function renderTable(t: Tokens.Table, available: number, theme: Theme): string[] {
   const cols = t.header.length;
   if (cols === 0) return [];
 
-  // Border overhead: "│ " + (cols-1) * " │ " + " │" = 3*cols + 1.
-  const borderOverhead = 3 * cols + 1;
-  const cellBudget = available - borderOverhead;
+  // Row overhead: "| " + (cols-1) * " | " + " |" = 3*cols + 1.
+  const rowOverhead = 3 * cols + 1;
+  const cellBudget = available - rowOverhead;
   if (cellBudget < cols) {
-    // Too narrow — fall back to raw.
     return [...wrap(t.raw ?? "", available), ""];
   }
 
-  // Render every cell to a styled inline string up front so we can
-  // measure visible widths accurately.
   const headerCells = t.header.map((h) => renderInline(h.tokens || [], theme));
   const rowCells = t.rows.map((row) => row.map((c) => renderInline(c.tokens || [], theme)));
 
-  // Natural width per column = max visible width of header + any row cell.
-  const natural: number[] = headerCells.map(visibleLen);
-  for (const row of rowCells) {
-    for (let i = 0; i < cols; i++) {
-      natural[i] = Math.max(natural[i] ?? 0, visibleLen(row[i] ?? ""));
-    }
-  }
-
-  // Shrink proportionally if natural total exceeds budget. Floor each
-  // column at 1 cell so the layout never collapses to zero-width.
-  let widths: number[];
-  const naturalTotal = natural.reduce((a, b) => a + b, 0);
-  if (naturalTotal <= cellBudget) {
-    widths = natural.slice();
-  } else {
-    const ratio = cellBudget / naturalTotal;
-    widths = natural.map((n) => Math.max(1, Math.floor(n * ratio)));
-    // Distribute leftover from rounding.
-    let leftover = cellBudget - widths.reduce((a, b) => a + b, 0);
-    for (let i = 0; leftover > 0 && i < cols; i++) {
+  const natural = Array.from({ length: cols }, (_, i) =>
+    Math.max(1, ...[headerCells[i] ?? "", ...rowCells.map((row) => row[i] ?? "")].map(visibleLen)),
+  );
+  let widths = natural.slice();
+  const naturalTotal = widths.reduce((sum, w) => sum + w, 0);
+  if (naturalTotal > cellBudget) {
+    const even = Math.max(1, Math.floor(cellBudget / cols));
+    widths = Array.from({ length: cols }, () => even);
+    let leftover = cellBudget - even * cols;
+    for (let i = 0; leftover > 0; i = (i + 1) % cols) {
       widths[i]!++;
       leftover--;
     }
   }
 
-  // Wrap each cell to its column width, return per-cell line arrays.
-  const wrapCell = (cell: string, w: number): string[] => {
-    const out: string[] = [];
-    for (const seg of cell.split("\n")) out.push(...wrap(seg, w));
-    return out.length > 0 ? out : [""];
+  const wrapCell = (cell: string, width: number) => flowLines(cell, width);
+  const headerLines = headerCells.map((cell, i) => wrapCell(cell, widths[i]!));
+  const rowsLines = rowCells.map((row) =>
+    Array.from({ length: cols }, (_, i) => wrapCell(row[i] ?? "", widths[i]!)),
+  );
+  const dim = (s: string) => (theme === plainTheme ? s : `${ANSI.dim}${s}${ANSI.reset}`);
+  const pipe = dim("|");
+  const separator = `${pipe}${widths.map((w) => dim("-".repeat(w + 2))).join(pipe)}${pipe}`;
+  const renderRow = (cells: string[][], lineIdx: number, header: boolean): string => {
+    const parts = cells.map((cellLines, i) => {
+      const text = padTo(cellLines[lineIdx] ?? "", widths[i]!);
+      return header ? theme.bold(text) : text;
+    });
+    return `${pipe} ${parts.join(` ${pipe} `)} ${pipe}`;
   };
 
-  const headerLines = headerCells.map((c, i) => wrapCell(c, widths[i]!));
-  const rowsLines = rowCells.map((row) => row.map((c, i) => wrapCell(c, widths[i]!)));
-
-  const dim = (s: string) => `${ANSI.dim}${s}${ANSI.reset}`;
   const out: string[] = [];
-
-  const border = (l: string, m: string, r: string) =>
-    dim(l + widths.map((w) => "─".repeat(w + 2)).join(m) + r);
-
-  out.push(border("┌", "┬", "┐"));
-
-  // Header rows. Bold each cell's wrapped lines.
-  const headerHeight = Math.max(...headerLines.map((c) => c.length));
+  const headerHeight = Math.max(...headerLines.map((cell) => cell.length));
   for (let lineIdx = 0; lineIdx < headerHeight; lineIdx++) {
-    const parts = headerLines.map((cellLines, ci) => {
-      const text = cellLines[lineIdx] ?? "";
-      return theme.bold(padTo(text, widths[ci]!));
-    });
-    out.push(`${dim("│")} ${parts.join(` ${dim("│")} `)} ${dim("│")}`);
+    out.push(renderRow(headerLines, lineIdx, true));
   }
-  out.push(border("├", "┼", "┤"));
-
-  for (let r = 0; r < rowsLines.length; r++) {
-    const row = rowsLines[r]!;
-    const rowHeight = Math.max(...row.map((c) => c.length));
-    for (let lineIdx = 0; lineIdx < rowHeight; lineIdx++) {
-      const parts = row.map((cellLines, ci) => {
-        const text = cellLines[lineIdx] ?? "";
-        return padTo(text, widths[ci]!);
-      });
-      out.push(`${dim("│")} ${parts.join(` ${dim("│")} `)} ${dim("│")}`);
-    }
+  out.push(separator);
+  for (const row of rowsLines) {
+    const rowHeight = Math.max(...row.map((cell) => cell.length));
+    for (let lineIdx = 0; lineIdx < rowHeight; lineIdx++) out.push(renderRow(row, lineIdx, false));
   }
-  out.push(border("└", "┴", "┘"));
   out.push("");
   return out;
 }
