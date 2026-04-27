@@ -214,6 +214,7 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
       toAgentId?: string;
       since?: number;
       limit?: number;
+      maxPayloadBytes?: number;
     },
     ReturnType<typeof recentEvents>
   > = {
@@ -222,7 +223,7 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
     category: "observability",
     shortClause: "raw event-log query (use sparingly)",
     description:
-      "Generic event-log query. All filters optional — combine actorId/type/threadId/toAgentId/since to narrow. Use sparingly: the event log is the source of truth and large reads cost tokens; prefer the specialized query_* tools when they answer your question.",
+      "Generic event-log query. All filters optional — combine actorId/type/threadId/toAgentId/since to narrow. Use sparingly: the event log is the source of truth and large reads cost tokens; prefer the specialized query_* tools when they answer your question. Each row's payload is capped to maxPayloadBytes (default 2048) — over-budget rows come back as `{ _truncated, _bytes, _preview }`. Raise the cap deliberately when you need a full body; one chat.tool-call payload can be 100KB+.",
     inputSchema: {
       type: "object",
       properties: {
@@ -232,6 +233,11 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
         toAgentId: { type: "string" },
         since: COMMON_TIME_PROPS.since,
         limit: { type: "number", description: "Max rows (default 100)." },
+        maxPayloadBytes: {
+          type: "number",
+          description:
+            "Per-row payload byte cap (default 2048). Rows whose serialized payload exceeds this come back truncated with a preview. Raising this directly increases context cost.",
+        },
       },
       additionalProperties: false,
     },
@@ -243,6 +249,7 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
         toAgentId: scopedAgent(args.toAgentId, ctx.actorId, "query_events"),
         since: args.since,
         limit: args.limit,
+        maxPayloadBytes: args.maxPayloadBytes ?? 2048,
       } satisfies RecentEventsFilter),
   };
 
