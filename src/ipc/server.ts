@@ -60,6 +60,10 @@ export interface IpcServerOptions {
    *  fall on the floor; consumers (chat REPL, bridges) probe this to
    *  fail fast instead of publishing into a dead mailbox. */
   chatStatus?: () => { enabled: boolean; reason?: string };
+  /** Cancel the in-flight turn for a given thread on the root chat agent.
+   *  Returns true when a turn was running and was signalled to abort,
+   *  false when no active turn was found. */
+  chatCancel?: (threadId: string) => boolean;
 }
 
 export interface IpcServer {
@@ -224,6 +228,16 @@ async function dispatch(
           ok: true,
           value: { enabled: s.enabled, reason: s.reason ?? null },
         });
+        return;
+      }
+      case "chat.cancel": {
+        const threadId = req.params?.threadId as string | undefined;
+        if (!threadId) {
+          send({ id: req.id, ok: false, error: { message: "threadId required" } });
+          return;
+        }
+        const cancelled = opts.chatCancel ? opts.chatCancel(threadId) : false;
+        send({ id: req.id, ok: true, value: { cancelled } });
         return;
       }
       case "tail": {

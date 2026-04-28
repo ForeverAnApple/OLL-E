@@ -361,12 +361,19 @@ async function cmdChat(): Promise<void> {
 
   let turnBusy = false;
   let stopping = false;
+  // Two-tap quit on idle: first Ctrl-C arms a hint, second within the
+  // window exits. Streaming Ctrl-C cancels the turn and is independent.
+  const QUIT_ARM_MS = 2_000;
+  let quitArmedUntil = 0;
 
   // Slash command surface. Tiny on purpose; agent-authored extension
   // commands are not v0 — those would be tools, not chat shortcuts.
   const slashCommands: Array<{ name: string; description: string }> = [
     { name: "/help", description: "show available commands" },
     { name: "/clear", description: "clear scrollback" },
+    { name: "/cancel", description: "cancel the current agent turn" },
+    { name: "/inbox", description: "open the decision inbox in a new window (run `olle inbox`)" },
+    { name: "/cost", description: "show running session cost (token + USD totals)" },
     { name: "/exit", description: "exit chat" },
     { name: "/quit", description: "exit chat" },
   ];
@@ -390,7 +397,7 @@ async function cmdChat(): Promise<void> {
     promptCont: ui.promptContString(),
     callbacks: {
       onSubmit: handleSubmit,
-      onAbort: () => void stop(),
+      onAbort: () => idleCtrlC(),
       onEof: () => void stop(),
       onTab: (text) => {
         const matches = matchSlash(text);
@@ -400,8 +407,40 @@ async function cmdChat(): Promise<void> {
         return matches[0]!.name + (rest.startsWith(" ") ? rest : ` ${rest.trimStart()}`);
       },
       onChange: (text) => editor.setAboveLine(aboveFor(text)),
+      onStreamCancel: () => void cancelTurn(),
     },
   });
+
+  function idleCtrlC(): void {
+    // First press: arm; second press within the window: exit.
+    const now = Date.now();
+    if (now <= quitArmedUntil) {
+      void stop();
+      return;
+    }
+    quitArmedUntil = now + QUIT_ARM_MS;
+    editor.setAboveLine(
+      color(ANSI.dim, "press Ctrl-C again within 2s to exit"),
+    );
+    setTimeout(() => {
+      if (Date.now() > quitArmedUntil) return; // already exited or rearmed
+      // Disarm: redraw the normal status line if still idle.
+      quitArmedUntil = 0;
+      if (!turnBusy && !stopping) editor.setAboveLine(ui.formatStatus());
+    }, QUIT_ARM_MS + 50);
+  }
+
+  async function cancelTurn(): Promise<void> {
+    if (!turnBusy) return;
+    ui.cancelling();
+    try {
+      await current.call("chat.cancel", { threadId });
+    } catch {
+      // If the IPC call itself fails the chat.cancelled / chat.error
+      // event will still surface via the tail loop once the daemon
+      // recovers. Don't let a transient socket error spam the user.
+    }
+  }
 
   const stop = async () => {
     if (stopping) return;
@@ -415,7 +454,11 @@ async function cmdChat(): Promise<void> {
     }
     process.exit(0);
   };
-  process.on("SIGINT", stop);
+  // Note: process.on("SIGINT") is intentionally NOT installed. Raw mode
+  // disables OS-level SIGINT generation from \x03; the LineEditor reads
+  // the byte directly and routes it (idle → two-tap quit confirm,
+  // streaming → cancelTurn). SIGTERM still flows; we leave it unhandled
+  // so the default exit semantics apply.
 
   async function handleSubmit(raw: string): Promise<void> {
     const text = raw.replace(/\s+$/, "");
@@ -432,6 +475,12 @@ async function cmdChat(): Promise<void> {
       }
       if (slash.name === "/help") ui.printSlashHelp(slashCommands);
       else if (slash.name === "/clear") ui.clearScrollback();
+      else if (slash.name === "/cancel") {
+        if (turnBusy) await cancelTurn();
+        else ui.note("no agent turn in progress");
+      } else if (slash.name === "/cost") ui.printCost();
+      else if (slash.name === "/inbox")
+        ui.note("inbox is its own command — run `olle inbox` in another shell");
       if (!stopping) {
         editor.setAboveLine(ui.formatStatus());
         editor.refresh();
@@ -521,6 +570,10 @@ async function cmdChat(): Promise<void> {
           reprompt();
         } else if (ev.type === "chat.error") {
           ui.error(String(p.error ?? ""));
+          turnBusy = false;
+          reprompt();
+        } else if (ev.type === "chat.cancelled") {
+          ui.cancelled();
           turnBusy = false;
           reprompt();
         }
@@ -890,11 +943,14 @@ export function createChatUI(opts: ChatUIOpts) {
       const bot = color(ANSI.cyan, `╰${"─".repeat(inner)}╯`);
       const side = color(ANSI.cyan, "│");
       const title = `${ANSI.bold}${opts.agentName}${ANSI.reset}`;
-      const hint = color(ANSI.dim, "/help for commands · Ctrl-C to exit");
+      const hint1 = color(
+        ANSI.dim,
+        "Alt+Enter newline · Ctrl+C cancel turn / quit · /help",
+      );
       const row = (s: string) => `${side} ${padLine(s, inner - 2)} ${side}\n`;
       out.write(`${top}\n`);
       out.write(row(title));
-      out.write(row(hint));
+      out.write(row(hint1));
       const n = opts.inboxOpen ?? 0;
       if (n > 0) {
         const word = n === 1 ? "item" : "items";
@@ -1015,6 +1071,46 @@ export function createChatUI(opts: ChatUIOpts) {
     error(msg: string): void {
       flushAssistant();
       out.write(color(ANSI.red, `  ⚠ ${msg}`) + "\n\n");
+    },
+
+    /** "we asked the daemon to cancel; waiting on the abort to land". */
+    cancelling(): void {
+      out.write(color(ANSI.yellow, "  ⏹ cancelling…") + "\n");
+    },
+
+    /** Daemon confirmed the turn was aborted. */
+    cancelled(): void {
+      flushAssistant();
+      out.write(color(ANSI.yellow, "  ⏹ turn cancelled") + "\n\n");
+    },
+
+    /** Plain dim status note (no agent attribution). */
+    note(msg: string): void {
+      out.write(color(ANSI.dim, `  ${msg}`) + "\n\n");
+    },
+
+    /** Spell out the cumulative session cost in a multi-line block. The
+     *  one-liner above the prompt is glanceable; this is the "give me the
+     *  numbers" form for `/cost`. */
+    printCost(): void {
+      const s = sessionStats;
+      const total =
+        s.inputTokens + s.outputTokens + s.cacheReadTokens + s.cacheCreationTokens;
+      if (total === 0 && s.usdMicros === 0) {
+        out.write(color(ANSI.dim, "  no turns this session yet.") + "\n\n");
+        return;
+      }
+      const lines = [
+        color(`${ANSI.bold}${ANSI.cyan}`, "◆ session cost"),
+        `  input:        ${formatTokens(s.inputTokens)}`,
+        `  output:       ${formatTokens(s.outputTokens)}`,
+        `  cache read:   ${formatTokens(s.cacheReadTokens)}`,
+        `  cache create: ${formatTokens(s.cacheCreationTokens)}`,
+        `  total tokens: ${formatTokens(total)}`,
+        `  total cost:   ${formatUsd(s.usdMicros)}`,
+      ];
+      if (s.model) lines.push(color(ANSI.dim, `  model: ${s.model}`));
+      out.write(lines.join("\n") + "\n\n");
     },
 
     /** Accumulate per-turn usage into running session totals. The

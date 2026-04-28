@@ -71,6 +71,10 @@ export interface AgentRunOptions {
    *  TruncationState across turns of one thread to keep the prompt cache
    *  prefix stable. */
   truncate?: TruncateOptions;
+  /** Cancel the in-flight turn. Forwarded to the LLM call so streaming
+   *  aborts at network level; also checked between rounds so a fired
+   *  abort during a tool call ends the turn before the next LLM hop. */
+  signal?: AbortSignal;
 }
 
 export type AgentStep =
@@ -125,6 +129,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   };
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    if (opts.signal?.aborted) throw abortError(opts.signal);
     const { tools: roundTools, byName: toolByName } = resolveTools();
     const visibleTools = filterVisibleTools(roundTools, opts.isLoaded);
     const toolSpecs: ToolSpec[] | undefined = visibleTools?.map(toToolSpec);
@@ -138,6 +143,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
     if (toolSpecs && toolSpecs.length > 0) req.tools = toolSpecs;
     req.onRetry = (info) => opts.onStep?.({ kind: "retry", info });
     req.onTextDelta = (delta) => opts.onStep?.({ kind: "assistant_delta", text: delta });
+    if (opts.signal) req.signal = opts.signal;
     const completion = await opts.llm.complete(req);
     total.inputTokens += completion.usage.inputTokens;
     total.outputTokens += completion.usage.outputTokens;
@@ -243,6 +249,14 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   }
 
   return { messages, stopReason: "max_turns", totalUsage: total };
+}
+
+function abortError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error) return reason;
+  const e = new Error(typeof reason === "string" ? reason : "aborted");
+  e.name = "AbortError";
+  return e;
 }
 
 function toToolSpec(t: ToolDef): ToolSpec {

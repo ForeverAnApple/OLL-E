@@ -131,14 +131,17 @@ async function runStream(
   client: Anthropic,
   req: CompletionRequest,
 ): Promise<Anthropic.Messages.Message> {
-  const stream = client.messages.stream({
-    model: req.model,
-    max_tokens: req.maxTokens,
-    temperature: req.temperature,
-    system: buildSystem(req.system),
-    messages: buildMessages(req.messages),
-    tools: req.tools?.length ? buildTools(req.tools) : undefined,
-  } as Anthropic.Messages.MessageCreateParamsStreaming);
+  const stream = client.messages.stream(
+    {
+      model: req.model,
+      max_tokens: req.maxTokens,
+      temperature: req.temperature,
+      system: buildSystem(req.system),
+      messages: buildMessages(req.messages),
+      tools: req.tools?.length ? buildTools(req.tools) : undefined,
+    } as Anthropic.Messages.MessageCreateParamsStreaming,
+    req.signal ? { signal: req.signal } : undefined,
+  );
   if (req.onTextDelta) {
     stream.on("text", (delta: string) => {
       try {

@@ -133,6 +133,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       enabled: chat !== undefined,
       reason: chatDisabledReason,
     }),
+    chatCancel: (threadId: string) => (chat ? chat.cancel(threadId) : false),
   });
   await ipc.listen();
 

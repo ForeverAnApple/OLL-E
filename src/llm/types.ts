@@ -76,6 +76,11 @@ export interface CompletionRequest {
    *  visibility hook for surfaces (CLI, future bridges) that want to
    *  render tokens as they arrive instead of waiting for the full block. */
   onTextDelta?: (delta: string) => void;
+  /** Cancel the in-flight request. The adapter forwards this to the SDK;
+   *  on abort the call rejects with an AbortError. Lets the agent loop
+   *  surface a Ctrl-C from the CLI as a real network interrupt rather
+   *  than waiting for the full response and discarding it. */
+  signal?: AbortSignal;
 }
 
 export interface Usage {

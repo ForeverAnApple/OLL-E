@@ -92,6 +92,11 @@ interface Thread {
   pendingOrigin: Event[];
   /** Set by the single drain loop; undefined means no worker running. */
   worker?: Promise<void>;
+  /** Active turn's abort controller. Set when a turn starts; cleared on
+   *  end. `cancel(threadId)` on the loop fires this so the LLM stream
+   *  aborts at network level and the turn returns control to the user
+   *  without burning the rest of the round-trip budget. */
+  activeAbort?: AbortController;
   /** Tool names whose schemas the agent has pulled into context for this
    *  thread. Mutated by load_tools / unload_tools meta-tools. Always-
    *  loaded tools are not tracked here — they're sent every turn
@@ -113,6 +118,11 @@ interface Thread {
 export interface AgentLoop {
   stop(): void;
   threads(): string[];
+  /** Abort the in-flight turn for `threadId`, if any. Returns true if a
+   *  turn was running and was signalled to abort; false if no active turn
+   *  was found. The turn's chat.error event lands on the bus once the
+   *  cancellation propagates through the LLM stream. */
+  cancel(threadId: string): boolean;
 }
 
 /** Per-agent stable thread id where mail-wake notes are delivered. The
@@ -245,6 +255,12 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
       }
     },
     threads: () => [...threads.keys()],
+    cancel: (threadId: string) => {
+      const t = threads.get(threadId);
+      if (!t || !t.activeAbort) return false;
+      t.activeAbort.abort(new Error("cancelled by user"));
+      return true;
+    },
   };
 }
 
@@ -270,6 +286,8 @@ async function runTurn(
   allThreads: Map<string, Thread>,
 ): Promise<void> {
   thread.messages.push({ role: "user", content: text });
+  const turnAbort = new AbortController();
+  thread.activeAbort = turnAbort;
   try {
     // Core tools wrapped per-turn so register_extension's auto-load
     // closure binds this thread's loadedTools.
@@ -369,9 +387,12 @@ async function runTurn(
         // time; this default only ever reaches a core tool.
         extensionId: "",
         actorId: opts.agentId,
-        abort: new AbortController().signal,
+        // Same signal as runAgent's `signal`: a single user-cancel fires
+        // both the LLM stream abort and any in-flight tool that respects it.
+        abort: turnAbort.signal,
         secrets: {},
       },
+      signal: turnAbort.signal,
       messages: thread.messages,
       truncate: opts.toolTruncate
         ? {
@@ -510,15 +531,23 @@ async function runTurn(
       },
     });
   } catch (err) {
+    const cancelled =
+      turnAbort.signal.aborted ||
+      (err as { name?: string })?.name === "AbortError" ||
+      /cancelled by user|aborted/i.test((err as Error)?.message ?? "");
     opts.bus.publish({
-      type: "chat.error",
+      type: cancelled ? "chat.cancelled" : "chat.error",
       hostId: opts.hostId,
       actorId: opts.agentId,
       parentEventId: origin.id,
       threadId: thread.id,
       durable: true,
-      payload: { error: (err as Error).message },
+      payload: {
+        error: cancelled ? "cancelled by user" : (err as Error).message,
+      },
     });
+  } finally {
+    if (thread.activeAbort === turnAbort) thread.activeAbort = undefined;
   }
 }
 

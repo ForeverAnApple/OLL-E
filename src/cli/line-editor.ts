@@ -30,6 +30,10 @@ export interface LineEditorCallbacks {
    *  caller can use this to drive the above-prompt slot via
    *  setAboveLine(). */
   onChange?(text: string): void;
+  /** Ctrl+C arrived while the editor was suspended (the chat is streaming).
+   *  Lets the caller route a turn-cancel without resuming the editor. When
+   *  omitted, suspended Ctrl+C falls back to onAbort(). */
+  onStreamCancel?(): void;
 }
 
 export interface LineEditorOpts {
@@ -85,6 +89,7 @@ export class LineEditor {
     this.listening = false;
     const { in: stdin, out } = this.opts;
     stdin.removeListener("data", this.handleData);
+    stdin.removeListener("data", this.handleStreamData);
     if (out.isTTY) out.write("\x1b[?2004l"); // bracketed paste off
     if (stdin.isTTY) {
       try {
@@ -97,21 +102,36 @@ export class LineEditor {
 
   /** Pause input handling and erase the rendered frame. Use during agent
    *  streaming so the prompt isn't sitting under the agent's output and
-   *  user keystrokes don't silently accumulate into the next message. */
+   *  user keystrokes don't silently accumulate into the next message.
+   *  Ctrl+C still routes (to onStreamCancel, falling back to onAbort) so
+   *  the user can interrupt a running turn — raw mode swallows the SIGINT
+   *  the OS would otherwise generate, so the editor has to read it itself. */
   suspend(): void {
     if (this.suspended) return;
     this.suspended = true;
     this.eraseRender();
     this.opts.in.removeListener("data", this.handleData);
+    this.opts.in.on("data", this.handleStreamData);
   }
 
   /** Resume after suspend(): re-attach the input listener and repaint. */
   resume(): void {
     if (!this.suspended) return;
     this.suspended = false;
+    this.opts.in.removeListener("data", this.handleStreamData);
     this.opts.in.on("data", this.handleData);
     this.render();
   }
+
+  /** Slim listener installed while suspended. Reads only Ctrl+C; drops
+   *  everything else on the floor. */
+  private handleStreamData = (chunk: string): void => {
+    if (chunk.includes("\x03")) {
+      const cb = this.opts.callbacks;
+      if (cb.onStreamCancel) cb.onStreamCancel();
+      else cb.onAbort();
+    }
+  };
 
   /** Set (or clear) the single ephemeral line painted directly above the
    *  prompt — status during idle, slash suggestions while typing `/…`.
@@ -145,6 +165,7 @@ export class LineEditor {
   refresh(): void {
     if (this.suspended) {
       this.suspended = false;
+      this.opts.in.removeListener("data", this.handleStreamData);
       this.opts.in.on("data", this.handleData);
     }
     this.render();
@@ -161,39 +182,60 @@ export class LineEditor {
     const lines = this.buffer.split("\n");
     const promptLen = visibleLen(this.opts.prompt);
     const contLen = visibleLen(this.opts.promptCont);
+    // Snapshot terminal width once per render. Cursor + erase math both
+    // need to agree on how many visual rows each buffer line occupies;
+    // ignoring wraps was the bug that printed the status line on every
+    // keystroke past the right margin (each render erased only logical
+    // rows so the wrapped portion above the cursor was never cleared).
+    const w = Math.max(1, this.opts.out.columns ?? 80);
+
     for (let i = 0; i < lines.length; i++) {
       out.write(i === 0 ? this.opts.prompt : this.opts.promptCont);
       out.write(lines[i]!);
       if (i < lines.length - 1) out.write("\n");
     }
 
-    const aboveRows = this.aboveLine !== null ? 1 : 0;
-    this.renderedRows = aboveRows + lines.length;
+    // Visual rows per buffer line, including soft-wraps. An empty line
+    // still occupies 1 row (the prompt is visible). promptVis + content
+    // length / width, ceiled, with min 1.
+    const visualRows = lines.map((line, i) => {
+      const promptVis = i === 0 ? promptLen : contLen;
+      return Math.max(1, Math.ceil((promptVis + line.length) / w));
+    });
+    const totalInputRows = visualRows.reduce((a, b) => a + b, 0);
 
-    // Find which rendered line + col the cursor lands on.
-    let inputRow = 0;
-    let inputCol = 0;
+    // Cursor's visual position within the input frame.
+    let inputVisualRow = 0;
+    let inputVisualCol = 0;
     let abs = 0;
+    let priorRows = 0;
     for (let i = 0; i < lines.length; i++) {
       const len = lines[i]!.length;
       if (this.cursor <= abs + len) {
-        inputRow = i;
-        inputCol = this.cursor - abs;
+        const promptVis = i === 0 ? promptLen : contLen;
+        const visualCol = promptVis + (this.cursor - abs);
+        inputVisualRow = priorRows + Math.floor(visualCol / w);
+        inputVisualCol = visualCol % w;
         break;
       }
-      abs += len + 1; // +1 for the implicit \n
+      abs += len + 1;
+      priorRows += visualRows[i]!;
     }
 
-    // After printing, cursor sits at end of last input line. Move up to
-    // the target line, then to its column.
-    const upFromEnd = lines.length - 1 - inputRow;
+    // Cursor parking: after writing a line whose visible length is a
+    // non-zero multiple of the width, the terminal parks the cursor at
+    // col=width on the same row. The next visible char would advance.
+    // For positioning math we treat that as "row N, col w" — moving up
+    // (visualRows-1 - inputRow) and then carriage-return + right-N lands
+    // correctly.
+    const upFromEnd = totalInputRows - 1 - inputVisualRow;
     if (upFromEnd > 0) out.write(`\x1b[${upFromEnd}A`);
     out.write("\r");
-    const promptVis = inputRow === 0 ? promptLen : contLen;
-    const targetCol = promptVis + inputCol;
-    if (targetCol > 0) out.write(`\x1b[${targetCol}C`);
+    if (inputVisualCol > 0) out.write(`\x1b[${inputVisualCol}C`);
 
-    this.renderedRow = aboveRows + inputRow;
+    const aboveRows = this.aboveLine !== null ? 1 : 0;
+    this.renderedRow = aboveRows + inputVisualRow;
+    this.renderedRows = aboveRows + totalInputRows;
 
     this.opts.callbacks.onChange?.(this.buffer);
   }
@@ -349,6 +391,18 @@ export class LineEditor {
       const ch = chunk[i]!;
 
       if (ch === "\r" || ch === "\n") {
+        // Paste-fallback heuristic. Bracketed paste (above) is the canonical
+        // path; this catches terminals that strip the markers (tmux without
+        // proper config, some SSH paths). A real Enter keypress arrives as
+        // its own 1-byte chunk; a paste arrives bundled. If there are more
+        // printable bytes after this newline in the same chunk, treat the
+        // newline as embedded — otherwise submit.
+        const after = chunk.slice(i + 1);
+        if (/[^\r\n]/.test(after)) {
+          this.insert("\n");
+          i += ch === "\r" && chunk[i + 1] === "\n" ? 2 : 1;
+          continue;
+        }
         this.submit();
         i++;
         continue;

@@ -832,6 +832,29 @@ The compacted `0001_init.sql` defines the final-state CREATE TABLE / CREATE INDE
 
 ---
 
+## 2026-04-28 — `olle chat` polish: paste fallback, Ctrl-C semantics, `chat.cancelled` event
+
+`olle chat` had two reported issues: (a) pastes containing newlines auto-submitted at the first newline, (b) no way to interrupt a streaming agent turn — Ctrl-C did nothing or quit. Both fixed; the architectural choices behind the fixes are worth recording.
+
+**On the framework question.** Considered swapping the hand-rolled raw-mode renderer for Ink, OpenTUI (opencode's choice), or terminal-kit. Rejected for v0:
+- Ink breaks `bun build --compile` (yoga.wasm bundling, top-level await — see Bun #13552). Single-binary distribution is load-bearing.
+- OpenTUI is v0.2 with native Zig deps and "not ready for production" per its own README. Adopting now would put renderer maintenance inside a surface the inhabitants couldn't realistically reshape.
+- The polished references that look best (Claude Code, opencode, Codex CLI) all use *alt-screen* + custom scrollback. That's why their copy/scroll bug-class exists — they fight the terminal for what the terminal already does well. OLL-E's renderer writes to native scrollback; mouse copy and `Ctrl+B [` scroll-up still work. Keeping that property is more agentic-feeling than the polished-but-trapped alternative.
+
+**Paste fallback heuristic.** Bracketed paste (`\x1b[?2004h`) is the canonical path and was already implemented. The bug appeared when terminals/multiplexers stripped the markers (tmux without proper config, some SSH paths). Added a heuristic in `line-editor.ts`: if a chunk contains a newline followed by more printable bytes in the same chunk, treat the newline as embedded (insert) rather than submit. Single Enter keypresses arrive as their own 1-byte chunk; pastes arrive bundled. The bracketed path still wins when present; this just stops the silent failure mode.
+
+**Ctrl-C semantics.** Raw mode disables OS-level SIGINT generation, so `process.on("SIGINT")` never fires while the editor is active — every Ctrl-C must be read off `stdin` directly. New behavior:
+- *Idle:* first Ctrl-C arms a "press again within 2s to exit" hint above the prompt; second Ctrl-C exits. One-tap exit is too easy to hit accidentally when the buffer has half a message.
+- *Streaming:* Ctrl-C cancels the in-flight turn (LLM stream aborted at network level via `AbortSignal`), emits a `chat.cancelled` event, and returns control to the prompt. The user does not have to wait out the rest of the response just to redirect.
+
+**`chat.cancelled` is a distinct event, not a flavor of `chat.error`.** The chat-health monitor escalates repeated `chat.error`s to an inbox proposal (the system thinks chat is crashing). User-initiated cancellations would otherwise look like a crash loop to the monitor and start filing false-positive diagnostics. Distinct event = correct semantics: cancellation is a normal user-driven outcome, not a fault.
+
+**Plumbing.** `AbortSignal` flows: `LineEditor.onStreamCancel` → `cancelTurn()` → IPC `chat.cancel({threadId})` → `AgentLoop.cancel(threadId)` → per-thread `AbortController` → `runAgent` `signal` → `CompletionRequest.signal` → Anthropic SDK `messages.stream(params, {signal})`. Same signal also lands in `toolCtx.abort` so a future tool that respects abort gets cancelled too. The retry layer in `anthropic.ts` does not retry `AbortError` (only `APIError`), so cancellation propagates cleanly through.
+
+**Polish that was deferred.** Considered an in-editor large-paste collapse (`[Pasted N lines]` placeholder) and `$EDITOR` escape. Both require a buffer-segment refactor of `LineEditor` (cursor/row math currently assumes a flat string). Not blocking; revisit when paste sizes start hurting visually or when users start asking for `$EDITOR`.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.
