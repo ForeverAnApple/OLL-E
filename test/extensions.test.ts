@@ -286,6 +286,72 @@ describe("manifest validation", () => {
     expect(row?.status).toBe("inactive");
   });
 
+  it("unsubscribes listeners attached before a mid-register throw", async () => {
+    const r = rig();
+    let observed = 0;
+    r.bus.subscribe("chat.input", () => {
+      // sentinel — this listener stays for the whole test, separate from
+      // the one the extension installs. Used only to confirm publish
+      // actually reaches the bus.
+    });
+    writeExt(tmp, "leaky", {
+      manifest: {
+        name: "leaky",
+        version: "0.1.0",
+        eventReads: ["chat.input"],
+      },
+      index: `
+        export function register(api) {
+          api.on("chat.input", () => { globalThis.__leakyHits = (globalThis.__leakyHits ?? 0) + 1; });
+          throw new Error("boom after subscribe");
+        }
+      `,
+    });
+    (globalThis as unknown as { __leakyHits?: number }).__leakyHits = 0;
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("leaky")).rejects.toThrow(/boom after subscribe/);
+
+    r.bus.publish({
+      type: "chat.input",
+      payload: { text: "after-failed-load" },
+      hostId: r.hostId,
+      actorId: "test",
+      durable: true,
+    });
+    observed = (globalThis as unknown as { __leakyHits: number }).__leakyHits;
+    expect(observed).toBe(0);
+  });
+
+  it("does not stack listeners across repeated failed loads", async () => {
+    const r = rig();
+    writeExt(tmp, "stacker", {
+      manifest: {
+        name: "stacker",
+        version: "0.1.0",
+        eventReads: ["chat.input"],
+      },
+      index: `
+        export function register(api) {
+          api.on("chat.input", () => { globalThis.__stackerHits = (globalThis.__stackerHits ?? 0) + 1; });
+          throw new Error("always boom");
+        }
+      `,
+    });
+    (globalThis as unknown as { __stackerHits?: number }).__stackerHits = 0;
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    for (let i = 0; i < 4; i++) {
+      await expect(host.load("stacker")).rejects.toThrow(/always boom/);
+    }
+    r.bus.publish({
+      type: "chat.input",
+      payload: { text: "hi" },
+      hostId: r.hostId,
+      actorId: "test",
+      durable: true,
+    });
+    expect((globalThis as unknown as { __stackerHits: number }).__stackerHits).toBe(0);
+  });
+
   it("registerTool is first-wins on name collision", async () => {
     const r = rig();
     writeExt(tmp, "first", {

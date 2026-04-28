@@ -576,12 +576,17 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     }
 
     const { api, unsubs } = makeApi(manifest, extensionId, extDir);
+    // Track subs *before* register runs so a partial register (e.g. one
+    // that subscribes to several events, then throws on the next api.on
+    // because of a manifest gate) is fully reachable by purgeRegistry.
+    // The unsubs array is captured by reference inside makeApi, so every
+    // api.on() pushes onto the same list this map holds.
+    subs.set(name, unsubs);
     // Transactional registration: any throw between register() and the
     // final loaded.set must roll back all in-memory side effects, or the
     // next load attempt collides with orphaned tools/subs/triggers.
     try {
       await impl.register(api);
-      subs.set(name, unsubs);
       await startTriggers(extensionId, manifest);
     } catch (err) {
       await purgeRegistry(extensionId, name);
