@@ -42,9 +42,12 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  // Order matters: child tables (FK -> decisions) before decisions itself.
+  // Order matters: walk leaf-to-root through the FK graph.
   daemon.store.raw.exec(
-    "DELETE FROM decision_messages; DELETE FROM approvals; DELETE FROM decisions;",
+    "DELETE FROM decision_message_reads;" +
+      " DELETE FROM decision_messages;" +
+      " DELETE FROM approvals;" +
+      " DELETE FROM decisions;",
   );
 });
 
@@ -91,16 +94,65 @@ describe("inbox.* IPC", () => {
   it("inbox.get returns full row plus reply messages; missing id errors", async () => {
     const { id } = seedDecision(daemon);
     daemon.inbox.reply({ decisionId: id, actorId: daemon.rootAgentId, text: "shipped abc" });
-    const r = await client.call<Decision & { messages: Array<{ text: string; actorId: string }> }>(
-      "inbox.get",
-      { id },
-    );
+    const r = await client.call<
+      Decision & {
+        messages: Array<{ text: string; actorId: string; actorName: string; read: boolean }>;
+      }
+    >("inbox.get", { id });
     expect(r.id).toBe(id);
     expect(r.payload).toEqual({ ext: "discord" });
     expect(r.messages).toHaveLength(1);
     expect(r.messages[0]!.text).toBe("shipped abc");
     expect(r.messages[0]!.actorId).toBe(daemon.rootAgentId);
+    // actorName resolves the display name so the CLI doesn't show raw ULIDs.
+    expect(r.messages[0]!.actorName).toBe("root");
+    // First read returns read:false (the principal hadn't seen it before).
+    expect(r.messages[0]!.read).toBe(false);
     await expect(client.call("inbox.get", { id: "nope" })).rejects.toThrow(/not found/);
+  });
+
+  it("inbox.get auto-marks replies read; subsequent gets return read:true", async () => {
+    const { id } = seedDecision(daemon);
+    daemon.inbox.reply({ decisionId: id, actorId: daemon.rootAgentId, text: "first" });
+    daemon.inbox.reply({ decisionId: id, actorId: daemon.rootAgentId, text: "second" });
+    const first = await client.call<{ messages: Array<{ read: boolean }> }>("inbox.get", { id });
+    expect(first.messages.every((m) => !m.read)).toBe(true);
+    const second = await client.call<{ messages: Array<{ read: boolean }> }>("inbox.get", { id });
+    expect(second.messages.every((m) => m.read)).toBe(true);
+    // A new reply lands → only that one is unread on the next get.
+    daemon.inbox.reply({ decisionId: id, actorId: daemon.rootAgentId, text: "third" });
+    const third = await client.call<{ messages: Array<{ read: boolean; text: string }> }>(
+      "inbox.get",
+      { id },
+    );
+    const unreadTexts = third.messages.filter((m) => !m.read).map((m) => m.text);
+    expect(unreadTexts).toEqual(["third"]);
+  });
+
+  it("inbox.get with markRead:false does NOT advance the read state", async () => {
+    const { id } = seedDecision(daemon);
+    daemon.inbox.reply({ decisionId: id, actorId: daemon.rootAgentId, text: "x" });
+    await client.call("inbox.get", { id, markRead: false });
+    // Second call with default markRead still sees the message as unread,
+    // because the first call didn't mark it.
+    const r = await client.call<{ messages: Array<{ read: boolean }> }>("inbox.get", { id });
+    expect(r.messages[0]!.read).toBe(false);
+  });
+
+  it("inbox.list enriches each row with unreadReplyCount", async () => {
+    const { id: d1 } = seedDecision(daemon, "first");
+    seedDecision(daemon, "second");
+    daemon.inbox.reply({ decisionId: d1, actorId: daemon.rootAgentId, text: "a" });
+    daemon.inbox.reply({ decisionId: d1, actorId: daemon.rootAgentId, text: "b" });
+    const rows = await client.call<Array<Decision & { unreadReplyCount: number }>>("inbox.list");
+    const row1 = rows.find((r) => r.id === d1)!;
+    const row2 = rows.find((r) => r.summary === "second")!;
+    expect(row1.unreadReplyCount).toBe(2);
+    expect(row2.unreadReplyCount).toBe(0);
+    // After viewing d1 (which auto-marks read), the list count drops.
+    await client.call("inbox.get", { id: d1 });
+    const after = await client.call<Array<Decision & { unreadReplyCount: number }>>("inbox.list");
+    expect(after.find((r) => r.id === d1)!.unreadReplyCount).toBe(0);
   });
 
   it("inbox.get/respond accept a unique id prefix (CLI paste-friendly)", async () => {

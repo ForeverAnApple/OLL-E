@@ -761,6 +761,42 @@ Three shapes were considered:
 
 ---
 
+## 2026-04-28 — `threadInventory` cache stats sourced from `chat.turn-end`, not `chat.usage`
+
+`query_my_threads` was reporting `cacheHitRatio: 0` on every live thread in production. Root cause: `threadInventory` folded cache fields from `chat.usage` events queried from the durable events table, but `chat.usage` is published with `durable: false` (it's the per-call live stream for CLI tail / future bridges, intentionally not persisted — see `chat.ts` `kind === "usage"` branch). The events table never has `chat.usage` rows, so the rollup was always empty. The pre-existing observability test passed because its fixture published `chat.usage` with `durable: true`, which doesn't match production.
+
+**Decision: read cache fields from `chat.turn-end` instead.** That event is already durable, fires once per turn (one row per turn instead of one per inner round-trip), and carries `inputTokens` + `cacheReadTokens` + `cacheCreationTokens` + `totalTokens` directly. Considered the alternative (flip `chat.usage` to `durable: true`): rejected because it would write 5–10× more event rows for the same information and `chat.usage` is by-design transient — its job is the *live* stream, the durable record is `chat.turn-end`. The fix was a four-line change in `threadInventory` plus the field-name update (`cacheReadInputTokens` → `cacheReadTokens` to match the turn-end payload shape).
+
+The all-time cache-ratio rollup in `usageStats` was unaffected — it reads the ledger, which is correctly populated. The artifact users were seeing in `query_my_threads` (0 ratio on a thread that was clearly hitting cache) is gone.
+
+---
+
+## 2026-04-28 — Inbox UI/UX: read tracking, unread badges, visibility-first show view
+
+Manual-test of `mail_reply` (LOG 2026-04-27) revealed the next visibility gap: the principal had no way to know an agent had replied. `olle inbox list` showed the same row as before; nothing distinguished "agent posted a follow-up" from "no change since I last looked." Read tracking was the obvious fix; the rest of the cut leaned into "visibility-first" — colored glyphs, unread badges, generous whitespace, `[NEW]` markers on previously-unread replies in the show view, and a sectioned layout that gives the proposal, payload, and reply thread their own breathing room.
+
+**The shape that landed:**
+
+- **Migration `0008_decision_message_reads.sql`** — `(message_id, reader_actor_id, at)` composite PK plus `reader_actor_id` index. Same shape as `memory_reads`. Federation-ready: per-reader rows mean future quorum-of-principals or team-shared inboxes work without schema change. Single-principal v0 always carries the root principal as reader.
+- **Inbox APIs** — `markDecisionRead(decisionId, readerActorId)` (idempotent, returns count newly marked), `readMessageIdsFor(decisionId, readerActorId)` (Set, used to render `[NEW]` flags), and `unreadCountsByDecision(decisionIds, readerActorId)` (bulk Map for listing badges, two queries instead of N+1).
+- **IPC enrichment** — `inbox.list` adds `unreadReplyCount` per row. `inbox.get` adds `messages: [...]` with each carrying `read: boolean` (state captured *before* this call's side-effects) AND auto-marks all replies read for the requester. `markRead: false` opt-out for observability peeks. Default reader is the root principal. Same handler also resolves `actorName` for each message via the existing enrichment pattern, so the CLI doesn't print 26-char ULIDs where a name fits.
+- **`olle inbox list`** — colored status glyphs (cyan-bold when unread replies are waiting, otherwise yellow=open / green=approved / red=denied / cyan=modified / gray=stale), bold-cyan `(N new)` badge appended to summaries with unread, and a header line showing total + total-unread when non-zero. Generous summary width.
+- **`olle inbox show <id>`** — restructured: title block (id + double-rule), key-value pairs (status / tier / from / to / age / stale / resolved) on indented lines, wrapped summary with breathing room, `── payload ──` rule before the JSON, `── replies (N) · M new ──` rule before the threaded replies. Each reply gets a timestamp, author name, optional `[NEW]` cyan tag, and indented body with soft-wrap. Auto-marked-read by the IPC handler.
+- **TUI** — list rows now show the cyan-bold glyph + `(N new)` badge when unread. Preview pane gained a replies block at the bottom rendered in the same shape as the CLI show. Selection-changes fire an async `inbox.get` (auto-marks read, refreshes the listing); listing's unread badge drops on next refresh. Detail-fetch dedupes against the cached selection so navigation doesn't thrash IPC.
+
+**The four design calls:**
+
+1. **Auto-mark on view.** Considered explicit `mail_ack` (more agentic-feeling, principal in control). Rejected for the principal-facing surface: the principal's role here is *consumer*, not author. Forcing them to ack each reply would be the same nagging-discipline anti-pattern we rejected for the agent-facing sidebar (LOG 2026-04-27). Opening the decision IS reading it. The `markRead: false` flag exists for the rare programmatic peek. Symmetric to how the agent-side sidebar auto-acks on render.
+2. **Unread state per-reader, not per-message.** The state needing per-reader split is "did *I* see this," not "has anyone seen this." `decision_message_reads` is the right shape; a `read_at` column on `decision_messages` would either lock us to single-reader or muddle the semantics. Cost: one more table; gain: the federation seam is honest.
+3. **Cyan-bold for "needs attention."** ANSI color choices land on convention: yellow=open (waiting), green=approved (done well), red=denied, cyan=modified, gray=stale. Cyan-bold reserved for "you have unread replies" because it's the signal we want eye-catching without being alarming (red would imply error). Single-color signaling beats glyph-substitution for accessibility — even on color-blind terminals the badge text still reads clearly.
+4. **One-call list view.** `inbox.list` could have stayed plain and `unreadReplyCount` could ride a separate `inbox.unreadCount` call. Rejected: the listing shows N rows and would do N round-trips, defeating the rendering UX work. Bulk enrichment server-side keeps the listing snappy and the CLI/TUI dumb.
+
+**One `[DEFERRED]` item:**
+
+- **Mark-unread / per-message granular state.** Today the principal gets one knob: viewing the decision marks ALL replies on it read. No way to revisit a single reply as "I want to come back to this." Considered: `mail_unread(decisionId, messageId?)` tool, or a TUI hotkey. Skipped because no concrete need yet — the search/scan affordances cover "find that reply again." **Resurrect when:** a real workflow needs revisit-tracking on individual messages (likely paired with bridges that push notifications, where re-surfacing matters).
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.

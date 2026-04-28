@@ -62,6 +62,23 @@ interface InboxRow {
   staleness: number | null;
   createdAt: number;
   resolvedAt: number | null;
+  /** Per-decision unread reply count for the principal — emitted by
+   *  `inbox.list`. Drives the "(N new)" badge in the row. */
+  unreadReplyCount?: number;
+}
+
+interface DecisionMessageRow {
+  id: string;
+  decisionId: string;
+  actorId: string;
+  /** Display name for `actorId`, resolved server-side. */
+  actorName?: string;
+  text: string;
+  at: number;
+  /** Whether this message had been seen by the principal BEFORE the
+   *  current `inbox.get` call returned. (The handler auto-marks-read
+   *  at the same time it captures this state.) */
+  read?: boolean;
 }
 
 export interface InboxTuiOptions {
@@ -142,6 +159,12 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
 
   let rows: InboxRow[] = [];
   let visible: InboxRow[] = [];
+  // Cache of replies + unread state for the currently-selected decision.
+  // Populated by an async fetch that runs whenever selection changes; the
+  // preview pane reads this synchronously when rendering. Auto-marks read
+  // on the IPC side so the listing's unreadReplyCount drops on next refresh.
+  let detailMessages: DecisionMessageRow[] | null = null;
+  let detailDecisionId: string | null = null;
   let filterAll = false;
   let selected = 0;
   let listOffset = 0;
@@ -192,6 +215,38 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
       rows = [];
     }
     applyFilter();
+  }
+
+  /** Async-fetch the selected decision's replies + read state. Auto-marks
+   *  read server-side. Re-fetches the listing afterward so the unread
+   *  badge on the row drops to 0. Idempotent on the same selection (no
+   *  thrashing). */
+  async function fetchDetail(): Promise<void> {
+    const r = current();
+    if (!r) {
+      detailMessages = null;
+      detailDecisionId = null;
+      return;
+    }
+    if (detailDecisionId === r.id && detailMessages !== null) {
+      // Already loaded for this selection.
+      return;
+    }
+    try {
+      const got = await client.call<{ messages?: DecisionMessageRow[] }>("inbox.get", {
+        id: r.id,
+      });
+      detailDecisionId = r.id;
+      detailMessages = got.messages ?? [];
+      // Refresh listing so the row's unreadReplyCount drops to 0.
+      const hadUnread = (r.unreadReplyCount ?? 0) > 0;
+      if (hadUnread) {
+        await fetch();
+      }
+      render();
+    } catch (e) {
+      setStatus(`detail fetch failed: ${(e as Error).message}`, 5000);
+    }
   }
 
   function applyFilter(): void {
@@ -247,6 +302,17 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
     renderPreview(cols, prevH);
     renderStatus(cols);
     flush();
+
+    // After painting, kick an async detail fetch if the selection has
+    // moved off the cached row. The fetch auto-marks-read on the IPC
+    // side, refreshes the listing, and re-renders. Fire-and-forget;
+    // fetchDetail dedupes against detailDecisionId.
+    const sel = current();
+    if (sel && detailDecisionId !== sel.id) {
+      detailMessages = null;
+      detailDecisionId = null;
+      void fetchDetail();
+    }
   }
 
   function renderHeader(cols: number): void {
@@ -278,7 +344,6 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
     const idW = 10;
     const ageW = 5;
     const tierW = 12;
-    const summaryW = Math.max(20, cols - (3 + idW + 2 + tierW + 2 + ageW + 2 + 2));
     for (let i = 0; i < h; i++) {
       const idx = listOffset + i;
       if (idx >= visible.length) {
@@ -287,7 +352,13 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
       }
       const r = visible[idx]!;
       const cur = idx === selected;
-      const glyph = statusGlyph(r.status);
+      const unread = r.unreadReplyCount ?? 0;
+      // Cyan-bold glyph when unread replies are waiting — reads as
+      // higher-priority than the open-yellow it overrides.
+      const glyph =
+        unread > 0
+          ? `${ANSI.bold}${ANSI.cyan}${STATUS_GLYPHS[r.status]?.replace(/\x1b\[[0-9;]*m/g, "") ?? "●"}${ANSI.reset}`
+          : statusGlyph(r.status);
       const tier = `${tierColor(r.tier)}${r.tier}${ANSI.reset}`;
       const id = `${ANSI.dim}${r.id.slice(0, idW)}${ANSI.reset}`;
       const age = fmtAge(now - r.createdAt);
@@ -301,7 +372,11 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
       const fromTag = r.proposingAgentName
         ? `${ANSI.dim}[${r.proposingAgentName}]${ANSI.reset} `
         : "";
-      const lineRaw = ` ${glyph}${stale} ${id}  ${pad(tier, tierW)}  ${pad(age, ageW)}  ${fromTag}${summary}`;
+      const unreadBadge =
+        unread > 0
+          ? `  ${ANSI.bold}${ANSI.cyan}(${unread} new)${ANSI.reset}`
+          : "";
+      const lineRaw = ` ${glyph}${stale} ${id}  ${pad(tier, tierW)}  ${pad(age, ageW)}  ${fromTag}${summary}${unreadBadge}`;
       let line = clip(lineRaw, cols);
       if (cur) {
         // Strip ANSI inside selected line then inverse-paint: highlights
@@ -400,6 +475,63 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
       }
       out.push(`  ${rest}`);
     }
+
+    // Replies block — surfaces agent follow-ups (mail_reply) inline.
+    // Loaded async by fetchDetail() when this row gets selected; if the
+    // load hasn't landed yet, leave it out (the next render will show it).
+    if (detailDecisionId === r.id && detailMessages !== null && detailMessages.length > 0) {
+      const newCount = detailMessages.filter((m) => !m.read).length;
+      const header =
+        `${ANSI.dim}── replies (${detailMessages.length})${ANSI.reset}` +
+        (newCount > 0
+          ? `  ${ANSI.bold}${ANSI.cyan}· ${newCount} new${ANSI.reset}`
+          : "");
+      out.push("");
+      out.push(header);
+      for (const m of detailMessages) {
+        const when = formatTimestamp(m.at);
+        const newTag = m.read ? "" : `  ${ANSI.bold}${ANSI.cyan}[NEW]${ANSI.reset}`;
+        const author = m.actorName ?? m.actorId;
+        out.push("");
+        out.push(
+          `  ${ANSI.dim}· ${when}${ANSI.reset}  ${ANSI.bold}${author}${ANSI.reset}${newTag}`,
+        );
+        const limit = Math.max(20, cols - 6);
+        for (const para of m.text.split("\n")) {
+          for (const wrapped of softWrap(para, limit)) {
+            out.push(`      ${wrapped}`);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  function formatTimestamp(at: number): string {
+    const d = new Date(at);
+    const Y = d.getFullYear();
+    const M = String(d.getMonth() + 1).padStart(2, "0");
+    const D = String(d.getDate()).padStart(2, "0");
+    const h = String(d.getHours()).padStart(2, "0");
+    const m = String(d.getMinutes()).padStart(2, "0");
+    return `${Y}-${M}-${D} ${h}:${m}`;
+  }
+
+  function softWrap(text: string, width: number): string[] {
+    if (text.length === 0) return [""];
+    const out: string[] = [];
+    let line = "";
+    for (const word of text.split(/\s+/)) {
+      if (line.length === 0) {
+        line = word;
+      } else if (line.length + 1 + word.length <= width) {
+        line += " " + word;
+      } else {
+        out.push(line);
+        line = word;
+      }
+    }
+    if (line.length > 0) out.push(line);
     return out;
   }
 

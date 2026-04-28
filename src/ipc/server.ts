@@ -15,7 +15,13 @@ import { history, revertSubtree } from "../extensions/git.ts";
 import { installStarter, listStarters } from "../starters/index.ts";
 import type { OllePaths } from "../paths.ts";
 import type { Store } from "../store/index.ts";
-import { enrichDecision, enrichDecisions, type Inbox, type UserVote } from "../inbox/index.ts";
+import {
+  enrichDecision,
+  enrichDecisionMessages,
+  enrichDecisions,
+  type Inbox,
+  type UserVote,
+} from "../inbox/index.ts";
 import {
   agentSelf,
   budgetStatus,
@@ -449,7 +455,19 @@ async function dispatch(
         const rows =
           status === "all" ? opts.inbox.listAll(principalId) : opts.inbox.listOpen(principalId);
         const enriched = opts.store ? enrichDecisions(opts.store, rows) : rows;
-        send({ id: req.id, ok: true, value: enriched });
+        // Per-decision unread reply counts for the principal — backs the
+        // "(N new)" badge on the listing UI. One pair of queries for the
+        // whole batch (no N+1).
+        const reader = principalId;
+        const unread = opts.inbox.unreadCountsByDecision(
+          enriched.map((r) => r.id),
+          reader,
+        );
+        const withUnread = enriched.map((r) => ({
+          ...r,
+          unreadReplyCount: unread.get(r.id) ?? 0,
+        }));
+        send({ id: req.id, ok: true, value: withUnread });
         return;
       }
       case "inbox.get": {
@@ -468,14 +486,34 @@ async function dispatch(
           return;
         }
         const enriched = opts.store ? enrichDecision(opts.store, row) : row;
-        // Also pull the reply messages so the CLI can render the full
-        // thread without a second round-trip — keeps `olle inbox show`
-        // a single call. Cheap query (indexed on decision_id, at).
+        // Pull replies + per-message read state for this reader BEFORE
+        // marking-as-read, so the CLI can render `[NEW]` markers on
+        // previously-unread rows in the same view that acks them.
+        const reader =
+          (req.params?.readerActorId as string | undefined) ??
+          opts.rootPrincipalId ??
+          "principal";
         const messages = opts.inbox.listMessages(row.id);
+        const wasRead = opts.inbox.readMessageIdsFor(row.id, reader);
+        const enrichedMessages = opts.store
+          ? enrichDecisionMessages(opts.store, messages)
+          : messages.map((m) => ({ ...m, actorName: m.actorId }));
+        const messagesWithRead = enrichedMessages.map((m) => ({
+          ...m,
+          read: wasRead.has(m.id),
+        }));
+        // Auto-mark on view: opening the decision IS reading it. Avoids
+        // a second IPC round-trip and keeps the badge accurate without
+        // discipline. Pass markRead:false to suppress (e.g. observability
+        // peeks). Idempotent.
+        const shouldMark = req.params?.markRead !== false;
+        if (shouldMark && messages.length > 0) {
+          opts.inbox.markDecisionRead(row.id, reader);
+        }
         send({
           id: req.id,
           ok: true,
-          value: { ...enriched, messages },
+          value: { ...enriched, messages: messagesWithRead },
         });
         return;
       }

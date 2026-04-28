@@ -158,7 +158,7 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
     category: "observability",
     shortClause: "threads addressed to your mailbox, with cache stats",
     description:
-      "List threads addressed to your mailbox, ordered by most-recent activity. Each row carries that thread's cache hit ratio (computed from chat.usage events seen in the scan window). Complements the per-turn mailbox sidebar by surfacing durable thread data that the sidebar elides — useful before delegating, retargeting, or auditing children's work.",
+      "List threads addressed to your mailbox, ordered by most-recent activity. Each row carries that thread's cache hit ratio (computed from chat.turn-end events seen in the scan window). Complements the per-turn mailbox sidebar by surfacing durable thread data that the sidebar elides — useful before delegating, retargeting, or auditing children's work.",
     inputSchema: {
       type: "object",
       properties: {

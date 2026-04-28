@@ -79,6 +79,20 @@ export interface Inbox {
    *  with the proposal + approvals in `olle inbox show <id>` and the
    *  agent's `mail_list` enrichment. */
   listMessages(decisionId: string): DecisionMessage[];
+  /** Mark every reply on a decision as read by `readerActorId`. Idempotent.
+   *  Returns the count of messages newly marked (rows that already had a
+   *  read entry are not re-counted). Backs the auto-mark-on-view UX. */
+  markDecisionRead(decisionId: string, readerActorId: string): number;
+  /** Per-decision unread reply counts for a single reader. Used to render
+   *  the "(N new)" badge on `olle inbox` listings without N+1 queries. */
+  unreadCountsByDecision(
+    decisionIds: string[],
+    readerActorId: string,
+  ): Map<string, number>;
+  /** For a single decision, return the set of message ids the reader has
+   *  already seen. Lets `inbox.show` render `[NEW]` on previously-unread
+   *  messages while still auto-marking-read on the same call. */
+  readMessageIdsFor(decisionId: string, readerActorId: string): Set<string>;
   sweepStale(nowMs?: number): number;
 }
 
@@ -290,6 +304,87 @@ export function createInbox(opts: InboxOptions): Inbox {
       .all();
   }
 
+  function markDecisionRead(decisionId: string, readerActorId: string): number {
+    const messages = store
+      .select({ id: tables.decisionMessages.id })
+      .from(tables.decisionMessages)
+      .where(eq(tables.decisionMessages.decisionId, decisionId))
+      .all();
+    if (messages.length === 0) return 0;
+    const already = readMessageIdsFor(decisionId, readerActorId);
+    const now = Date.now();
+    let added = 0;
+    for (const m of messages) {
+      if (already.has(m.id)) continue;
+      store
+        .insert(tables.decisionMessageReads)
+        .values({ messageId: m.id, readerActorId, at: now })
+        .onConflictDoNothing()
+        .run();
+      added += 1;
+    }
+    return added;
+  }
+
+  function readMessageIdsFor(decisionId: string, readerActorId: string): Set<string> {
+    // Inner join: messages on this decision that have a read row for this reader.
+    const rows = store
+      .select({ id: tables.decisionMessages.id })
+      .from(tables.decisionMessages)
+      .innerJoin(
+        tables.decisionMessageReads,
+        eq(tables.decisionMessageReads.messageId, tables.decisionMessages.id),
+      )
+      .where(
+        and(
+          eq(tables.decisionMessages.decisionId, decisionId),
+          eq(tables.decisionMessageReads.readerActorId, readerActorId),
+        ),
+      )
+      .all();
+    return new Set(rows.map((r) => r.id));
+  }
+
+  function unreadCountsByDecision(
+    decisionIds: string[],
+    readerActorId: string,
+  ): Map<string, number> {
+    const out = new Map<string, number>();
+    if (decisionIds.length === 0) return out;
+    // Fetch all messages for the given decisions, plus this reader's reads,
+    // then bucket. Two queries beats N+1 and the rows are bounded.
+    const messages = store
+      .select({
+        id: tables.decisionMessages.id,
+        decisionId: tables.decisionMessages.decisionId,
+      })
+      .from(tables.decisionMessages)
+      .where(inArray(tables.decisionMessages.decisionId, decisionIds))
+      .all();
+    if (messages.length === 0) {
+      for (const d of decisionIds) out.set(d, 0);
+      return out;
+    }
+    const messageIds = messages.map((m) => m.id);
+    const reads = store
+      .select({ messageId: tables.decisionMessageReads.messageId })
+      .from(tables.decisionMessageReads)
+      .where(
+        and(
+          inArray(tables.decisionMessageReads.messageId, messageIds),
+          eq(tables.decisionMessageReads.readerActorId, readerActorId),
+        ),
+      )
+      .all();
+    const readSet = new Set(reads.map((r) => r.messageId));
+    for (const d of decisionIds) out.set(d, 0);
+    for (const m of messages) {
+      if (readSet.has(m.id)) continue;
+      out.set(m.decisionId, (out.get(m.decisionId) ?? 0) + 1);
+    }
+    return out;
+  }
+
   function sweepStale(nowMs: number = Date.now()): number {
     const open = store
       .select()
@@ -336,6 +431,9 @@ export function createInbox(opts: InboxOptions): Inbox {
     respond,
     reply,
     listMessages,
+    markDecisionRead,
+    readMessageIdsFor,
+    unreadCountsByDecision,
     sweepStale,
   };
 }

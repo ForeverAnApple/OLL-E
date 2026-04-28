@@ -277,6 +277,73 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
     expect(list.map((m) => m.text)).toEqual(["first", "second", "third"]);
   });
 
+  it("markDecisionRead is idempotent and per-reader", () => {
+    const r = rig();
+    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { id: did } = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "x",
+      payload: {},
+    });
+    r.inbox.reply({ decisionId: did, actorId: "proposer", text: "a" });
+    r.inbox.reply({ decisionId: did, actorId: "proposer", text: "b" });
+
+    // Reader X marks all → 2 newly marked.
+    expect(r.inbox.markDecisionRead(did, "reader-x")).toBe(2);
+    // Idempotent — re-marking adds nothing.
+    expect(r.inbox.markDecisionRead(did, "reader-x")).toBe(0);
+    // Reader Y is independent.
+    expect(r.inbox.markDecisionRead(did, "reader-y")).toBe(2);
+    // X's read set covers both messages.
+    expect(r.inbox.readMessageIdsFor(did, "reader-x").size).toBe(2);
+    // A new reply lands → reader X has one unread again.
+    r.inbox.reply({ decisionId: did, actorId: "proposer", text: "c" });
+    const counts = r.inbox.unreadCountsByDecision([did], "reader-x");
+    expect(counts.get(did)).toBe(1);
+  });
+
+  it("unreadCountsByDecision returns 0 for decisions with no replies and is bulk-correct", () => {
+    const r = rig();
+    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { id: d1 } = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "one",
+      payload: {},
+    });
+    const { id: d2 } = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "two",
+      payload: {},
+    });
+    const { id: d3 } = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "three",
+      payload: {},
+    });
+    r.inbox.reply({ decisionId: d1, actorId: "proposer", text: "x" });
+    r.inbox.reply({ decisionId: d1, actorId: "proposer", text: "y" });
+    r.inbox.reply({ decisionId: d3, actorId: "proposer", text: "z" });
+
+    const counts = r.inbox.unreadCountsByDecision([d1, d2, d3], "reader");
+    expect(counts.get(d1)).toBe(2);
+    expect(counts.get(d2)).toBe(0);
+    expect(counts.get(d3)).toBe(1);
+
+    // After marking d1 read, it drops to 0 but d3 stays 1.
+    r.inbox.markDecisionRead(d1, "reader");
+    const after = r.inbox.unreadCountsByDecision([d1, d2, d3], "reader");
+    expect(after.get(d1)).toBe(0);
+    expect(after.get(d3)).toBe(1);
+  });
+
   it("textPreview truncates long bodies in the event payload (full text in row)", () => {
     const r = rig();
     const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });

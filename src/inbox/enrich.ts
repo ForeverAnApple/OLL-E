@@ -10,7 +10,7 @@
 import { inArray } from "drizzle-orm";
 import type { Store } from "../store/db.ts";
 import { tables } from "../store/index.ts";
-import type { Decision } from "../store/schema.ts";
+import type { Decision, DecisionMessage } from "../store/schema.ts";
 
 export interface EnrichedDecision extends Decision {
   /** `agents.name` for `proposingAgentId`; falls back to the id when the
@@ -19,6 +19,13 @@ export interface EnrichedDecision extends Decision {
   proposingAgentName: string;
   /** `principals.display` for `principalId`; falls back to id. */
   principalDisplay: string;
+}
+
+export interface EnrichedDecisionMessage extends DecisionMessage {
+  /** Display name for `actorId`. Looks up `agents.name` first, then
+   *  `principals.display`, falls back to the raw id. The CLI/TUI use
+   *  this so the inbox view shows "root" instead of a 26-char ULID. */
+  actorName: string;
 }
 
 export function enrichDecision(store: Store, d: Decision): EnrichedDecision {
@@ -46,4 +53,31 @@ export function enrichDecisions(store: Store, ds: Decision[]): EnrichedDecision[
     proposingAgentName: agentMap.get(d.proposingAgentId) ?? d.proposingAgentId,
     principalDisplay: principalMap.get(d.principalId) ?? d.principalId,
   }));
+}
+
+/** Resolve display names for a batch of decision messages. Looks each
+ *  actor_id up in `agents.name`, then `principals.display`, then falls
+ *  back to the raw id. One pair of queries for the batch (no N+1). */
+export function enrichDecisionMessages<T extends DecisionMessage>(
+  store: Store,
+  msgs: T[],
+): Array<T & { actorName: string }> {
+  if (msgs.length === 0) return [];
+  const ids = Array.from(new Set(msgs.map((m) => m.actorId)));
+  const agentRows = store
+    .select({ id: tables.agents.id, name: tables.agents.name })
+    .from(tables.agents)
+    .where(inArray(tables.agents.id, ids))
+    .all();
+  const principalRows = store
+    .select({ id: tables.principals.id, display: tables.principals.display })
+    .from(tables.principals)
+    .where(inArray(tables.principals.id, ids))
+    .all();
+  const nameMap = new Map<string, string>();
+  for (const p of principalRows) nameMap.set(p.id, p.display);
+  // Agent name wins on conflict — agents are the more common authors and
+  // `principals` is collapsing into `agents` long-term anyway (LOG 2026-04-23).
+  for (const a of agentRows) nameMap.set(a.id, a.name);
+  return msgs.map((m) => ({ ...m, actorName: nameMap.get(m.actorId) ?? m.actorId }));
 }

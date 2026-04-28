@@ -1333,6 +1333,8 @@ interface InboxRow {
   id: string;
   principalId: string;
   proposingAgentId: string;
+  proposingAgentName?: string;
+  principalDisplay?: string;
   tier: string;
   summary: string;
   payload: Record<string, unknown>;
@@ -1340,14 +1342,26 @@ interface InboxRow {
   staleness: number | null;
   createdAt: number;
   resolvedAt: number | null;
+  /** Per-decision unread reply count for the current reader. Emitted by
+   *  `inbox.list` so the CLI can render the "(N new)" badge without a
+   *  follow-up call. */
+  unreadReplyCount?: number;
 }
 
 interface DecisionMessageRow {
   id: string;
   decisionId: string;
   actorId: string;
+  /** Display name for `actorId`, resolved server-side. Falls back to
+   *  the raw id when no agents/principals row matches. */
+  actorName?: string;
   text: string;
   at: number;
+  /** Whether this message had been seen by the requesting reader BEFORE
+   *  this `inbox.get` call. The handler auto-marks-read on view, so the
+   *  next call returns `read: true` for the same row. Used by the CLI
+   *  to flag `[NEW]` on previously-unread replies. */
+  read?: boolean;
 }
 
 interface InboxRowWithMessages extends InboxRow {
@@ -1401,6 +1415,237 @@ function parseRespondArgs(rest: string[]): RespondArgs {
   return { id, vote: v, message, payloadOverride };
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Inbox CLI rendering — list + show. ANSI dressing on a TTY; plain on
+// pipes. Visibility-first: unread badges on the listing, `[NEW]` markers
+// on the show view (auto-marked-read by `inbox.get` after capture).
+// ───────────────────────────────────────────────────────────────────────
+
+const STATUS_GLYPH: Record<string, string> = {
+  open: "●",
+  approved: "✓",
+  denied: "✗",
+  modified: "±",
+  stale: "·",
+};
+
+function statusGlyphColored(status: string, hasUnread: boolean): string {
+  const glyph = STATUS_GLYPH[status] ?? " ";
+  // Cyan for "has unread replies you should look at" — reads as
+  // higher-priority than the open-yellow it overlays.
+  if (hasUnread) return color(`${ANSI.bold}${ANSI.cyan}`, glyph);
+  switch (status) {
+    case "open":
+      return color(ANSI.yellow, glyph);
+    case "approved":
+      return color(ANSI.green, glyph);
+    case "denied":
+      return color(ANSI.red, glyph);
+    case "modified":
+      return color(ANSI.cyan, glyph);
+    case "stale":
+      return color(ANSI.gray, glyph);
+    default:
+      return glyph;
+  }
+}
+
+function tierColored(tier: string): string {
+  switch (tier) {
+    case "vision":
+      return color(ANSI.magenta, tier);
+    case "strategic":
+      return color(ANSI.cyan, tier);
+    case "operational":
+      return color(ANSI.gray, tier);
+    default:
+      return tier;
+  }
+}
+
+function renderInboxList(rows: InboxRow[]): void {
+  const now = Date.now();
+  const cols = termWidth();
+  // Column widths chosen so the summary gets the lion's share. id+age+tier
+  // are dense and scan-friendly; the summary is the headline.
+  const idW = 10;
+  const ageW = 5;
+  const tierW = 18;
+  const fixed = 1 /*glyph*/ + 1 /*stale*/ + 2 + idW + 2 + tierW + 2 + ageW + 2;
+  const summaryW = Math.max(20, cols - fixed - 18 /*reserved for "(N new)" suffix*/);
+
+  let totalUnread = 0;
+  for (const r of rows) totalUnread += r.unreadReplyCount ?? 0;
+
+  // Header line — quick orientation.
+  const totalLine =
+    `${rows.length} item${rows.length === 1 ? "" : "s"}` +
+    (totalUnread > 0
+      ? ` · ${color(ANSI.bold + ANSI.cyan, `${totalUnread} unread ${totalUnread === 1 ? "reply" : "replies"}`)}`
+      : "");
+  console.log(color(ANSI.dim, totalLine));
+  console.log(color(ANSI.dim, "─".repeat(cols)));
+
+  for (const r of rows) {
+    const unread = r.unreadReplyCount ?? 0;
+    const glyph = statusGlyphColored(r.status, unread > 0);
+    const stale =
+      r.status === "open" && r.staleness != null && r.staleness < now
+        ? color(ANSI.red, "!")
+        : " ";
+    const age = fmtAge(now - r.createdAt);
+    const id = color(ANSI.dim, r.id.slice(0, idW));
+    const tag = r.status === "open" ? tierColored(r.tier) : `${tierColored(r.tier)}/${r.status}`;
+    const fromTag = r.proposingAgentName
+      ? color(ANSI.dim, `[${r.proposingAgentName}] `)
+      : "";
+    const summaryRaw = r.summary.replace(/\s+/g, " ");
+    const summary = clipPlain(summaryRaw, summaryW);
+    const unreadBadge =
+      unread > 0
+        ? " " + color(ANSI.bold + ANSI.cyan, `(${unread} new)`)
+        : "";
+    console.log(
+      ` ${glyph}${stale} ${id}  ${padVisible(tag, tierW)}  ${age.padStart(ageW)}  ${fromTag}${summary}${unreadBadge}`,
+    );
+  }
+}
+
+function renderInboxShow(r: InboxRowWithMessages): void {
+  const now = Date.now();
+  const cols = termWidth();
+  const rule = (label?: string): string => {
+    const base = label ? `── ${label} ` : "";
+    const fill = "─".repeat(Math.max(2, cols - vlen(base)));
+    return color(ANSI.dim, base + fill);
+  };
+
+  // Title block.
+  console.log(color(ANSI.bold, r.id));
+  console.log(color(ANSI.dim, "═".repeat(cols)));
+  console.log("");
+
+  const kv = (label: string, value: string): void => {
+    console.log(`  ${color(ANSI.dim, label.padEnd(10))}${value}`);
+  };
+
+  const statusValue = `${statusGlyphColored(r.status, false)} ${r.status}`;
+  kv("status", statusValue);
+  kv("tier", tierColored(r.tier));
+  kv(
+    "from",
+    r.proposingAgentName
+      ? `${r.proposingAgentName} ${color(ANSI.dim, `(${r.proposingAgentId.slice(0, 10)})`)}`
+      : r.proposingAgentId,
+  );
+  kv(
+    "to",
+    r.principalDisplay
+      ? `${r.principalDisplay} ${color(ANSI.dim, `(${r.principalId.slice(0, 10)})`)}`
+      : r.principalId,
+  );
+  kv("age", fmtAge(now - r.createdAt));
+  if (r.staleness != null) {
+    const remaining = r.staleness - now;
+    const dl =
+      remaining > 0
+        ? color(ANSI.yellow, `in ${fmtAge(remaining)}`)
+        : color(ANSI.red, `${fmtAge(-remaining)} ago`);
+    kv("stale", dl);
+  }
+  if (r.resolvedAt != null) {
+    kv("resolved", color(ANSI.dim, new Date(r.resolvedAt).toISOString()));
+  }
+  console.log("");
+  // Summary — wrapped, indented, given visual room.
+  for (const line of wrap(r.summary, cols - 4)) {
+    console.log(`  ${line}`);
+  }
+
+  console.log("");
+  console.log(rule("payload"));
+  const payloadStr = JSON.stringify(r.payload ?? {}, null, 2);
+  for (const line of payloadStr.split("\n")) {
+    console.log(`  ${line}`);
+  }
+
+  if (r.messages && r.messages.length > 0) {
+    const newCount = r.messages.filter((m) => !m.read).length;
+    const header =
+      `replies (${r.messages.length})` +
+      (newCount > 0
+        ? `  · ${color(ANSI.bold + ANSI.cyan, `${newCount} new`)}`
+        : "");
+    console.log("");
+    console.log(rule(header));
+    for (const m of r.messages) {
+      const when = formatTimestamp(m.at);
+      const newTag = m.read ? "" : " " + color(ANSI.bold + ANSI.cyan, "[NEW]");
+      const author = color(ANSI.bold, m.actorName ?? m.actorId);
+      console.log("");
+      console.log(`  · ${color(ANSI.dim, when)}  ${author}${newTag}`);
+      for (const line of m.text.split("\n")) {
+        for (const wrapped of wrap(line, cols - 6)) {
+          console.log(`      ${wrapped}`);
+        }
+      }
+    }
+  }
+  console.log("");
+}
+
+function formatTimestamp(at: number): string {
+  const d = new Date(at);
+  const Y = d.getFullYear();
+  const M = String(d.getMonth() + 1).padStart(2, "0");
+  const D = String(d.getDate()).padStart(2, "0");
+  const h = String(d.getHours()).padStart(2, "0");
+  const m = String(d.getMinutes()).padStart(2, "0");
+  return `${Y}-${M}-${D} ${h}:${m}`;
+}
+
+function wrap(text: string, width: number): string[] {
+  if (width < 10) width = 10;
+  const out: string[] = [];
+  for (const para of text.split("\n")) {
+    if (para.length === 0) {
+      out.push("");
+      continue;
+    }
+    let line = "";
+    for (const word of para.split(/\s+/)) {
+      if (line.length === 0) {
+        line = word;
+        continue;
+      }
+      if (line.length + 1 + word.length <= width) {
+        line += " " + word;
+      } else {
+        out.push(line);
+        line = word;
+      }
+    }
+    if (line.length > 0) out.push(line);
+  }
+  return out;
+}
+
+function vlen(s: string): number {
+  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function clipPlain(s: string, width: number): string {
+  if (vlen(s) <= width) return s;
+  const plain = s.replace(/\x1b\[[0-9;]*m/g, "");
+  return plain.slice(0, Math.max(0, width - 1)) + "…";
+}
+
+function padVisible(s: string, width: number): string {
+  const n = vlen(s);
+  if (n >= width) return clipPlain(s, width);
+  return s + " ".repeat(width - n);
+}
+
 async function cmdInbox(args: string[]): Promise<void> {
   // Default form (`olle inbox` with no subcommand) drops into the
   // mutt-style TUI on a TTY. Pipes / scripts fall through to `list`
@@ -1427,47 +1672,14 @@ async function cmdInbox(args: string[]): Promise<void> {
           console.log(all ? "(no inbox items)" : "(no open inbox items)");
           return;
         }
-        const now = Date.now();
-        for (const r of rows) {
-          const age = fmtAge(now - r.createdAt);
-          const tag = r.status === "open" ? r.tier : `${r.tier}/${r.status}`;
-          console.log(`${r.id.slice(0, 10)}  ${tag.padEnd(20)}  ${age.padStart(4)}  ${r.summary}`);
-        }
+        renderInboxList(rows);
         return;
       }
       case "show": {
         const id = rest[0];
         if (!id) throw new Error("usage: olle inbox show <id>");
         const r = await client.call<InboxRowWithMessages>("inbox.get", { id });
-        const now = Date.now();
-        console.log(`id:        ${r.id}`);
-        console.log(`status:    ${r.status}`);
-        console.log(`tier:      ${r.tier}`);
-        console.log(`from:      ${r.proposingAgentId}`);
-        console.log(`principal: ${r.principalId}`);
-        console.log(`age:       ${fmtAge(now - r.createdAt)}`);
-        if (r.staleness != null) {
-          const remaining = r.staleness - now;
-          const dl = remaining > 0 ? `in ${fmtAge(remaining)}` : `${fmtAge(-remaining)} ago`;
-          console.log(`stale:     ${dl}`);
-        }
-        if (r.resolvedAt != null) {
-          console.log(`resolved:  ${new Date(r.resolvedAt).toISOString()}`);
-        }
-        console.log(`summary:   ${r.summary}`);
-        console.log("payload:");
-        console.log(JSON.stringify(r.payload, null, 2));
-        if (r.messages && r.messages.length > 0) {
-          console.log("");
-          console.log(`replies (${r.messages.length}):`);
-          for (const m of r.messages) {
-            const when = new Date(m.at).toISOString();
-            console.log(`  [${when}] ${m.actorId}:`);
-            for (const line of m.text.split("\n")) {
-              console.log(`    ${line}`);
-            }
-          }
-        }
+        renderInboxShow(r);
         return;
       }
       case "respond": {

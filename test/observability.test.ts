@@ -190,20 +190,11 @@ describe("observability.runHistory", () => {
 });
 
 describe("observability.threadInventory + recentEvents", () => {
-  it("groups events by thread; folds chat.usage into cache hit ratio", () => {
+  it("groups events by thread; folds chat.turn-end into cache hit ratio", () => {
     const { store, bus, hostId } = rig();
     const agentId = "agent-x";
-    // Publish one chat.usage on each of two threads so the inventory
+    // Publish one chat.turn-end on each of two threads so the inventory
     // can compute different hit ratios per thread.
-    bus.publish({
-      type: "chat.usage",
-      hostId,
-      actorId: agentId,
-      threadId: "t1",
-      toAgentId: agentId,
-      durable: true,
-      payload: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 900, cacheCreationInputTokens: 0, totalTokens: 1050 },
-    });
     bus.publish({
       type: "chat.turn-end",
       hostId,
@@ -211,16 +202,30 @@ describe("observability.threadInventory + recentEvents", () => {
       threadId: "t1",
       toAgentId: agentId,
       durable: true,
-      payload: { stopReason: "end_turn" },
+      payload: {
+        stopReason: "end_turn",
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 900,
+        cacheCreationTokens: 0,
+        totalTokens: 1050,
+      },
     });
     bus.publish({
-      type: "chat.usage",
+      type: "chat.turn-end",
       hostId,
       actorId: agentId,
       threadId: "t2",
       toAgentId: agentId,
       durable: true,
-      payload: { inputTokens: 1000, outputTokens: 50, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 1050 },
+      payload: {
+        stopReason: "end_turn",
+        inputTokens: 1000,
+        outputTokens: 50,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalTokens: 1050,
+      },
     });
 
     const inv = threadInventory(store, { toAgentId: agentId });
@@ -232,14 +237,15 @@ describe("observability.threadInventory + recentEvents", () => {
     expect(t2.cacheHitRatio).toBe(0);
 
     const recent = recentEvents(store, { threadId: "t1" });
-    expect(recent.length).toBe(2);
+    expect(recent.length).toBe(1);
   });
 
-  // Regression: chat.ts emits chat.usage with durable:false (per-call usage
-  // is meant to be a transient stream for live subscribers, see chat.ts
-  // around the "kind === 'usage'" branch). threadInventory reads from the
-  // events table, which only contains durable rows. Result: ratio always 0.
-  it("BUG: ignores chat.usage when emitted with durable:false (production shape)", () => {
+  // Regression: chat.ts emits chat.usage with durable:false (it's a live
+  // per-call stream for subscribers, not a persisted record). Earlier
+  // threadInventory keyed on chat.usage and so always reported a ratio
+  // of 0 in production — chat.turn-end is the durable per-turn record
+  // and is the right source.
+  it("ignores transient chat.usage; uses durable chat.turn-end for cache stats", () => {
     const { store, bus, hostId } = rig();
     const agentId = "agent-x";
     bus.publish({
@@ -277,12 +283,8 @@ describe("observability.threadInventory + recentEvents", () => {
     const inv = threadInventory(store, { toAgentId: agentId });
     const t1 = inv.find((r) => r.threadId === "t1")!;
     expect(t1).toBeDefined();
-    // The thread is visible (chat.turn-end is durable), but the cache hit
-    // ratio is 0 because the only source threadInventory consults is
-    // chat.usage — and those rows never landed in the events table.
-    expect(t1.cacheHitRatio).toBe(0);
-    // Meanwhile the cache fields ARE present on chat.turn-end and would
-    // give the correct 0.9 ratio if threadInventory consulted that type.
+    // 900 / (900 + 100) = 0.9 — sourced from the durable chat.turn-end.
+    expect(t1.cacheHitRatio).toBeCloseTo(0.9, 5);
   });
 });
 

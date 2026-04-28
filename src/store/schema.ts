@@ -309,6 +309,24 @@ export const decisionMessages = sqliteTable(
   }),
 );
 
+/** Per-reader "I saw this message" log (LOG 2026-04-28 — inbox UI/UX).
+ *  Backs unread-counts on `inbox.list` and the `[NEW]` markers on
+ *  `inbox.show`. Same shape as `memory_reads`. */
+export const decisionMessageReads = sqliteTable(
+  "decision_message_reads",
+  {
+    messageId: text("message_id")
+      .notNull()
+      .references(() => decisionMessages.id),
+    readerActorId: text("reader_actor_id").notNull(),
+    at: integer("at").notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.messageId, t.readerActorId] }),
+    byReader: index("decision_message_reads_reader").on(t.readerActorId),
+  }),
+);
+
 export const budgets = sqliteTable(
   "budgets",
   {
@@ -459,6 +477,8 @@ export type Decision = typeof decisions.$inferSelect;
 export type NewDecision = typeof decisions.$inferInsert;
 export type DecisionMessage = typeof decisionMessages.$inferSelect;
 export type NewDecisionMessage = typeof decisionMessages.$inferInsert;
+export type DecisionMessageRead = typeof decisionMessageReads.$inferSelect;
+export type NewDecisionMessageRead = typeof decisionMessageReads.$inferInsert;
 export type Memory = typeof memories.$inferSelect;
 export type NewMemory = typeof memories.$inferInsert;
 export type Extension = typeof extensions.$inferSelect;
