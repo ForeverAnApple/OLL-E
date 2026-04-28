@@ -194,13 +194,18 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
     return r > 10 ? r : 24;
   }
 
-  // Layout heights derived from terminal size each render. The list takes
-  // the upper ~60% of the body; preview takes the rest. Header + status
-  // each take one row.
+  // Layout heights derived from terminal size each render. Roughly 50/50
+  // list-and-preview so the preview has room for replies above the fold;
+  // before LOG 2026-04-28 the preview was 40% and replies frequently fell
+  // off-screen. Header + status each take one row; -1 for separator.
+  // Detail mode collapses the list and gives the preview the full body.
   function layout(): { listH: number; prevH: number } {
     const total = termRows();
     const body = total - 2; // header + status
-    const prevH = Math.max(6, Math.floor(body * 0.4));
+    if (mode === "detail") {
+      return { listH: 0, prevH: body };
+    }
+    const prevH = Math.max(8, Math.floor(body * 0.5));
     const listH = Math.max(3, body - prevH - 1); // -1 for separator
     return { listH, prevH };
   }
@@ -297,9 +302,13 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
 
     w(HOME);
     renderHeader(cols);
-    renderList(cols, listH);
-    renderSeparator(cols);
-    renderPreview(cols, prevH);
+    if (mode === "detail") {
+      renderPreview(cols, prevH);
+    } else {
+      renderList(cols, listH);
+      renderSeparator(cols);
+      renderPreview(cols, prevH);
+    }
     renderStatus(cols);
     flush();
 
@@ -318,9 +327,15 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
   function renderHeader(cols: number): void {
     const open = rows.filter((r) => r.status === "open").length;
     const total = rows.length;
+    const totalUnread = rows.reduce((acc, r) => acc + (r.unreadReplyCount ?? 0), 0);
     const filter = filterAll ? "all" : "open";
-    const left = ` ${ANSI.bold}olle inbox${ANSI.reset}  ${ANSI.dim}filter:${ANSI.reset} ${filter}`;
-    const right = `${ANSI.dim}${open} open · ${total} total${ANSI.reset} `;
+    const title = mode === "detail" ? "olle inbox · view" : "olle inbox";
+    const left = ` ${ANSI.bold}${title}${ANSI.reset}  ${ANSI.dim}filter:${ANSI.reset} ${filter}`;
+    const unreadPart =
+      totalUnread > 0
+        ? `${ANSI.bold}${ANSI.cyan}${totalUnread} unread${ANSI.reset}${ANSI.dim} · ${ANSI.reset}`
+        : "";
+    const right = `${unreadPart}${ANSI.dim}${open} open · ${total} total${ANSI.reset} `;
     const lWidth = vlen(left);
     const rWidth = vlen(right);
     const gap = Math.max(1, cols - lWidth - rWidth);
@@ -405,63 +420,131 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
       previewOffset = Math.max(0, lines.length - h);
     }
     if (previewOffset < 0) previewOffset = 0;
+    const above = previewOffset;
+    const below = Math.max(0, lines.length - previewOffset - h);
+    // We reserve the top/bottom-most row for scroll hints when overflow
+    // exists. Hints sit on the same row as content (no extra height cost):
+    // they replace the first/last visible line with a dim "▲ N more above"
+    // / "▼ N more below" string. This lets the user know to scroll without
+    // burning a whole row of preview.
     for (let i = 0; i < h; i++) {
       const idx = previewOffset + i;
-      const ln = idx < lines.length ? lines[idx]! : "";
+      let ln = idx < lines.length ? lines[idx]! : "";
+      const isFirst = i === 0;
+      const isLast = i === h - 1;
+      if (isFirst && above > 0) {
+        const hint = `${ANSI.dim}▲ ${above} more line${above === 1 ? "" : "s"} above (k / Ctrl-U / press o for full view)${ANSI.reset}`;
+        ln = hint;
+      } else if (isLast && below > 0) {
+        const hint = `${ANSI.dim}▼ ${below} more line${below === 1 ? "" : "s"} below (j / Ctrl-D / press o for full view)${ANSI.reset}`;
+        ln = hint;
+      }
       w(`${pad(clip(ln, cols), cols)}\n`);
     }
   }
 
+  /** Build the per-decision "thread view" — the same content the small
+   *  preview pane and the full-screen detail mode both render. Layout
+   *  (top to bottom):
+   *
+   *    1. Headline:  bold summary
+   *    2. Meta:      single dim line — status · tier · age · resolved/stale · from → to
+   *    3. What's-being-requested highlights (if payload matches a known shape)
+   *    4. Replies (if any, oldest → newest, with [NEW] markers and unread counter)
+   *    5. Payload JSON (full, soft-wrapped)
+   *    6. Footer line with the full id (for copy/paste)
+   *
+   *  Replies sit above the payload because they are what the principal
+   *  most-recently needs to see; the payload was already approved.
+   *  Anything beyond what the small preview window can show is surfaced
+   *  via "▼ N more lines" / "▲ N more above" indicators on the preview's
+   *  edges (rendered separately in renderPreview). */
   function previewLines(r: InboxRow, cols: number): string[] {
     const now = Date.now();
     const out: string[] = [];
-    const k = (label: string, value: string): string =>
-      `${ANSI.dim}${label.padEnd(12)}${ANSI.reset}${value}`;
-    const idTail = (id: string): string =>
-      `${ANSI.dim}(${id.slice(0, 10)}…)${ANSI.reset}`;
-    const fromLabel = r.proposingAgentName
-      ? `${ANSI.bold}${r.proposingAgentName}${ANSI.reset} ${idTail(r.proposingAgentId)}`
-      : r.proposingAgentId;
-    const principalLabel = r.principalDisplay
-      ? `${r.principalDisplay} ${idTail(r.principalId)}`
-      : r.principalId;
-    out.push(k("id:", r.id));
-    out.push(
-      k(
-        "status:",
-        `${statusGlyph(r.status)} ${r.status}${
-          r.resolvedAt != null
-            ? ` ${ANSI.dim}(${new Date(r.resolvedAt).toISOString()})${ANSI.reset}`
-            : ""
-        }`,
-      ),
-    );
-    out.push(k("tier:", `${tierColor(r.tier)}${r.tier}${ANSI.reset}`));
-    out.push(k("from:", fromLabel));
-    out.push(k("principal:", principalLabel));
-    out.push(k("age:", fmtAge(now - r.createdAt)));
-    if (r.staleness != null) {
-      const remaining = r.staleness - now;
-      const dl =
-        remaining > 0
-          ? `${ANSI.yellow}in ${fmtAge(remaining)}${ANSI.reset}`
-          : `${ANSI.red}${fmtAge(-remaining)} ago${ANSI.reset}`;
-      out.push(k("stale:", dl));
-    }
-    out.push(k("summary:", r.summary));
 
-    // Highlights — recognized payload shapes get a focused readable
-    // block above the raw JSON. The full payload still renders below
-    // for transparency; this is just where the eyes land first.
+    // 1. Headline — bold, wrapped.
+    const headlineLimit = Math.max(20, cols - 2);
+    const headlineLines = softWrap(r.summary.replace(/\s+/g, " "), headlineLimit);
+    for (let i = 0; i < headlineLines.length; i++) {
+      out.push(`${ANSI.bold}${headlineLines[i]}${ANSI.reset}`);
+    }
+
+    // 2. Meta — one dense line summarising who/when/state.
+    const metaParts: string[] = [];
+    metaParts.push(`${statusGlyph(r.status)} ${r.status}`);
+    metaParts.push(`${tierColor(r.tier)}${r.tier}${ANSI.reset}`);
+    metaParts.push(`${ANSI.dim}${fmtAge(now - r.createdAt)} old${ANSI.reset}`);
+    if (r.staleness != null && r.status === "open") {
+      const remaining = r.staleness - now;
+      metaParts.push(
+        remaining > 0
+          ? `${ANSI.yellow}stale in ${fmtAge(remaining)}${ANSI.reset}`
+          : `${ANSI.red}stale ${fmtAge(-remaining)} ago${ANSI.reset}`,
+      );
+    }
+    if (r.resolvedAt != null) {
+      metaParts.push(`${ANSI.dim}resolved ${fmtAge(now - r.resolvedAt)} ago${ANSI.reset}`);
+    }
+    out.push(`${ANSI.dim}·${ANSI.reset} ${metaParts.join(`  ${ANSI.dim}·${ANSI.reset}  `)}`);
+
+    const fromName = r.proposingAgentName ?? r.proposingAgentId;
+    const toName = r.principalDisplay ?? r.principalId;
+    out.push(
+      `${ANSI.dim}from${ANSI.reset} ${ANSI.bold}${fromName}${ANSI.reset}  ${ANSI.dim}to${ANSI.reset} ${toName}`,
+    );
+
+    // 3. Highlights (payload-shape-aware) — kept compact.
     const hi = highlightLines(r, cols);
     if (hi.length > 0) {
       out.push("");
-      out.push(`${ANSI.cyan}${ANSI.bold}── what's being requested${ANSI.reset}`);
+      out.push(`${ANSI.cyan}${ANSI.bold}── what's being requested ${ANSI.reset}${ANSI.dim}${"─".repeat(Math.max(2, cols - vlen("── what's being requested ")))}${ANSI.reset}`);
       for (const line of hi) out.push(line);
     }
 
+    // 4. Replies — visible above the fold by default. Loaded async by
+    //    fetchDetail() on selection change; absent until the IPC roundtrip
+    //    completes (the next render shows them).
+    if (detailDecisionId === r.id && detailMessages !== null) {
+      out.push("");
+      const n = detailMessages.length;
+      const newCount = detailMessages.filter((m) => !m.read).length;
+      const ruleLabel =
+        n === 0
+          ? "── no replies yet "
+          : `── replies (${n})${newCount > 0 ? `  ${ANSI.bold}${ANSI.cyan}· ${newCount} new${ANSI.reset}${ANSI.dim}` : ""} `;
+      const fillW = Math.max(2, cols - vlen(ruleLabel));
+      out.push(`${ANSI.dim}${ruleLabel}${"─".repeat(fillW)}${ANSI.reset}`);
+      if (n === 0) {
+        out.push(
+          `  ${ANSI.dim}(no follow-ups posted yet — agent uses mail_reply to report back here)${ANSI.reset}`,
+        );
+      } else {
+        for (const m of detailMessages) {
+          const when = formatTimestamp(m.at);
+          const newTag = m.read ? "" : `  ${ANSI.bold}${ANSI.cyan}[NEW]${ANSI.reset}`;
+          const author = m.actorName ?? m.actorId;
+          out.push("");
+          out.push(
+            `  ${ANSI.bold}${ANSI.cyan}▸${ANSI.reset} ${ANSI.bold}${author}${ANSI.reset}  ${ANSI.dim}${when}${ANSI.reset}${newTag}`,
+          );
+          const limit = Math.max(20, cols - 6);
+          for (const para of m.text.split("\n")) {
+            for (const wrapped of softWrap(para, limit)) {
+              out.push(`      ${wrapped}`);
+            }
+          }
+        }
+      }
+    }
+
+    // 5. Payload — kept but pushed below replies; the principal already
+    //    approved this, so it's reference content.
     out.push("");
-    out.push(`${ANSI.dim}── full payload${ANSI.reset}`);
+    const payloadLabel = "── payload ";
+    out.push(
+      `${ANSI.dim}${payloadLabel}${"─".repeat(Math.max(2, cols - vlen(payloadLabel)))}${ANSI.reset}`,
+    );
     const pretty = JSON.stringify(r.payload ?? {}, null, 2).split("\n");
     for (const ln of pretty) {
       // Soft-wrap long json lines so they don't clip.
@@ -476,34 +559,10 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
       out.push(`  ${rest}`);
     }
 
-    // Replies block — surfaces agent follow-ups (mail_reply) inline.
-    // Loaded async by fetchDetail() when this row gets selected; if the
-    // load hasn't landed yet, leave it out (the next render will show it).
-    if (detailDecisionId === r.id && detailMessages !== null && detailMessages.length > 0) {
-      const newCount = detailMessages.filter((m) => !m.read).length;
-      const header =
-        `${ANSI.dim}── replies (${detailMessages.length})${ANSI.reset}` +
-        (newCount > 0
-          ? `  ${ANSI.bold}${ANSI.cyan}· ${newCount} new${ANSI.reset}`
-          : "");
-      out.push("");
-      out.push(header);
-      for (const m of detailMessages) {
-        const when = formatTimestamp(m.at);
-        const newTag = m.read ? "" : `  ${ANSI.bold}${ANSI.cyan}[NEW]${ANSI.reset}`;
-        const author = m.actorName ?? m.actorId;
-        out.push("");
-        out.push(
-          `  ${ANSI.dim}· ${when}${ANSI.reset}  ${ANSI.bold}${author}${ANSI.reset}${newTag}`,
-        );
-        const limit = Math.max(20, cols - 6);
-        for (const para of m.text.split("\n")) {
-          for (const wrapped of softWrap(para, limit)) {
-            out.push(`      ${wrapped}`);
-          }
-        }
-      }
-    }
+    // 6. Footer with full id for copy/paste.
+    out.push("");
+    out.push(`${ANSI.dim}id ${r.id}${ANSI.reset}`);
+
     return out;
   }
 
@@ -644,8 +703,10 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
       line = `${ANSI.dim}help — press any key to dismiss${ANSI.reset}`;
     } else if (statusMsg && now < statusMsgUntil) {
       line = statusMsg;
+    } else if (mode === "detail") {
+      line = `${ANSI.dim}j/k scroll · q/Esc/← back · a approve · d deny · m modify · ? help${ANSI.reset}`;
     } else {
-      line = `${ANSI.dim}j/k move · Enter open · a approve · d deny · m modify · / search · Tab open/all · ? help · q quit${ANSI.reset}`;
+      line = `${ANSI.dim}j/k move · o/Enter open · a/d/m vote · / search · Tab open/all · ? help · q quit${ANSI.reset}`;
     }
     w(pad(clip(line, cols), cols));
   }
@@ -663,8 +724,10 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
       ["G", "last item"],
       ["Ctrl-d / Ctrl-u", "half-page down / up"],
       ["Ctrl-f / Ctrl-b / PgDn / PgUp", "page down / up"],
-      ["h  ←", "scroll preview up"],
-      ["l  →  Enter  o", "open detail / scroll preview down"],
+      ["o  Enter", "open in detail view (full screen, scrollable)"],
+      ["q  Esc  ← (in detail)", "back to list"],
+      ["h  ←", "scroll preview up (list mode)"],
+      ["l  →", "scroll preview down (list mode)"],
       ["", ""],
       ["a", "approve (prompts for optional message)"],
       ["d", "deny (prompts for optional message)"],
@@ -930,7 +993,105 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
 
     // ── normal mode ────────────────────────────────────────────────────
     const { listH, prevH } = layout();
-    const half = Math.max(1, Math.floor(listH / 2));
+    const half = Math.max(1, Math.floor(mode === "detail" ? prevH / 2 : listH / 2));
+
+    // Detail-mode early-out: `q`/`Esc`/`←` returns to list; navigation
+    // keys scroll the body rather than moving between decisions (same
+    // convention as `less`/`man` and most inbox clients).
+    if (mode === "detail") {
+      // `q` or `Esc` exits detail mode (does NOT quit the TUI).
+      if (seq === "\x1b" || seq === "q") {
+        mode = "normal";
+        previewOffset = 0;
+        lastG = 0;
+        render();
+        return;
+      }
+      switch (seq) {
+        case "?":
+          mode = "help";
+          renderHelpOverlay();
+          return;
+        case "j":
+        case "\x1b[B": // ↓
+          previewOffset += 1;
+          lastG = 0;
+          render();
+          return;
+        case "k":
+        case "\x1b[A": // ↑
+          previewOffset = Math.max(0, previewOffset - 1);
+          lastG = 0;
+          render();
+          return;
+        case "\x04": // Ctrl-D
+        case "J":
+          previewOffset += half;
+          lastG = 0;
+          render();
+          return;
+        case "\x15": // Ctrl-U
+        case "K":
+          previewOffset = Math.max(0, previewOffset - half);
+          lastG = 0;
+          render();
+          return;
+        case "\x06": // Ctrl-F
+        case "\x1b[6~": // PgDn
+          previewOffset += prevH;
+          lastG = 0;
+          render();
+          return;
+        case "\x02": // Ctrl-B
+        case "\x1b[5~": // PgUp
+          previewOffset = Math.max(0, previewOffset - prevH);
+          lastG = 0;
+          render();
+          return;
+        case "g":
+          if (Date.now() - lastG < 700) {
+            previewOffset = 0;
+            lastG = 0;
+          } else {
+            lastG = Date.now();
+          }
+          render();
+          return;
+        case "G":
+          // Jump to bottom; previewOffset clamped in renderPreview.
+          previewOffset = Number.MAX_SAFE_INTEGER;
+          lastG = 0;
+          render();
+          return;
+        case "h":
+        case "\x1b[D": // ←
+          mode = "normal";
+          previewOffset = 0;
+          lastG = 0;
+          render();
+          return;
+        case "a":
+          startAction("approve");
+          render();
+          return;
+        case "d":
+          startAction("deny");
+          render();
+          return;
+        case "m":
+          startAction("modify");
+          render();
+          return;
+        case "y":
+          yankCurrentId();
+          return;
+        case "\x03": // Ctrl-C
+          quit();
+          return;
+        default:
+          return;
+      }
+    }
 
     // gg sequence — `g` then `g` within ~700ms jumps to first.
     if (seq === "g") {
@@ -1000,12 +1161,19 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
         break;
       case "l":
       case "\x1b[C": // →
-      case "o":
         previewOffset += 1;
         break;
+      case "o":
       case "\r":
       case "\n":
-        previewOffset += Math.max(1, Math.floor(prevH / 2));
+        // Open the selected decision in full-screen detail mode. ESC, q,
+        // or ← returns to the list. Same content as the small preview;
+        // gets the whole screen so long replies + payload aren't behind
+        // the fold.
+        if (current()) {
+          mode = "detail";
+          previewOffset = 0;
+        }
         break;
       case "K":
         previewOffset = Math.max(0, previewOffset - prevH);
