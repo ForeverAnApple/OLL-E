@@ -252,13 +252,31 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       secrets: resolved,
       scratchDir,
       registerTool(tool) {
-        let list = toolsByExt.get(extensionId);
-        if (!list) toolsByExt.set(extensionId, (list = []));
+        // First-wins: a tool name is a single slot in the registry.
+        // Rejecting a duplicate keeps toolsByName and toolsByExt
+        // consistent — drift between the two is what wedged the LLM tool
+        // list with two copies of the same name.
         const prior = toolsByName.get(tool.name);
-        if (prior && prior.extensionId !== extensionId) {
+        if (prior) {
+          const sameExt = prior.extensionId === extensionId;
+          opts.bus.publish({
+            type: "tool.collision-rejected",
+            payload: {
+              tool: tool.name,
+              priorExtension: prior.extensionName,
+              rejectedExtension: callerName,
+              sameExtension: sameExt,
+            },
+            hostId: opts.hostId,
+            actorId: extensionId,
+            durable: false,
+          });
           console.warn(
-            `[extensions] tool name "${tool.name}" registered by both "${prior.extensionName}" and "${callerName}" — callTool resolution is ambiguous`,
+            sameExt
+              ? `[extensions] tool "${tool.name}" registered twice by "${callerName}" — dropping the second registration`
+              : `[extensions] tool "${tool.name}" already registered by "${prior.extensionName}"; dropping registration from "${callerName}"`,
           );
+          return;
         }
         // LLM vendors reject tool specs without a JSON Schema; fall back
         // to an empty-object schema rather than 400 every chat turn.
@@ -275,6 +293,8 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
           tool: guarded,
           resolveSecrets: resolveOwnSecrets,
         };
+        let list = toolsByExt.get(extensionId);
+        if (!list) toolsByExt.set(extensionId, (list = []));
         list.push(entry);
         toolsByName.set(tool.name, entry);
       },
@@ -472,19 +492,17 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     return { api, unsubs };
   }
 
-  async function startTriggers(extensionId: string, manifest: Manifest, extDir: string): Promise<void> {
+  async function startTriggers(extensionId: string, manifest: Manifest): Promise<void> {
+    // A trigger declared with `type: X` is itself the authority statement
+    // that this extension emits X events; cross-checking against
+    // manifest.eventWrites would be double bookkeeping that only ever
+    // catches manifest drift, never an actual unauthorised emit.
+    // eventWrites continues to gate imperative api.publish() and task
+    // emit() — see assertEventWrite in makeApi.
     const list = triggersByExt.get(extensionId) ?? [];
-    const eventWriteAllowlist = new Set(manifest.eventWrites ?? []);
-    const assertTriggerWrite = (type: string) => {
-      if (eventWriteAllowlist.has(type) || eventWriteAllowlist.has("*")) return;
-      throw new Error(
-        `extensions: "${manifest.name}" cannot emit trigger "${type}" — add it to manifest.eventWrites`,
-      );
-    };
+    const resolved = resolveManifestSecrets(manifest);
     for (const entry of list) {
-      assertTriggerWrite(entry.trigger.type);
       const emit = (payload: unknown) => {
-        assertTriggerWrite(entry.trigger.type);
         opts.bus.publish({
           type: entry.trigger.type,
           payload,
@@ -493,11 +511,44 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
           durable: true,
         });
       };
-      const resolved = resolveManifestSecrets(manifest);
       await entry.trigger.start(emit, { hostId: opts.hostId, extensionId, secrets: resolved });
       entry.stop = entry.trigger.stop?.bind(entry.trigger);
-      void extDir; // keep for future scratch paths
     }
+  }
+
+  /** Drop all in-memory registrations bound to an extensionId and stop
+   *  any partially-started triggers. Used by both unload() and the
+   *  failed-load rollback — same job, two callers. Does NOT touch the
+   *  `loaded` map or the DB row; the caller decides those. */
+  async function purgeRegistry(extensionId: string, name: string): Promise<void> {
+    for (const un of subs.get(name) ?? []) {
+      try {
+        un();
+      } catch {
+        /* best-effort */
+      }
+    }
+    subs.delete(name);
+    await Promise.allSettled(
+      (triggersByExt.get(extensionId) ?? []).map((e) => (e.stop ? e.stop() : undefined)),
+    );
+    for (const entry of tasksByExt.get(extensionId) ?? []) {
+      try {
+        entry.unregister();
+      } catch {
+        /* best-effort */
+      }
+    }
+    for (const entry of toolsByExt.get(extensionId) ?? []) {
+      // Only evict if we still own the name — a reload races register
+      // before unload, so a newer entry may have taken the slot.
+      if (toolsByName.get(entry.tool.name) === entry) {
+        toolsByName.delete(entry.tool.name);
+      }
+    }
+    tasksByExt.delete(extensionId);
+    triggersByExt.delete(extensionId);
+    toolsByExt.delete(extensionId);
   }
 
   async function load(name: string): Promise<LoadedExtension> {
@@ -525,9 +576,18 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     }
 
     const { api, unsubs } = makeApi(manifest, extensionId, extDir);
-    await impl.register(api);
-    subs.set(name, unsubs);
-    await startTriggers(extensionId, manifest, extDir);
+    // Transactional registration: any throw between register() and the
+    // final loaded.set must roll back all in-memory side effects, or the
+    // next load attempt collides with orphaned tools/subs/triggers.
+    try {
+      await impl.register(api);
+      subs.set(name, unsubs);
+      await startTriggers(extensionId, manifest);
+    } catch (err) {
+      await purgeRegistry(extensionId, name);
+      markStatus(opts.store, extensionId, "inactive");
+      throw err;
+    }
 
     const record: LoadedExtension = {
       id: extensionId,
@@ -552,30 +612,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   async function unload(name: string): Promise<void> {
     const record = loaded.get(name);
     if (!record) return;
-    for (const un of subs.get(name) ?? []) un();
-    subs.delete(name);
-    // Stop triggers in parallel — a hung stop on one trigger shouldn't
-    // block the rest (e.g. Discord gateway + poll on the same extension).
-    await Promise.allSettled(
-      (triggersByExt.get(record.id) ?? []).map((e) => (e.stop ? e.stop() : undefined)),
-    );
-    for (const entry of tasksByExt.get(record.id) ?? []) {
-      try {
-        entry.unregister();
-      } catch {
-        /* best-effort */
-      }
-    }
-    for (const entry of toolsByExt.get(record.id) ?? []) {
-      // Only evict if we still own the name — a reload races register
-      // before unload, so a newer entry may have taken the slot.
-      if (toolsByName.get(entry.tool.name) === entry) {
-        toolsByName.delete(entry.tool.name);
-      }
-    }
-    tasksByExt.delete(record.id);
-    triggersByExt.delete(record.id);
-    toolsByExt.delete(record.id);
+    await purgeRegistry(record.id, name);
     try {
       if (record.unload) await record.unload();
     } catch (err) {

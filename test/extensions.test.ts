@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBus, persistToStore } from "../src/bus/index.ts";
 import { openStore, tables } from "../src/store/index.ts";
+import { eq } from "drizzle-orm";
 import { ulid } from "../src/id/index.ts";
 import {
   commitSubtree,
@@ -233,8 +234,12 @@ describe("manifest validation", () => {
     expect(seen).toEqual([{ text: "hello" }]);
   });
 
-  it("requires manifest.eventWrites for trigger output events", async () => {
+  it("treats a trigger declaration as the authority statement for its type", async () => {
     const r = rig();
+    const seen: unknown[] = [];
+    r.bus.subscribe("tick", (ev) => {
+      seen.push(ev.payload);
+    });
     writeExt(tmp, "trigger", {
       manifest: { name: "trigger", version: "0.1.0" },
       index: `
@@ -250,7 +255,69 @@ describe("manifest validation", () => {
       `,
     });
     const host = createExtensionHost({ ...r, extensionsDir: tmp });
-    await expect(host.load("trigger")).rejects.toThrow(/manifest\.eventWrites/);
+    await host.load("trigger");
+    expect(seen).toEqual([{ ok: true }]);
+  });
+
+  it("rolls back partial registration when load fails after registerTool", async () => {
+    const r = rig();
+    writeExt(tmp, "halfway", {
+      manifest: { name: "halfway", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "halfway_tool",
+            description: "registered just before the throw",
+            inputSchema: { type: "object" },
+            execute: () => "ok",
+          });
+          throw new Error("boom mid-register");
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("halfway")).rejects.toThrow(/boom mid-register/);
+    expect(host.tools().find((t) => t.tool.name === "halfway_tool")).toBeUndefined();
+    const row = r.store
+      .select()
+      .from(tables.extensions)
+      .where(eq(tables.extensions.name, "halfway"))
+      .all()[0];
+    expect(row?.status).toBe("inactive");
+  });
+
+  it("registerTool is first-wins on name collision", async () => {
+    const r = rig();
+    writeExt(tmp, "first", {
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "shared",
+            description: "first registrant",
+            inputSchema: { type: "object" },
+            execute: () => "first",
+          });
+        }
+      `,
+    });
+    writeExt(tmp, "second", {
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "shared",
+            description: "second registrant",
+            inputSchema: { type: "object" },
+            execute: () => "second",
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("first");
+    await host.load("second");
+    const all = host.tools().filter((t) => t.tool.name === "shared");
+    expect(all).toHaveLength(1);
+    expect(all[0]!.tool.description).toBe("first registrant");
   });
 
   it("rejects a name mismatch", async () => {
