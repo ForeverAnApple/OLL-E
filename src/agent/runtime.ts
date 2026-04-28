@@ -150,7 +150,15 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
 
     messages.push({ role: "assistant", content: completion.content });
 
-    if (completion.stopReason !== "tool_use") {
+    // Gate dispatch on actual content, not stop_reason. Anthropic emits
+    // stop_reason="pause_turn" (and our adapter folds it to "end_turn")
+    // when long parallel-tool batches are split — the assistant message
+    // still carries tool_use blocks that must be answered before the next
+    // user turn, or the API 400s with "tool_use ids were found without
+    // tool_result blocks". Same applies to max_tokens / refusal endings
+    // that nonetheless include tool_use blocks.
+    const hasToolUse = completion.content.some((b) => b.type === "tool_use");
+    if (!hasToolUse) {
       return {
         messages,
         stopReason: completion.stopReason,

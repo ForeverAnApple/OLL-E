@@ -284,6 +284,31 @@ export const approvals = sqliteTable(
   }),
 );
 
+/** Agent-authored follow-up replies on a decision (LOG 2026-04-27 — mail_reply).
+ *  Distinct from `approvals` because there's no vote — these are the
+ *  "FYI done" / "blocked because X" messages an agent posts back into
+ *  a decision's conversation thread after (typically) executing an
+ *  approved payload. Read together with proposal + approvals to render
+ *  the full thread in `olle inbox show <id>` and `mail_list`. */
+export const decisionMessages = sqliteTable(
+  "decision_messages",
+  {
+    id: text("id").primaryKey(),
+    decisionId: text("decision_id")
+      .notNull()
+      .references(() => decisions.id),
+    hostId: text("host_id")
+      .notNull()
+      .references(() => hosts.id),
+    actorId: text("actor_id").notNull(),
+    text: text("text").notNull(),
+    at: integer("at").notNull(),
+  },
+  (t) => ({
+    byDecision: index("decision_messages_decision").on(t.decisionId, t.at),
+  }),
+);
+
 export const budgets = sqliteTable(
   "budgets",
   {
@@ -432,6 +457,8 @@ export type EventRow = typeof events.$inferSelect;
 export type NewEventRow = typeof events.$inferInsert;
 export type Decision = typeof decisions.$inferSelect;
 export type NewDecision = typeof decisions.$inferInsert;
+export type DecisionMessage = typeof decisionMessages.$inferSelect;
+export type NewDecisionMessage = typeof decisionMessages.$inferInsert;
 export type Memory = typeof memories.$inferSelect;
 export type NewMemory = typeof memories.$inferInsert;
 export type Extension = typeof extensions.$inferSelect;

@@ -133,8 +133,9 @@ tool_calls    (id, task_id, tool_id, args_json, result_json, tokens_used, starte
 tool_results  (id, hlc, host_id, actor_id, thread_id, tool_name, content, bytes, created_at)
               -- spilled over-cap tool output, recovered via read_tool_result
 
-decisions     (id, principal_id, proposing_agent_id, tier, summary, payload, status, staleness, created_at, resolved_at)
-approvals     (decision_id, actor_id, vote, message, at)     -- for quorum/ask-up chains
+decisions          (id, principal_id, proposing_agent_id, tier, summary, payload, status, staleness, created_at, resolved_at)
+approvals          (decision_id, actor_id, vote, message, at)             -- vote rows on a decision
+decision_messages  (id, decision_id, host_id, actor_id, text, at)         -- agent follow-up replies (mail_reply)
 
 budgets       (id, principal_id, agent_id, period, cap_tokens, cap_usd, spent, updated_at)
 ledger        (id, hlc, host_id, actor_id, thread_id, provider, model,
@@ -200,6 +201,8 @@ Reply modes:
 - `ignore` → staleness fires; `on_stale` policy runs
 
 Agents never block waiting. Every inbox-originated task continues other work while waiting.
+
+Two surfaces close the loop after resolution. The **from-idle wake** (LOG 2026-04-26) fires a synthetic `chat.input` on the proposing agent's `mailbox:<agentId>` thread when `decision.resolved` lands — a small, bounded thread the agent processes cheaply. The **on-next-turn sidebar** (LOG 2026-04-27) renders unread resolutions in the per-turn system prompt for whichever thread the proposer next runs in, so the close-loop reply lands where the user is watching without forcing a turn on the originating thread when the resolution itself arrives — important when that thread is large. The high-water mark for "unread" is in-memory and initialized to loop start on restart, so pre-restart resolutions are not automatically re-rendered. Pull-side `mail_list({direction:"out", includeResolved:true})` is the durable audit.
 
 ## Budget and token ledger
 

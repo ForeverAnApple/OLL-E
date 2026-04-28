@@ -102,6 +102,12 @@ interface Thread {
    *  uses the byte-identical preview from this map — without it the
    *  prefix would invalidate every turn the conversation rehydrates. */
   truncationState: TruncationState;
+  /** Per-thread high-water mark for "decision resolutions you haven't
+   *  seen on this thread" (LOG 2026-04-27). Per-thread (not per-loop) so
+   *  the agent's processing turn on `mailbox:<agentId>` advancing its
+   *  own HWM does not ack the resolution for the user-facing chat thread.
+   *  Initialized to the loop's start time on first touch; restart resets. */
+  mailHwm: number;
 }
 
 export interface AgentLoop {
@@ -133,6 +139,14 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
     : undefined;
   if (agentDir) mkdirSync(agentDir, { recursive: true });
 
+  // Loop-start timestamp seeds each new thread's per-thread mailHwm so
+  // we don't dump pre-existing history on a thread's first turn after
+  // boot. Per-thread (not per-loop) so the agent's mailbox-thread
+  // processing of a wake doesn't ack the resolution for the user-facing
+  // chat thread (LOG 2026-04-27). Restart resets — pull surface
+  // mail_list({direction:"out", includeResolved:true}) is the durable audit.
+  const loopStartMs = Date.now();
+
   function getOrCreate(id: string): Thread {
     let t = threads.get(id);
     if (t) return t;
@@ -144,6 +158,7 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
       pendingOrigin: [],
       loadedTools: new Set<string>(),
       truncationState: createTruncationState(),
+      mailHwm: loopStartMs,
     };
     threads.set(id, t);
     return t;
@@ -312,18 +327,22 @@ async function runTurn(
     // in this catalog text — the catalog must stay stable across
     // load_tools calls within a thread or it'll invalidate the prefix.
     const catalogBlock = renderToolCatalog(turnStartTools);
-    // Mailbox sidebar — a one-line situational awareness block appended
-    // to the system prompt each turn. Makes delegation decidable: the
-    // agent can see "I have 3 threads with pending work" and choose to
-    // spawn a secretary, retarget, or stay focused.
-    const sidebar = buildMailboxSidebar(allThreads, thread.id);
+    // Mailbox sidebar — situational awareness block appended to the
+    // system prompt each turn. Two sections:
+    //   1. Other threads with activity (delegation cue).
+    //   2. Resolved proposals this agent hasn't seen yet (LOG 2026-04-27).
+    // The wake on `mailbox:<agentId>` covers idle resolutions; this
+    // section closes the loop on whichever thread the agent next runs a
+    // turn on. Ack is delayed until after the paid turn returns, so a
+    // budget wall or LLM failure does not mark unread mail as seen.
+    const sidebar = buildMailboxSidebar(allThreads, thread, opts.inbox, opts.agentId);
     // Structured system prompt with the cache breakpoint between stable
     // (base + principles + catalog) and volatile (sidebar) segments.
     const systemSegments = composeSystemSegments(
       opts.system,
       principleBlock,
       catalogBlock,
-      sidebar,
+      sidebar.text,
     );
     const budgetBlock = paidBudgetBlock(opts, thread.id, origin);
     if (budgetBlock) {
@@ -439,6 +458,9 @@ async function runTurn(
         );
       },
     });
+    if (sidebar.mailHwmAfterRead != null) {
+      thread.mailHwm = Math.max(thread.mailHwm, sidebar.mailHwmAfterRead);
+    }
     thread.messages = result.messages;
     let recorded: { usdMicros: number } | undefined;
     if (opts.ledger && result.totalUsage.totalTokens > 0) {
@@ -640,6 +662,24 @@ function pruneOrphanLoaded(
 
 function buildMailboxSidebar(
   threads: Map<string, Thread>,
+  current: Thread,
+  inbox: Inbox | undefined,
+  agentId: string,
+): { text: string; mailHwmAfterRead?: number } {
+  const sections: string[] = [];
+  let mailHwmAfterRead: number | undefined;
+  const threadSection = renderThreadActivity(threads, current.id);
+  if (threadSection) sections.push(threadSection);
+  if (inbox) {
+    const resolutionSection = renderUnreadResolutions(inbox, agentId, current);
+    if (resolutionSection.text) sections.push(resolutionSection.text);
+    mailHwmAfterRead = resolutionSection.mailHwmAfterRead;
+  }
+  return { text: sections.join("\n\n"), mailHwmAfterRead };
+}
+
+function renderThreadActivity(
+  threads: Map<string, Thread>,
   currentThreadId: string,
 ): string {
   const others: Array<{ id: string; pending: number; msgs: number }> = [];
@@ -662,6 +702,66 @@ function buildMailboxSidebar(
   const header = `Your mailbox — ${others.length} other thread(s) with activity:`;
   const footer = truncated > 0 ? `\n  (+${truncated} more — load query_my_threads for full inventory)` : "";
   return `${header}\n${lines.join("\n")}${footer}`;
+}
+
+/** Resolved proposals where this agent was the proposer that landed since
+ *  the HWM. Closes the loop on whichever thread the agent next runs in,
+ *  complementing the from-idle wake on `mailbox:<agentId>`. The caller
+ *  commits the returned HWM only after a paid turn is delivered, so
+ *  budget gates and LLM failures do not acknowledge mail the agent never
+ *  read. Crash-mid-turn recovery is the always-available pull surface
+ *  mail_list({direction:"out", includeResolved:true}). */
+function renderUnreadResolutions(
+  inbox: Inbox,
+  agentId: string,
+  thread: Thread,
+): { text: string; mailHwmAfterRead?: number } {
+  const sinceHwm = thread.mailHwm;
+  const nowAtRead = Date.now();
+  const all = inbox.listProposedBy(agentId, { includeResolved: true, limit: 100 });
+  const fresh = all.filter(
+    (d) =>
+      d.status !== "open" &&
+      d.resolvedAt != null &&
+      // `>=` because thread creation and a same-tick respond() can land
+      // on the same millisecond. We compensate on advance below.
+      d.resolvedAt >= sinceHwm &&
+      d.resolvedAt <= nowAtRead,
+  );
+  if (fresh.length === 0) return { text: "" };
+  // Advance to nowAtRead+1 after the turn returns so the rows we showed
+  // don't re-appear next turn on this thread, while a resolution landing
+  // exactly at nowAtRead+1 in the future is still captured by the next
+  // render's `>=` window. Per-thread, so the agent's mailbox-thread
+  // processing doesn't ack the resolution for the user-facing chat thread.
+  const mailHwmAfterRead = nowAtRead + 1;
+  fresh.sort((a, b) => (a.resolvedAt ?? 0) - (b.resolvedAt ?? 0));
+  const cap = 8;
+  const shown = fresh.slice(-cap);
+  const truncated = fresh.length - shown.length;
+  const lines = shown.map((d) => {
+    const summary = d.summary.length > 80 ? `${d.summary.slice(0, 77)}...` : d.summary;
+    const ago = relativeAgo(nowAtRead - (d.resolvedAt ?? nowAtRead));
+    return `  - ${d.id}: ${d.status} ${ago} — "${summary}"`;
+  });
+  const header = `Decision resolutions you haven't seen (${fresh.length}):`;
+  const footer =
+    truncated > 0
+      ? `\n  (+${truncated} older — call mail_list({direction:"out", includeResolved:true}) for full audit)`
+      : "";
+  return { text: `${header}\n${lines.join("\n")}${footer}`, mailHwmAfterRead };
+}
+
+function relativeAgo(ms: number): string {
+  if (ms < 0) return "just now";
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
 }
 
 /** Wrap an extension-contributed tool so its `execute` always receives a

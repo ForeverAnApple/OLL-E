@@ -23,7 +23,7 @@ import {
   type UserVote,
 } from "../inbox/index.ts";
 import type { EventBus } from "../bus/index.ts";
-import type { Decision } from "../store/schema.ts";
+import type { Decision, DecisionMessage } from "../store/schema.ts";
 import type { Store } from "../store/db.ts";
 import type { Tier } from "../scheduler/index.ts";
 
@@ -154,7 +154,46 @@ export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
     },
   };
 
-  const tools: ToolDef[] = [list, respond];
+  const reply: ToolDef<{ decisionId: string; text: string }, DecisionMessage> = {
+    name: "mail_reply",
+    tier: "operational",
+    category: "mailbox",
+    shortClause: "post a follow-up message into a decision's thread",
+    description:
+      "Append a non-vote message into the conversation thread on an existing decision. Use this AFTER a proposal you filed gets resolved (approved/denied/modified) to close the loop with the principal: report what you did with the approved payload, post the commit/PR/result, or explain a blocker if execution couldn't complete. The principal sees these inline with `olle inbox show <id>` and via bridges. Operational tier — the strategic cost was paid when the proposal was opened; replies are the cheap close-loop primitive that keeps the principal informed without a new approval. Convention: be concise (2–6 lines); link to artifacts (commits, files, events) rather than pasting them. If you blocked, say what's blocking and what you'd need.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        decisionId: {
+          type: "string",
+          description: "Full decision ULID (the same id you got from mail_propose).",
+        },
+        text: {
+          type: "string",
+          description:
+            "Message body. Plain text or markdown. Keep it tight — the principal scans these.",
+        },
+      },
+      required: ["decisionId", "text"],
+      additionalProperties: false,
+    },
+    execute: (args, ctx) => {
+      const target = inbox.resolve(args.decisionId);
+      if (!target) throw new Error(`mail_reply: decision ${args.decisionId} not found`);
+      if (target.proposingAgentId !== ctx.actorId) {
+        throw new Error(
+          `mail_reply: actor ${ctx.actorId} cannot reply to decision ${target.id}; only the proposing agent can reply`,
+        );
+      }
+      return inbox.reply({
+        decisionId: target.id,
+        actorId: ctx.actorId,
+        text: args.text,
+      });
+    },
+  };
+
+  const tools: ToolDef[] = [list, respond, reply];
 
   // mail_propose needs bus + store + hostId (askUp emits events, walks the
   // ancestor chain, and stamps origin). Skip the tool when any of the trio

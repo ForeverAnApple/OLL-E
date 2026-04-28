@@ -11,10 +11,10 @@
 import type { EventBus } from "../bus/index.ts";
 import type { Store } from "../store/db.ts";
 import { tables } from "../store/index.ts";
-import type { Decision } from "../store/schema.ts";
+import type { Decision, DecisionMessage } from "../store/schema.ts";
 import { ulid } from "../id/index.ts";
 import type { Tier } from "../scheduler/index.ts";
-import { and, desc, eq, inArray, like, lt } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, like, lt } from "drizzle-orm";
 
 export type DecisionStatus = "open" | "approved" | "denied" | "modified" | "stale";
 // `stale` is a system-emitted vote — `sweepStale` writes it on auto-expiry.
@@ -45,6 +45,12 @@ export interface RespondInput {
   payloadOverride?: Record<string, unknown>;
 }
 
+export interface ReplyInput {
+  decisionId: string;
+  actorId: string;
+  text: string;
+}
+
 export interface Inbox {
   propose(p: Proposal): { id: string; deadlineAt?: number };
   listOpen(principalId: string): Decision[];
@@ -64,6 +70,15 @@ export interface Inbox {
    *  shows truncated ids, so callers commonly pass a prefix. */
   resolve(idOrPrefix: string): Decision | undefined;
   respond(input: RespondInput): Decision;
+  /** Append a non-vote message into a decision's conversation thread.
+   *  Used by `mail_reply` for "FYI done" / "blocked because X" follow-
+   *  ups after a decision resolves (or, occasionally, while still open
+   *  to add context). Emits `decision.replied` for bridges + observers. */
+  reply(input: ReplyInput): DecisionMessage;
+  /** All follow-up messages on a decision, oldest first. Renders inline
+   *  with the proposal + approvals in `olle inbox show <id>` and the
+   *  agent's `mail_list` enrichment. */
+  listMessages(decisionId: string): DecisionMessage[];
   sweepStale(nowMs?: number): number;
 }
 
@@ -230,6 +245,51 @@ export function createInbox(opts: InboxOptions): Inbox {
     return { ...d, status: nextStatus, payload: nextPayload, resolvedAt: now };
   }
 
+  function reply(input: ReplyInput): DecisionMessage {
+    if (!input.text || typeof input.text !== "string") {
+      throw new Error("inbox: reply text is required");
+    }
+    const d = get(input.decisionId);
+    if (!d) throw new Error(`inbox: decision ${input.decisionId} not found`);
+    const id = ulid();
+    const now = Date.now();
+    const row: DecisionMessage = {
+      id,
+      decisionId: d.id,
+      hostId,
+      actorId: input.actorId,
+      text: input.text,
+      at: now,
+    };
+    store.insert(tables.decisionMessages).values(row).run();
+    bus.publish({
+      type: "decision.replied",
+      hostId,
+      actorId: input.actorId,
+      durable: true,
+      payload: {
+        decisionId: d.id,
+        replyId: id,
+        principalId: d.principalId,
+        proposingAgentId: d.proposingAgentId,
+        // Truncate in the event payload — full text lives in the row.
+        // Bridges that want display content should query the row.
+        textPreview: input.text.length > 200 ? `${input.text.slice(0, 197)}...` : input.text,
+        textLength: input.text.length,
+      },
+    });
+    return row;
+  }
+
+  function listMessages(decisionId: string): DecisionMessage[] {
+    return store
+      .select()
+      .from(tables.decisionMessages)
+      .where(eq(tables.decisionMessages.decisionId, decisionId))
+      .orderBy(asc(tables.decisionMessages.at))
+      .all();
+  }
+
   function sweepStale(nowMs: number = Date.now()): number {
     const open = store
       .select()
@@ -266,5 +326,16 @@ export function createInbox(opts: InboxOptions): Inbox {
     return ids.length;
   }
 
-  return { propose, listOpen, listAll, listProposedBy, get, resolve, respond, sweepStale };
+  return {
+    propose,
+    listOpen,
+    listAll,
+    listProposedBy,
+    get,
+    resolve,
+    respond,
+    reply,
+    listMessages,
+    sweepStale,
+  };
 }

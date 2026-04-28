@@ -207,3 +207,94 @@ describe("askUp chain", () => {
     expect(r.inbox.listOpen(principalId)).toHaveLength(1);
   });
 });
+
+describe("inbox reply — agent follow-up messages on a decision", () => {
+  // The "agent → principal FYI" edge that was missing: after a proposal
+  // resolves, the proposing agent reports back into the same decision
+  // thread (executed it, blocked, etc) without opening a new vote.
+
+  it("reply appends a row, fires decision.replied, and listMessages returns it", () => {
+    const r = rig();
+    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { id: did } = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "strategic",
+      summary: "do x",
+      payload: {},
+    });
+    r.inbox.respond({ decisionId: did, actorId: "principal-1", vote: "approve" });
+
+    const replied: unknown[] = [];
+    r.bus.subscribe("decision.replied", (e) => void replied.push(e.payload));
+
+    const m = r.inbox.reply({
+      decisionId: did,
+      actorId: "proposer",
+      text: "done — see commit abc123",
+    });
+    expect(m.id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(m.text).toBe("done — see commit abc123");
+    expect(m.actorId).toBe("proposer");
+
+    const list = r.inbox.listMessages(did);
+    expect(list).toHaveLength(1);
+    expect(list[0]!.text).toBe("done — see commit abc123");
+
+    expect(replied).toHaveLength(1);
+    const p = replied[0] as { decisionId: string; replyId: string; textPreview: string };
+    expect(p.decisionId).toBe(did);
+    expect(p.replyId).toBe(m.id);
+    expect(p.textPreview).toBe("done — see commit abc123");
+  });
+
+  it("reply on an unknown decision throws", () => {
+    const r = rig();
+    seedPrincipalAndAgent(r, { agentId: "proposer" });
+    expect(() =>
+      r.inbox.reply({ decisionId: "no-such-id", actorId: "proposer", text: "hi" }),
+    ).toThrow(/not found/);
+  });
+
+  it("listMessages returns rows in chronological order", () => {
+    const r = rig();
+    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { id: did } = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "x",
+      payload: {},
+    });
+    r.inbox.reply({ decisionId: did, actorId: "proposer", text: "first" });
+    // Tiny delay so `at` differs deterministically.
+    Bun.sleepSync(2);
+    r.inbox.reply({ decisionId: did, actorId: "proposer", text: "second" });
+    Bun.sleepSync(2);
+    r.inbox.reply({ decisionId: did, actorId: "proposer", text: "third" });
+
+    const list = r.inbox.listMessages(did);
+    expect(list.map((m) => m.text)).toEqual(["first", "second", "third"]);
+  });
+
+  it("textPreview truncates long bodies in the event payload (full text in row)", () => {
+    const r = rig();
+    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { id: did } = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "x",
+      payload: {},
+    });
+    const long = "x".repeat(500);
+    const seen: unknown[] = [];
+    r.bus.subscribe("decision.replied", (e) => void seen.push(e.payload));
+    const m = r.inbox.reply({ decisionId: did, actorId: "proposer", text: long });
+    expect(m.text).toBe(long);
+    const p = seen[0] as { textPreview: string; textLength: number };
+    expect(p.textLength).toBe(500);
+    expect(p.textPreview.length).toBeLessThanOrEqual(200);
+    expect(p.textPreview.endsWith("...")).toBe(true);
+  });
+});

@@ -42,7 +42,10 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  daemon.store.raw.exec("DELETE FROM approvals; DELETE FROM decisions;");
+  // Order matters: child tables (FK -> decisions) before decisions itself.
+  daemon.store.raw.exec(
+    "DELETE FROM decision_messages; DELETE FROM approvals; DELETE FROM decisions;",
+  );
 });
 
 afterAll(async () => {
@@ -85,11 +88,18 @@ describe("inbox.* IPC", () => {
     expect(all.find((r) => r.id === id)?.status).toBe("approved");
   });
 
-  it("inbox.get returns full row; missing id errors", async () => {
+  it("inbox.get returns full row plus reply messages; missing id errors", async () => {
     const { id } = seedDecision(daemon);
-    const r = await client.call<Decision>("inbox.get", { id });
+    daemon.inbox.reply({ decisionId: id, actorId: daemon.rootAgentId, text: "shipped abc" });
+    const r = await client.call<Decision & { messages: Array<{ text: string; actorId: string }> }>(
+      "inbox.get",
+      { id },
+    );
     expect(r.id).toBe(id);
     expect(r.payload).toEqual({ ext: "discord" });
+    expect(r.messages).toHaveLength(1);
+    expect(r.messages[0]!.text).toBe("shipped abc");
+    expect(r.messages[0]!.actorId).toBe(daemon.rootAgentId);
     await expect(client.call("inbox.get", { id: "nope" })).rejects.toThrow(/not found/);
   });
 
@@ -188,13 +198,77 @@ describe("mail_* core tools", () => {
     );
   });
 
-  it("mail_list is alwaysLoaded; mail_respond and mail_propose are deferred", () => {
+  it("mail_list is alwaysLoaded; mail_respond, mail_propose, mail_reply are deferred", () => {
     const list = tools.find((t) => t.name === "mail_list")!;
     const respond = tools.find((t) => t.name === "mail_respond")!;
     const propose = tools.find((t) => t.name === "mail_propose")!;
+    const reply = tools.find((t) => t.name === "mail_reply")!;
     expect(list.alwaysLoaded).toBe(true);
     expect(respond.alwaysLoaded).toBeFalsy();
     expect(propose.alwaysLoaded).toBeFalsy();
+    expect(reply.alwaysLoaded).toBeFalsy();
+  });
+
+  it("mail_reply appends a message and stamps actorId from ctx", async () => {
+    const { id } = seedDecision(daemon);
+    // Approve first so the agent has something to reply to (semantically
+    // typical, though reply works on any decision regardless of status).
+    daemon.inbox.respond({ decisionId: id, actorId: daemon.rootPrincipalId, vote: "approve" });
+    const reply = tools.find((t) => t.name === "mail_reply")!;
+    const result = (await reply.execute(
+      { decisionId: id, text: "done — see commit abc" },
+      makeCtx(daemon),
+    )) as { id: string; text: string; actorId: string; decisionId: string };
+    expect(result.text).toBe("done — see commit abc");
+    expect(result.actorId).toBe(daemon.rootAgentId);
+    expect(result.decisionId).toBe(id);
+    const messages = daemon.inbox.listMessages(id);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.text).toBe("done — see commit abc");
+  });
+
+  it("mail_reply accepts an id prefix", async () => {
+    const { id } = seedDecision(daemon);
+    const reply = tools.find((t) => t.name === "mail_reply")!;
+    const result = (await reply.execute(
+      { decisionId: id.slice(0, 10), text: "hi" },
+      makeCtx(daemon),
+    )) as { decisionId: string };
+    expect(result.decisionId).toBe(id);
+  });
+
+  it("mail_reply rejects callers who did not propose the decision", () => {
+    const childId = ulid();
+    daemon.store
+      .insert(tables.agents)
+      .values({
+        id: childId,
+        name: "child",
+        hostId: daemon.hostId,
+        parentAgentId: daemon.rootAgentId,
+        scope: {},
+        createdAt: Date.now(),
+      })
+      .run();
+    const { id } = daemon.inbox.propose({
+      principalId: daemon.rootPrincipalId,
+      proposingAgentId: childId,
+      tier: "strategic",
+      summary: "child ask",
+      payload: {},
+    });
+    const reply = tools.find((t) => t.name === "mail_reply")!;
+    expect(() => reply.execute({ decisionId: id, text: "done" }, makeCtx(daemon))).toThrow(
+      /only the proposing agent/,
+    );
+    expect(daemon.inbox.listMessages(id)).toHaveLength(0);
+  });
+
+  it("mail_reply errors when the decision id resolves to nothing", () => {
+    const reply = tools.find((t) => t.name === "mail_reply")!;
+    expect(() => reply.execute({ decisionId: "no-such", text: "x" }, makeCtx(daemon))).toThrow(
+      /not found/,
+    );
   });
 
   it("mail_propose is omitted when bus / hostId / store aren't all present", () => {

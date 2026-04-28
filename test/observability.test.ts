@@ -234,6 +234,56 @@ describe("observability.threadInventory + recentEvents", () => {
     const recent = recentEvents(store, { threadId: "t1" });
     expect(recent.length).toBe(2);
   });
+
+  // Regression: chat.ts emits chat.usage with durable:false (per-call usage
+  // is meant to be a transient stream for live subscribers, see chat.ts
+  // around the "kind === 'usage'" branch). threadInventory reads from the
+  // events table, which only contains durable rows. Result: ratio always 0.
+  it("BUG: ignores chat.usage when emitted with durable:false (production shape)", () => {
+    const { store, bus, hostId } = rig();
+    const agentId = "agent-x";
+    bus.publish({
+      type: "chat.usage",
+      hostId,
+      actorId: agentId,
+      threadId: "t1",
+      toAgentId: agentId,
+      durable: false,
+      payload: {
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadInputTokens: 900,
+        cacheCreationInputTokens: 0,
+        totalTokens: 1050,
+      },
+    });
+    bus.publish({
+      type: "chat.turn-end",
+      hostId,
+      actorId: agentId,
+      threadId: "t1",
+      toAgentId: agentId,
+      durable: true,
+      payload: {
+        stopReason: "end_turn",
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 900,
+        cacheCreationTokens: 0,
+        totalTokens: 1050,
+      },
+    });
+
+    const inv = threadInventory(store, { toAgentId: agentId });
+    const t1 = inv.find((r) => r.threadId === "t1")!;
+    expect(t1).toBeDefined();
+    // The thread is visible (chat.turn-end is durable), but the cache hit
+    // ratio is 0 because the only source threadInventory consults is
+    // chat.usage — and those rows never landed in the events table.
+    expect(t1.cacheHitRatio).toBe(0);
+    // Meanwhile the cache fields ARE present on chat.turn-end and would
+    // give the correct 0.9 ratio if threadInventory consulted that type.
+  });
 });
 
 describe("observability tools scope", () => {

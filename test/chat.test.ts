@@ -9,6 +9,7 @@ import { startAgentLoop } from "../src/agent/chat.ts";
 import { createInbox } from "../src/inbox/index.ts";
 import type { Completion, CompletionRequest, Llm } from "../src/llm/types.ts";
 import type { ExtensionHost, ToolDef } from "../src/extensions/index.ts";
+import { eq } from "drizzle-orm";
 
 function mockLlm(script: Completion[]): Llm {
   return {
@@ -671,5 +672,341 @@ describe("mail wake — decision.resolved synthesizes chat.input on mailbox thre
     loop.stop();
     await new Promise((resolve) => setTimeout(resolve, debounceMs + 20));
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe("mailbox sidebar — unread decision resolutions surface on next turn", () => {
+  // Pull-side close-loop for the proposing agent on whatever thread it
+  // next runs in (LOG 2026-04-27). Complements the from-idle wake on
+  // mailbox:<agentId>: when the principal returns to the original chat
+  // thread, the sidebar surfaces "your proposal X was approved" without
+  // forcing a turn on the original (potentially huge) thread when the
+  // resolution itself landed.
+
+  function rigWithInbox() {
+    const base = rig();
+    const principalId = ulid();
+    base.store
+      .insert(tables.principals)
+      .values({ id: principalId, display: "p", channels: [], createdAt: Date.now() })
+      .run();
+    const inbox = createInbox({ bus: base.bus, store: base.store, hostId: base.hostId });
+    return { ...base, inbox, principalId };
+  }
+
+  // Capture every system segment the LLM sees, turn-by-turn.
+  function capturingLlm(scripted: Completion[]): {
+    llm: Llm;
+    systemsPerTurn: Array<Array<{ text: string; cache?: string }>>;
+  } {
+    const systemsPerTurn: Array<Array<{ text: string; cache?: string }>> = [];
+    const llm: Llm = {
+      provider: "mock",
+      defaultModel: "mock-1",
+      async complete(req: CompletionRequest): Promise<Completion> {
+        const sys = req.system;
+        const segs = Array.isArray(sys)
+          ? sys.map((s) => ({ text: s.text, cache: s.cache }))
+          : sys
+            ? [{ text: sys as unknown as string }]
+            : [];
+        systemsPerTurn.push(segs);
+        const c = scripted.shift();
+        if (!c) throw new Error("capturingLlm exhausted");
+        return c;
+      },
+    };
+    return { llm, systemsPerTurn };
+  }
+
+  function sidebarTextFor(turnIndex: number, capture: ReturnType<typeof capturingLlm>): string {
+    const segs = capture.systemsPerTurn[turnIndex] ?? [];
+    // Sidebar segment is the one without cache hint (composeSystemSegments
+    // marks the stable identity segment as cache:"ephemeral").
+    const sidebarSeg = segs.find((s) => !s.cache);
+    return sidebarSeg?.text ?? "";
+  }
+
+  async function sendAndAwait(
+    r: ReturnType<typeof rigWithInbox>,
+    text: string,
+    threadId: string,
+  ): Promise<void> {
+    let resolved = false;
+    const done = new Promise<void>((resolve) => {
+      const unsub = r.bus.subscribe("chat.turn-end", (e) => {
+        if (resolved) return;
+        if (e.threadId === threadId) {
+          resolved = true;
+          unsub();
+          resolve();
+        }
+      });
+    });
+    r.bus.publish({
+      type: "chat.input",
+      hostId: r.hostId,
+      actorId: "cli",
+      durable: true,
+      toAgentId: r.agentId,
+      threadId,
+      payload: { text },
+    });
+    await done;
+    // The chat loop's drain.finally clears thread.worker as a microtask
+    // after this turn returns. Without yielding, an immediately-following
+    // sendAndAwait would publish chat.input while worker still appears
+    // set, and the message would sit in pending with nobody to drain it.
+    // setImmediate yields past the microtask queue.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  it("renders unread resolution on next turn, not on turn after (HWM advances)", async () => {
+    const r = rigWithInbox();
+    const capture = capturingLlm([endTurn("ok1"), endTurn("ok2"), endTurn("ok3")]);
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm: capture.llm,
+      agentId: r.agentId,
+      inbox: r.inbox,
+      // Disable wake firing during this test — we're isolating the sidebar path.
+      mailWakeDebounceMs: 60_000,
+    });
+    try {
+      // Resolve a proposal AFTER the loop starts (so it lands above the HWM).
+      const { id: d1 } = r.inbox.propose({
+        principalId: r.principalId,
+        proposingAgentId: r.agentId,
+        tier: "strategic",
+        summary: "Self-test findings: slim github_list_issues + auto-pick discord guild",
+        payload: { fixes: 2 },
+      });
+      r.inbox.respond({ decisionId: d1, actorId: "principal", vote: "approve" });
+
+      // Turn 1 — sidebar should mention the resolution.
+      await sendAndAwait(r, "what's up?", "T1");
+      const turn1Sidebar = sidebarTextFor(0, capture);
+      expect(turn1Sidebar).toContain("Decision resolutions you haven't seen");
+      expect(turn1Sidebar).toContain(d1);
+      expect(turn1Sidebar).toContain("approved");
+
+      // Turn 2 — same thread, no new resolutions: sidebar should NOT
+      // re-render the same row (HWM advanced past it).
+      await sendAndAwait(r, "anything else?", "T1");
+      const turn2Sidebar = sidebarTextFor(1, capture);
+      expect(turn2Sidebar).not.toContain(d1);
+      expect(turn2Sidebar).not.toContain("Decision resolutions you haven't seen");
+
+      // A second proposal lands and is resolved.
+      const { id: d2 } = r.inbox.propose({
+        principalId: r.principalId,
+        proposingAgentId: r.agentId,
+        tier: "strategic",
+        summary: "Add Slack adapter",
+        payload: {},
+      });
+      r.inbox.respond({ decisionId: d2, actorId: "principal", vote: "deny", message: "wait until v0.1" });
+
+      // Turn 3 — d2 only (d1 already shown).
+      await sendAndAwait(r, "ok cool", "T1");
+      const turn3Sidebar = sidebarTextFor(2, capture);
+      expect(turn3Sidebar).toContain("Decision resolutions you haven't seen");
+      expect(turn3Sidebar).toContain(d2);
+      expect(turn3Sidebar).toContain("denied");
+      expect(turn3Sidebar).not.toContain(d1);
+    } finally {
+      loop.stop();
+    }
+  });
+
+  it("does not ack unread resolutions when budget blocks the paid turn", async () => {
+    const r = rigWithInbox();
+    r.store
+      .insert(tables.budgets)
+      .values({
+        id: ulid(),
+        principalId: r.principalId,
+        agentId: r.agentId,
+        period: "all-time",
+        capUsd: 1,
+        capTokens: null,
+        spentUsd: 1,
+        spentTokens: 0,
+        updatedAt: Date.now(),
+      })
+      .run();
+    const capture = capturingLlm([endTurn("ok after cap raise")]);
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm: capture.llm,
+      agentId: r.agentId,
+      principalId: r.principalId,
+      inbox: r.inbox,
+      mailWakeDebounceMs: 60_000,
+    });
+    try {
+      const { id: d1 } = r.inbox.propose({
+        principalId: r.principalId,
+        proposingAgentId: r.agentId,
+        tier: "strategic",
+        summary: "approved while capped",
+        payload: {},
+      });
+      r.inbox.respond({ decisionId: d1, actorId: "principal", vote: "approve" });
+
+      const blocked = new Promise<string>((resolve) => {
+        const unsub = r.bus.subscribe("chat.error", (e) => {
+          if (e.threadId !== "T1") return;
+          unsub();
+          resolve((e.payload as { error: string }).error);
+        });
+      });
+      r.bus.publish({
+        type: "chat.input",
+        hostId: r.hostId,
+        actorId: "cli",
+        durable: true,
+        toAgentId: r.agentId,
+        threadId: "T1",
+        payload: { text: "while capped" },
+      });
+      await expect(blocked).resolves.toContain("budget exhausted");
+      expect(capture.systemsPerTurn).toHaveLength(0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      r.store
+        .update(tables.budgets)
+        .set({ capUsd: 2, updatedAt: Date.now() })
+        .where(eq(tables.budgets.principalId, r.principalId))
+        .run();
+
+      await sendAndAwait(r, "after cap raise", "T1");
+      const sidebar = sidebarTextFor(0, capture);
+      expect(sidebar).toContain("Decision resolutions you haven't seen");
+      expect(sidebar).toContain(d1);
+      expect(sidebar).toContain("approved");
+    } finally {
+      loop.stop();
+    }
+  });
+
+  it("does not surface resolutions that landed before the loop started", async () => {
+    // HWM is initialized to loop-start; pre-existing history shouldn't
+    // dump on the first turn (would be noise after a daemon restart).
+    const r = rigWithInbox();
+    // Resolve a proposal BEFORE the loop starts.
+    const { id: dOld } = r.inbox.propose({
+      principalId: r.principalId,
+      proposingAgentId: r.agentId,
+      tier: "strategic",
+      summary: "old proposal pre-boot",
+      payload: {},
+    });
+    r.inbox.respond({ decisionId: dOld, actorId: "principal", vote: "approve" });
+    // Sleep ~5ms to ensure loop-start HWM > resolvedAt of dOld.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const capture = capturingLlm([endTurn("ok")]);
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm: capture.llm,
+      agentId: r.agentId,
+      inbox: r.inbox,
+      mailWakeDebounceMs: 60_000,
+    });
+    try {
+      await sendAndAwait(r, "hello", "T1");
+      const turn1Sidebar = sidebarTextFor(0, capture);
+      expect(turn1Sidebar).not.toContain(dOld);
+      expect(turn1Sidebar).not.toContain("Decision resolutions you haven't seen");
+    } finally {
+      loop.stop();
+    }
+  });
+
+  it("HWM is per-thread — rendering on the mailbox wake thread does NOT ack the resolution for a separate chat thread", async () => {
+    // The whole reason we keep mailHwm per-thread (not per-loop). Otherwise
+    // the wake's mailbox:<agentId> turn would advance a shared HWM and
+    // pre-empt the user-facing thread's sidebar.
+    const r = rigWithInbox();
+    const capture = capturingLlm([endTurn("on mailbox"), endTurn("on T1")]);
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm: capture.llm,
+      agentId: r.agentId,
+      inbox: r.inbox,
+      mailWakeDebounceMs: 60_000,
+    });
+    try {
+      const { id: d1 } = r.inbox.propose({
+        principalId: r.principalId,
+        proposingAgentId: r.agentId,
+        tier: "strategic",
+        summary: "the thing",
+        payload: {},
+      });
+      r.inbox.respond({ decisionId: d1, actorId: "principal", vote: "approve" });
+
+      // Simulate the wake landing first by sending a turn on the mailbox thread.
+      await sendAndAwait(r, "(synthetic mail wake)", `mailbox:${r.agentId}`);
+      const mailboxSidebar = sidebarTextFor(0, capture);
+      expect(mailboxSidebar).toContain(d1);
+      expect(mailboxSidebar).toContain("approved");
+
+      // Now the user re-engages on a fresh chat thread — its sidebar
+      // should STILL show d1 even though the mailbox thread already
+      // rendered (and acked, for itself) the same resolution.
+      await sendAndAwait(r, "hi from user", "T1");
+      const t1Sidebar = sidebarTextFor(1, capture);
+      expect(t1Sidebar).toContain(d1);
+      expect(t1Sidebar).toContain("approved");
+    } finally {
+      loop.stop();
+    }
+  });
+
+  it("does not surface resolutions of proposals filed by other agents", async () => {
+    const r = rigWithInbox();
+    // Seed a second agent and have it propose+resolve.
+    const otherAgent = "other";
+    r.store
+      .insert(tables.agents)
+      .values({ id: otherAgent, name: otherAgent, hostId: r.hostId, createdAt: Date.now() })
+      .run();
+    const capture = capturingLlm([endTurn("ok")]);
+    const loop = startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm: capture.llm,
+      agentId: r.agentId,
+      inbox: r.inbox,
+      mailWakeDebounceMs: 60_000,
+    });
+    try {
+      const { id: dOther } = r.inbox.propose({
+        principalId: r.principalId,
+        proposingAgentId: otherAgent,
+        tier: "strategic",
+        summary: "not my proposal",
+        payload: {},
+      });
+      r.inbox.respond({ decisionId: dOther, actorId: "principal", vote: "approve" });
+
+      await sendAndAwait(r, "hi", "T1");
+      const sb = sidebarTextFor(0, capture);
+      expect(sb).not.toContain(dOther);
+      expect(sb).not.toContain("Decision resolutions you haven't seen");
+    } finally {
+      loop.stop();
+    }
   });
 });

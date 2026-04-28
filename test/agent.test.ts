@@ -338,6 +338,68 @@ describe("runAgent", () => {
     expect((newcomerResult as { is_error?: boolean }).is_error).toBeUndefined();
   });
 
+  it("processes tool_use blocks even when stop_reason is not 'tool_use' (pause_turn fold)", async () => {
+    // Anthropic returns stop_reason='pause_turn' on long parallel-tool-use
+    // batches; our adapter folds that to 'end_turn' (types.ts only enumerates
+    // the five canonical reasons). If the runtime gates tool dispatch on
+    // stop_reason rather than on actual content, the assistant message lands
+    // in history with unanswered tool_use blocks — and the next API call
+    // 400s with "tool_use ids were found without tool_result blocks".
+    const paused: Completion = {
+      content: [
+        { type: "tool_use", id: "tA", name: "echo", input: { msg: "a" } },
+        { type: "tool_use", id: "tB", name: "echo", input: { msg: "b" } },
+      ],
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 5,
+        outputTokens: 5,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        totalTokens: 10,
+      },
+    };
+    const llm = mockLlm([paused, endTurn("done.")]);
+    const echo: ToolDef<{ msg: string }, string> = {
+      name: "echo",
+      description: "echo",
+      inputSchema: {
+        type: "object",
+        properties: { msg: { type: "string" } },
+        required: ["msg"],
+      },
+      execute: (args) => `echoed:${args.msg}`,
+    };
+    const r = await runAgent({
+      llm,
+      toolCtx: ctx,
+      tools: [echo],
+      messages: [{ role: "user", content: "go" }],
+    });
+
+    // Structural invariant: every tool_use block in an assistant message
+    // must have a matching tool_result block in the immediately-following
+    // user message. This is exactly what the API checks server-side.
+    for (let i = 0; i < r.messages.length; i++) {
+      const m = r.messages[i]!;
+      if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+      const toolUseIds = m.content
+        .filter((b): b is { type: "tool_use"; id: string } => b.type === "tool_use")
+        .map((b) => b.id);
+      if (toolUseIds.length === 0) continue;
+      const next = r.messages[i + 1];
+      expect(next, `assistant message #${i} has tool_use but no follow-up`).toBeDefined();
+      expect(next!.role).toBe("user");
+      expect(Array.isArray(next!.content)).toBe(true);
+      const resultIds = (next!.content as ContentBlock[])
+        .filter((b): b is { type: "tool_result"; tool_use_id: string; content: string } =>
+          b.type === "tool_result",
+        )
+        .map((b) => b.tool_use_id);
+      expect(resultIds.sort()).toEqual([...toolUseIds].sort());
+    }
+  });
+
   it("getTools removes a renamed-away tool from dispatch on the next round", async () => {
     const llm = mockLlm([
       toolUse("t1", "rename", {}),

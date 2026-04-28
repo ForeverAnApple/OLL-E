@@ -1342,6 +1342,18 @@ interface InboxRow {
   resolvedAt: number | null;
 }
 
+interface DecisionMessageRow {
+  id: string;
+  decisionId: string;
+  actorId: string;
+  text: string;
+  at: number;
+}
+
+interface InboxRowWithMessages extends InboxRow {
+  messages?: DecisionMessageRow[];
+}
+
 function fmtAge(ms: number): string {
   if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
   if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
@@ -1426,7 +1438,7 @@ async function cmdInbox(args: string[]): Promise<void> {
       case "show": {
         const id = rest[0];
         if (!id) throw new Error("usage: olle inbox show <id>");
-        const r = await client.call<InboxRow>("inbox.get", { id });
+        const r = await client.call<InboxRowWithMessages>("inbox.get", { id });
         const now = Date.now();
         console.log(`id:        ${r.id}`);
         console.log(`status:    ${r.status}`);
@@ -1445,6 +1457,17 @@ async function cmdInbox(args: string[]): Promise<void> {
         console.log(`summary:   ${r.summary}`);
         console.log("payload:");
         console.log(JSON.stringify(r.payload, null, 2));
+        if (r.messages && r.messages.length > 0) {
+          console.log("");
+          console.log(`replies (${r.messages.length}):`);
+          for (const m of r.messages) {
+            const when = new Date(m.at).toISOString();
+            console.log(`  [${when}] ${m.actorId}:`);
+            for (const line of m.text.split("\n")) {
+              console.log(`    ${line}`);
+            }
+          }
+        }
         return;
       }
       case "respond": {
@@ -1485,7 +1508,7 @@ function printHelp(): void {
       "  Inbox — async decisions awaiting your response (paired with mail_* tools):",
       "  inbox                                         interactive TUI (vim keys; ? for help)",
       "  inbox list [--all]                            list open (or all) decisions",
-      "  inbox show <id>                               full decision payload",
+      "  inbox show <id>                               full decision payload + agent reply thread",
       "  inbox respond <id> approve|deny|modify [--message ...] [--payload {json}]",
       "",
       "  Observability — same data agents see via their query_my_* tools:",

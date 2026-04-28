@@ -10,6 +10,7 @@ import migration0003 from "./migrations/0003_event_mailbox.sql" with { type: "te
 import migration0004 from "./migrations/0004_memory_surface.sql" with { type: "text" };
 import migration0005 from "./migrations/0005_ledger_visibility.sql" with { type: "text" };
 import migration0006 from "./migrations/0006_tool_results.sql" with { type: "text" };
+import migration0007 from "./migrations/0007_decision_messages.sql" with { type: "text" };
 
 export interface MigrationFile {
   readonly index: number;
@@ -24,6 +25,7 @@ const MIGRATIONS: readonly MigrationFile[] = [
   { index: 4, name: "memory_surface", sql: migration0004 },
   { index: 5, name: "ledger_visibility", sql: migration0005 },
   { index: 6, name: "tool_results", sql: migration0006 },
+  { index: 7, name: "decision_messages", sql: migration0007 },
 ];
 
 export function listMigrations(): readonly MigrationFile[] {

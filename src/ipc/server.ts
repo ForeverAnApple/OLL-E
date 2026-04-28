@@ -467,10 +467,15 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: `decision ${id} not found` } });
           return;
         }
+        const enriched = opts.store ? enrichDecision(opts.store, row) : row;
+        // Also pull the reply messages so the CLI can render the full
+        // thread without a second round-trip — keeps `olle inbox show`
+        // a single call. Cheap query (indexed on decision_id, at).
+        const messages = opts.inbox.listMessages(row.id);
         send({
           id: req.id,
           ok: true,
-          value: opts.store ? enrichDecision(opts.store, row) : row,
+          value: { ...enriched, messages },
         });
         return;
       }
