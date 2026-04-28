@@ -797,6 +797,41 @@ Manual-test of `mail_reply` (LOG 2026-04-27) revealed the next visibility gap: t
 
 ---
 
+## 2026-04-28 — Soul-seeding via bootstrap prompt; identity moves out of the binary
+
+The conversation that surfaced this: the root agent's identity ("you are olle, a helpful assistant…") was hardcoded at `daemon.ts:252-260`, which means an agent with full `memory_write` authority could *append* principles but never *replace* the identity that ships in the binary. Code is structurally more authoritative than any principle the agent will ever write — that violates "the environment is clay, not prison" and "every extension is replaceable by the agent itself." The fix is to move identity out of the binary and into seeded memory rows the agent (and its principal) own and can rewrite.
+
+**The shape that landed:**
+
+- **Two boot prompts.** When the root agent has zero `role='identity'` memories, the daemon uses a **bootstrap interviewer** prompt: "you were just installed; neither of you has a name; learn enough to be useful starting tomorrow; record what you learn with `memory_write`." Once identity exists, a **shrunk normal** prompt — pure operational orientation (catalog, load_tools, mailbox, host context) with all opinions removed.
+- **`role='identity'`** as a new posture tag. Joins `goal`, `preference`, `skill`, `knowledge`, `culture` per LOG 2026-04-23. No schema migration — `memories.role` is a free-form string. Documented in ARCHITECTURE.md memory-tiers.
+- **Render path.** Identity rows render alongside principles in the cached system segment, extending the SOUL pattern from LOG 2026-04-24. New `loadIdentity` + `renderSoul` in `src/memory/principles.ts`; `chat.ts` calls both. Identity renders first ("Who you are: …"), principles after.
+- **Detection.** Daemon resolves the boot prompt at every turn via a thunk on `system` (queries `memories WHERE actor_id=rootAgentId AND role='identity'`); the very turn that writes the first identity row flips the next turn into the normal prompt without needing a daemon restart.
+- **Bootstrap requires three.** The interviewer prompt names exactly three load-bearing asks: (a) what to call the principal, (b) what the principal wants to call the agent, (c) one real first task. Beyond that, "err on too few questions"; the rest accrues through living per VISION.
+- **`agents.name` stays as the internal handle.** The root row keeps `name='root'` for FK / mailbox routing. The principal-facing display name lives in the identity memory; renaming is a `memory_write`, not a schema mutation.
+
+**The big rejection.** The plan started as "deep-interview-lite" — dimension-driven question loop, pressure ladder, pushback pattern library, challenge modes (Ontologist / Contrarian), readiness gates as code, crystallization step (raw answers → typed rows), scratch-tier resume state machine, four new role tags (`identity`, `principle`, `anti-pattern`, `self-portrait`). Borrowed from `gstack/office-hours`, `oh-my-codex/deep-interview`, and `gstack/plan-tune`. All of it is exactly the kind of framework-style abstraction AGENTS.md "failure modes" rejects: *"agents reason in markdown and code; structure that costs agent tokens and clarity is a loss."* Those reference skills are solving a different problem (extracting bulletproof specs for downstream automation). Soul-seeding's research takeaway was *minimum viable seed*, with drift expected and correction ongoing. The bootstrap prompt with three required asks + technique notes gets ~95% of the value with ~5% of the code. If real use produces consistently bad seeds we add scaffolding *then*, with real evidence about which scaffold to add.
+
+**The dry-run that proved it.** Before locking, we ran the original 10-turn fixed script in conversation. Two questions in, the cognitive-interview "walk me through yesterday" technique was rejected by the principal: *"I just don't see how this is how you're going to work together with me. I can tell you how I currently work and how I WANT to work."* The technique was imported from forensic interviewing, where the witness might be unreliable. Soul-seeding has the opposite frame — the principal is *authoring* the agent's identity, not being interrogated about behavior. The aspirational dimension is first-class signal, not noise. The script collapsed against contact with one principal; the structured loop would have collapsed the same way, just slower.
+
+**Phase 2 (`[DEFERRED-to-v0.1]`).** Living calibration — agent observes its own behavior against principles, surfaces stated-vs-lived drift to inbox via Socratic elenchus. Schema is already designed for it (memories are event-sourced; principles carry depth). **Resurrect when:** 2+ weeks of v0 use produces real divergence the principal complains about, OR the bootstrap prompt produces consistently bad seeds.
+
+**`memory_write` joins the always-loaded core.** Soul-seeding's bootstrap turn instructs the agent to record what it learns via `memory_write` — but `memory_write` was deferred, forcing a `load_tools(["memory_write"])` round-trip on the very first first-contact turn. That's exactly the kind of papercut habitat philosophy is supposed to delete. Promoting it is symmetric with `memory_search` (the read half is already always-loaded) and bounded — `memory_write` is the only write surface for the persistent self, not a wide-open category — so the always-loaded core grows from four tools to five (`load_tools`, `query_self`, `mail_list`, `memory_search`, `memory_write`). ARCHITECTURE.md's "Tool catalog and lazy loading" updated to reflect.
+
+---
+
+## 2026-04-28 — Migrations 0001-0008 collapsed into a single `0001_init.sql`
+
+Pre-v1; no installed-user upgrade path to preserve. The eight historical migrations were a development artifact (each one a real schema decision logged separately) rather than a contract with users. Carrying them forward means every fresh install walks through CREATE → ALTER → CREATE → ALTER replays of the same end state, plus the reasoning-trail noise of the historical names is now in `_migrations` instead of `LOG.md` where it belongs.
+
+The compacted `0001_init.sql` defines the final-state CREATE TABLE / CREATE INDEX statements (matching `schema.ts`). `migrate.ts` now imports only the single migration. Verified by the full test suite (280 tests pass against the new schema). The reasoning behind each table's shape stays in `LOG.md` (search for the table name); the SQL file just records what's in the store today.
+
+**Cost we paid:** historical commits' migration-numbered filenames no longer resolve at HEAD. The git history is the audit trail; `git log -- src/store/migrations/` reconstructs the per-decision sequence if anyone needs it.
+
+**Resurrect when:** v1 ships and we have installed users. From that point forward, schema changes are append-only migrations again, never collapsed.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.

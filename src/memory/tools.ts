@@ -173,6 +173,12 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
     tier: "operational",
     category: "memory",
     shortClause: "record or update a memory (private/team/scratch)",
+    // The write half of `memory_search` belongs in the always-loaded
+    // core: bootstrap-interview turns and any turn that learns something
+    // worth remembering would otherwise spend a `load_tools` round-trip
+    // before recording. Cheap to carry, paid for on first soul-seeding
+    // turn alone (LOG 2026-04-28).
+    alwaysLoaded: true,
     description:
       "Write or update a memory. Memory is your persistent self across time — preferences, principles, goals, skills, knowledge. Role tags the posture: `principle` memories are your strict commitments (they're injected into every turn and passed to any child you spawn), `goal` is an in-flight intention, `skill`/`knowledge` is how-you-do-things. Default depth weights the belief under the resistance model: principles default to 10 (strict), other roles to 1 (lived). Scope: `private` (yours only) / `team` (shared with a team) / `scratch` (task-ephemeral). Pass `updates: <id>` to edit an existing memory you own.",
     inputSchema: {

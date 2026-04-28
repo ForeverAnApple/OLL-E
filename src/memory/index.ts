@@ -13,4 +13,11 @@ export {
 } from "./events.ts";
 export { startMemoryProjector, type MemoryProjector, type ProjectorOptions } from "./projector.ts";
 export { buildMemoryTools, type MemoryToolsOptions } from "./tools.ts";
-export { loadPrinciples, renderPrinciples, type PrincipleRow } from "./principles.ts";
+export {
+  loadPrinciples,
+  renderPrinciples,
+  loadIdentity,
+  renderSoul,
+  type PrincipleRow,
+  type IdentityRow,
+} from "./principles.ts";

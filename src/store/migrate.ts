@@ -4,14 +4,10 @@ import type { Database } from "bun:sqlite";
 // readdirSync against `/$bunfs/root/migrations` returns ENOENT — the bundler
 // only carries files reachable through the import graph. Add new migrations
 // here in numeric order; the array is the manifest.
+//
+// 2026-04-28: 0001-0008 collapsed into a single `0001_init.sql` (LOG entry
+// for that date). Pre-v1 had no installed-user upgrade path to preserve.
 import migration0001 from "./migrations/0001_init.sql" with { type: "text" };
-import migration0002 from "./migrations/0002_task_runs.sql" with { type: "text" };
-import migration0003 from "./migrations/0003_event_mailbox.sql" with { type: "text" };
-import migration0004 from "./migrations/0004_memory_surface.sql" with { type: "text" };
-import migration0005 from "./migrations/0005_ledger_visibility.sql" with { type: "text" };
-import migration0006 from "./migrations/0006_tool_results.sql" with { type: "text" };
-import migration0007 from "./migrations/0007_decision_messages.sql" with { type: "text" };
-import migration0008 from "./migrations/0008_decision_message_reads.sql" with { type: "text" };
 
 export interface MigrationFile {
   readonly index: number;
@@ -21,13 +17,6 @@ export interface MigrationFile {
 
 const MIGRATIONS: readonly MigrationFile[] = [
   { index: 1, name: "init", sql: migration0001 },
-  { index: 2, name: "task_runs", sql: migration0002 },
-  { index: 3, name: "event_mailbox", sql: migration0003 },
-  { index: 4, name: "memory_surface", sql: migration0004 },
-  { index: 5, name: "ledger_visibility", sql: migration0005 },
-  { index: 6, name: "tool_results", sql: migration0006 },
-  { index: 7, name: "decision_messages", sql: migration0007 },
-  { index: 8, name: "decision_message_reads", sql: migration0008 },
 ];
 
 export function listMigrations(): readonly MigrationFile[] {

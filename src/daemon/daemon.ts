@@ -22,6 +22,7 @@ import { startChatHealthMonitor, type ChatHealthMonitor } from "./chat-health.ts
 import { installFaultIsolation, type FaultIsolation } from "./fault-isolation.ts";
 import {
   buildMemoryTools,
+  loadIdentity,
   startMemoryProjector,
   type MemoryProjector,
 } from "../memory/index.ts";
@@ -265,12 +266,13 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       // Children inherit the same tool set so they can themselves spawn,
       // read extension files, etc. Scope still gates what they get to use.
       agentManager.setCoreTools(coreTools);
+      const rootLoopAgentId = chatAgentId;
       chat = startAgentLoop({
         bus,
         store,
         hostId,
         llm,
-        agentId: chatAgentId,
+        agentId: rootLoopAgentId,
         extensions,
         coreTools,
         ledger,
@@ -278,17 +280,16 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         principalId: rootPrincipalId,
         threadsDir: paths.threadsDir,
         toolTruncate,
-        system: [
-          "You are olle, a helpful assistant living inside OLL-E — a habitat built for agents like you.",
-          "Your job is to accomplish what the human asks. OLL-E is yours to reshape: when the world is missing something you need, extend it.",
-          buildHostContextPrompt(paths, hostId),
-          "Your tools live in a catalog (rendered below). Most schemas are deferred — call `load_tools([\"name\"])` to pull them into context for this thread; the schema appears on the next turn. The catalog tells you what exists; loading is the act of picking it up. Unload with `unload_tools` when done.",
-          "The four tools you always carry — `load_tools`, `query_self`, `mail_list`, `memory_search` — are in your tool list every turn without loading. Use `query_self` to orient at the start of strategic work; `mail_list` to see open decisions awaiting your principal's response; `memory_search` to recall what you've remembered.",
-          "Never block a human waiting for slow work — delegate via `spawn_agent`. The per-turn mailbox sidebar shows live threads; load `query_my_threads` for the durable thread inventory.",
-          "When something feels off, look first (load `query_my_usage` / `query_my_runs` / `query_events`); when caching seems wasteful, propose a strategy revision through the inbox. Be concise.",
-        ].join("\n\n"),
+        // Boot prompt branches on whether identity has been seeded yet
+        // (LOG 2026-04-28). Resolve at turn-time, not daemon-start-time:
+        // fresh installs can seed identity during the first conversation,
+        // and the next turn in the same daemon must use the normal prompt.
+        system: () =>
+          hasSeededIdentity(store, rootLoopAgentId)
+            ? buildNormalPrompt(paths, hostId)
+            : buildBootstrapPrompt(paths, hostId),
       });
-      agentManager.register(chatAgentId, chat);
+      agentManager.register(rootLoopAgentId, chat);
       // Crash funnel: repeated chat.error events auto-propose an inbox
       // diagnostic so the principal hears even when chat itself is dead.
       chatHealth = startChatHealthMonitor({
@@ -415,6 +416,51 @@ function buildHostContextPrompt(paths: OllePaths, hostId: string): string {
     `Logs directory: ${paths.logsDir}.`,
     "These are stable coordinates, not proof that a specific file, extension, cwd, or executable exists right now. Before filesystem/subprocess work, call query_host_context or the relevant read/list tool to verify live state.",
   ].join(" ");
+}
+
+/** True when the root agent has at least one `role='identity'` memory.
+ *  Drives the daemon's choice of boot prompt: bootstrap-interviewer when
+ *  no identity has been seeded yet (first run after install), otherwise
+ *  the shrunk normal prompt that lets seeded identity + principles
+ *  render themselves through the SOUL pipeline. See LOG 2026-04-28.
+ *  Evaluated at turn start (system is a thunk) so a fresh install leaves
+ *  bootstrap mode as soon as the agent writes its first identity row. */
+function hasSeededIdentity(store: Store, agentId: string): boolean {
+  return loadIdentity(store, agentId).length > 0;
+}
+
+/** First-run bootstrap interviewer prompt. Used the very first time the
+ *  root agent runs after install, when no identity memories exist yet.
+ *  Three required asks (principal name, agent name, first task) plus
+ *  technique notes; agent records what it learns via `memory_write`,
+ *  then stops interviewing. Subsequent boots skip this entirely. */
+function buildBootstrapPrompt(paths: OllePaths, hostId: string): string {
+  return [
+    "You were just installed. Your principal is talking to you for the first time. Neither of you has a name for the other yet.",
+    "Your only job in this conversation is to learn enough to be useful starting tomorrow — not a complete portrait, the minimum to start. Three things you MUST learn before you stop interviewing:\n  1. What to call your principal.\n  2. What they want to call you.\n  3. One real thing they want help with first.",
+    "Beyond those, ask whatever feels load-bearing — communication style, things to specifically NOT do, how cautious vs eager they want you to be — but err on too few questions. The rest grows through living, not through this one conversation.",
+    "Technique notes: ground vague answers in concrete instances (\"give me one real example\"); push past polished first answers (\"what's the version that's harder to say?\"); reflect what you heard back so the principal can correct it.",
+    "Record what you learn as you go using `memory_write`:\n  - Names → role='identity', scope='private', depth=10 (one row for what to call your principal, one for your own name).\n  - Operative beliefs → role='principle', scope='private', depth=5 for foundational beliefs you'd rebuild decisions on, depth=2 for casual preferences. Put the *reason* in the body so future-you knows why.",
+    "When the three required items are captured and you've heard enough to start being useful, stop interviewing and ask what they want to do first. The next conversation will skip this introduction — you become the agent you helped describe.",
+    buildHostContextPrompt(paths, hostId),
+    "Always-loaded tools you carry every turn: `load_tools`, `query_self`, `mail_list`, `memory_search`, `memory_write`. Other tool schemas are deferred — call `load_tools([\"name\"])` to pull them into context for this thread.",
+  ].join("\n\n");
+}
+
+/** Normal boot prompt — used once identity has been seeded. Pure
+ *  operational orientation: catalog physics, always-loaded tools,
+ *  delegation, look-first-when-something-is-off. All opinions and
+ *  identity live in seeded memory rows and render through the SOUL
+ *  pipeline (`renderSoul` in src/memory/principles.ts). */
+function buildNormalPrompt(paths: OllePaths, hostId: string): string {
+  return [
+    "You live inside OLL-E — a habitat for agents like you. OLL-E is yours to reshape: when the world is missing something you need, extend it.",
+    buildHostContextPrompt(paths, hostId),
+    "Your tools live in a catalog (rendered below). Most schemas are deferred — call `load_tools([\"name\"])` to pull them into context for this thread; the schema appears on the next turn. The catalog tells you what exists; loading is the act of picking it up. Unload with `unload_tools` when done.",
+    "The five tools you always carry — `load_tools`, `query_self`, `mail_list`, `memory_search`, `memory_write` — are in your tool list every turn without loading. Use `query_self` to orient at the start of strategic work; `mail_list` to see open decisions awaiting your principal's response; `memory_search` and `memory_write` to recall and record what matters.",
+    "Never block a human waiting for slow work — delegate via `spawn_agent`. The mailbox sidebar shows live threads; load `query_my_threads` for the durable thread inventory.",
+    "When something feels off, look first (load `query_my_usage` / `query_my_runs` / `query_events`).",
+  ].join("\n\n");
 }
 
 function checkNotRunning(paths: OllePaths): void {

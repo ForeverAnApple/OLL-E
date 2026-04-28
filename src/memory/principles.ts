@@ -77,3 +77,53 @@ export function renderPrinciples(rows: PrincipleRow[]): string | null {
   }
   return lines.join("\n");
 }
+
+// Identity rows live alongside principles on the same surface (memory).
+// LOG 2026-04-28 — soul-seeding: `role='identity'` is the foundational
+// "who you are" layer, written by the bootstrap interview and rendered
+// at the top of the cached system segment so it sits ahead of the
+// principles block. Absence of identity rows on the root agent is what
+// flips the daemon into bootstrap-interviewer mode in the first place.
+
+export interface IdentityRow {
+  id: string;
+  title: string;
+  bodyMd: string;
+}
+
+export function loadIdentity(store: Store, agentId: string): IdentityRow[] {
+  return store
+    .select({
+      id: tables.memories.id,
+      title: tables.memories.title,
+      bodyMd: tables.memories.bodyMd,
+    })
+    .from(tables.memories)
+    .where(
+      and(
+        eq(tables.memories.actorId, agentId),
+        eq(tables.memories.scope, "private"),
+        eq(tables.memories.role, "identity"),
+      ),
+    )
+    .orderBy(asc(tables.memories.id))
+    .all();
+}
+
+/** Combined soul block: identity first, then principles. Returns null
+ *  when both are empty so the caller appends nothing — important for the
+ *  bootstrap-interview run where neither layer exists yet. */
+export function renderSoul(
+  identity: IdentityRow[],
+  principles: PrincipleRow[],
+): string | null {
+  const parts: string[] = [];
+  if (identity.length > 0) {
+    const lines: string[] = ["Who you are:"];
+    for (const r of identity) lines.push(`- ${r.title}: ${r.bodyMd}`);
+    parts.push(lines.join("\n"));
+  }
+  const principleBlock = renderPrinciples(principles);
+  if (principleBlock) parts.push(principleBlock);
+  return parts.length > 0 ? parts.join("\n\n") : null;
+}

@@ -51,6 +51,10 @@ function toolUseTurn(name: string, input: Record<string, unknown>): Completion {
   };
 }
 
+function flattenSystem(system: CompletionRequest["system"]): string {
+  return Array.isArray(system) ? system.map((s) => s.text).join("\n") : (system ?? "");
+}
+
 function fakeLiveExtensionHost(opts: {
   loaded: Set<string>;
   extensionName: string;
@@ -145,6 +149,83 @@ describe("agent loop over the mailbox", () => {
     expect(seen[0]!.threadId).toBe("t1");
     expect(seen[1]!.threadId).toBe("t1");
     expect((seen[0]!.payload as { text: string }).text).toBe("hi from mock");
+  });
+
+  it("resolves function system prompts at turn time", async () => {
+    const r = rig();
+    const requests: CompletionRequest[] = [];
+    const llm: Llm = {
+      provider: "mock",
+      defaultModel: "mock-1",
+      async complete(req) {
+        requests.push(req);
+        return endTurn(`turn ${requests.length}`);
+      },
+    };
+    startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      system: () => {
+        const seeded = r.store.raw
+          .query<{ id: string }, [string]>(
+            "SELECT id FROM memories WHERE actor_id = ? AND scope = 'private' AND role = 'identity' LIMIT 1",
+          )
+          .all(r.agentId);
+        return seeded.length > 0 ? "NORMAL PROMPT" : "BOOTSTRAP PROMPT";
+      },
+    });
+
+    async function send(text: string): Promise<void> {
+      const done = new Promise<void>((resolve) => {
+        const unsub = r.bus.subscribe("chat.turn-end", () => {
+          unsub();
+          resolve();
+        });
+      });
+      r.bus.publish({
+        type: "chat.input",
+        hostId: r.hostId,
+        actorId: "cli",
+        durable: true,
+        toAgentId: r.agentId,
+        threadId: "t1",
+        payload: { text },
+      });
+      await done;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    await send("first");
+    r.store
+      .insert(tables.memories)
+      .values({
+        id: ulid(),
+        hlc: "1",
+        hostId: r.hostId,
+        actorId: r.agentId,
+        scope: "private",
+        scopeRef: r.agentId,
+        role: "identity",
+        depth: 10,
+        title: "name",
+        bodyMd: "I am OLL-E.",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      })
+      .run();
+    await send("second");
+
+    const firstSystem = flattenSystem(requests[0]!.system);
+    const secondSystem = flattenSystem(requests[1]!.system);
+    expect(firstSystem).toContain("BOOTSTRAP PROMPT");
+    expect(firstSystem).not.toContain("NORMAL PROMPT");
+    expect(secondSystem).toContain("NORMAL PROMPT");
+    expect(secondSystem).not.toContain("BOOTSTRAP PROMPT");
+    expect(secondSystem).toContain("Who you are:");
+    expect(secondSystem).toContain("I am OLL-E.");
   });
 
   it("ignores chat.input that isn't addressed to this agent's mailbox", async () => {

@@ -9,8 +9,10 @@ import {
   MEMORY_FORGOTTEN,
   MEMORY_WROTE,
   buildMemoryTools,
+  loadIdentity,
   loadPrinciples,
   renderPrinciples,
+  renderSoul,
   startMemoryProjector,
 } from "../src/memory/index.ts";
 import { startAgentLoop } from "../src/agent/chat.ts";
@@ -803,5 +805,101 @@ describe("principle injection", () => {
     proj.stop();
     r.bus.close();
     r.store.close();
+  });
+});
+
+describe("identity + soul rendering (LOG 2026-04-28)", () => {
+  it("loadIdentity returns only actor's role=identity private memories", async () => {
+    const r = rig();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const tools = buildMemoryTools({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const write = getTool(tools, "memory_write");
+    r.store
+      .insert(tables.agents)
+      .values({ id: "alice", name: "alice", hostId: r.hostId, scope: {}, createdAt: Date.now() })
+      .run();
+    r.store
+      .insert(tables.agents)
+      .values({ id: "bob", name: "bob", hostId: r.hostId, scope: {}, createdAt: Date.now() })
+      .run();
+    const ctx = makeCtx("alice", r.hostId);
+    await write.execute(
+      { title: "agent name", bodyMd: "ollie", role: "identity", depth: 10 },
+      ctx,
+    );
+    await write.execute(
+      { title: "principal name", bodyMd: "dana", role: "identity", depth: 10 },
+      ctx,
+    );
+    // Non-identity — excluded
+    await write.execute({ title: "honesty", bodyMd: "always", role: "principle" }, ctx);
+    // Bob's identity — must not leak to Alice
+    await write.execute(
+      { title: "agent name", bodyMd: "bobbo", role: "identity", depth: 10 },
+      makeCtx("bob", r.hostId),
+    );
+
+    const ids = loadIdentity(r.store, "alice");
+    expect(ids.map((i) => i.bodyMd).sort()).toEqual(["dana", "ollie"]);
+    expect(ids.find((i) => i.bodyMd === "bobbo")).toBeUndefined();
+    proj.stop();
+    r.bus.close();
+    r.store.close();
+  });
+
+  it("renderSoul returns null when both layers are empty (bootstrap turn)", () => {
+    expect(renderSoul([], [])).toBeNull();
+  });
+
+  it("renderSoul renders identity-only when no principles exist", () => {
+    const out = renderSoul(
+      [{ id: "01J", title: "agent name", bodyMd: "ollie" }],
+      [],
+    );
+    expect(out).not.toBeNull();
+    expect(out!).toContain("Who you are:");
+    expect(out!).toContain("agent name: ollie");
+    expect(out!).not.toContain("Your principles");
+  });
+
+  it("renderSoul renders principles-only when no identity exists", () => {
+    const out = renderSoul(
+      [],
+      [
+        {
+          id: "01K",
+          title: "honesty",
+          bodyMd: "always",
+          depth: 10,
+          seededFrom: null,
+          authoredBy: null,
+        },
+      ],
+    );
+    expect(out).not.toBeNull();
+    expect(out!).not.toContain("Who you are");
+    expect(out!).toContain("Your principles");
+    expect(out!).toContain("honesty");
+  });
+
+  it("renderSoul orders identity before principles", () => {
+    const out = renderSoul(
+      [{ id: "01J", title: "agent name", bodyMd: "ollie" }],
+      [
+        {
+          id: "01K",
+          title: "honesty",
+          bodyMd: "always",
+          depth: 10,
+          seededFrom: null,
+          authoredBy: null,
+        },
+      ],
+    );
+    expect(out).not.toBeNull();
+    const whoIdx = out!.indexOf("Who you are:");
+    const principlesIdx = out!.indexOf("Your principles");
+    expect(whoIdx).toBeGreaterThanOrEqual(0);
+    expect(principlesIdx).toBeGreaterThan(whoIdx);
   });
 });

@@ -30,7 +30,7 @@ import { checkTool } from "../permissions/index.ts";
 import type { AgentScope } from "../store/schema.ts";
 import { tables } from "../store/index.ts";
 import { and, eq } from "drizzle-orm";
-import { loadPrinciples, renderPrinciples } from "../memory/principles.ts";
+import { loadIdentity, loadPrinciples, renderSoul } from "../memory/principles.ts";
 import { renderToolCatalog } from "./catalog.ts";
 import { buildLoadoutTools, markLoaded, type LoadResultEntry } from "../tools/loadout.ts";
 import {
@@ -47,7 +47,7 @@ export interface AgentLoopOptions {
   store: Store;
   hostId: string;
   llm: Llm;
-  system?: string;
+  system?: string | (() => string | undefined);
   /** The agent whose mailbox we're draining. */
   agentId: string;
   /** Extension runtime — loop exposes extension-owned tools alongside
@@ -315,11 +315,17 @@ async function runTurn(
     };
     const scope = loadAgentScope(opts.store, opts.agentId);
     const grantProposed = new Set<string>();
-    // Principles — the agent's strict commitments, injected at turn
-    // start instead of retrieved (openclaw SOUL pattern adapted to
-    // one-surface memory — LOG 2026-04-23). Stable sort (depth desc,
-    // id asc) keeps prompt caches warm across turns with no changes.
-    const principleBlock = renderPrinciples(loadPrinciples(opts.store, opts.agentId));
+    // SOUL block — identity (who you are) + principles (your strict
+    // commitments), injected at turn start instead of retrieved
+    // (openclaw SOUL pattern adapted to one-surface memory — LOG
+    // 2026-04-23, extended for identity by LOG 2026-04-28 soul-seeding).
+    // Identity renders first so the agent reads its own name before its
+    // commitments. Stable sort keeps prompt caches warm across turns
+    // with no changes.
+    const principleBlock = renderSoul(
+      loadIdentity(opts.store, opts.agentId),
+      loadPrinciples(opts.store, opts.agentId),
+    );
     // Tool catalog — pure function of the registered tool set, rendered
     // into the stable identity segment so the agent reads "what exists"
     // alongside its principles. Per-thread loaded state is encoded in
@@ -339,7 +345,7 @@ async function runTurn(
     // Structured system prompt with the cache breakpoint between stable
     // (base + principles + catalog) and volatile (sidebar) segments.
     const systemSegments = composeSystemSegments(
-      opts.system,
+      typeof opts.system === "function" ? opts.system() : opts.system,
       principleBlock,
       catalogBlock,
       sidebar.text,
