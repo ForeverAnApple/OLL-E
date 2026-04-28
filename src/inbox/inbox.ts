@@ -64,6 +64,14 @@ export interface Inbox {
    *  to include resolved/stale entries (for audit / catching missed
    *  replies on restart). */
   listProposedBy(actorId: string, opts?: { includeResolved?: boolean; limit?: number }): Decision[];
+  /** Decisions that need this reader's attention — open (awaiting their
+   *  vote) PLUS resolved decisions with unread replies (agent reported
+   *  back, principal hasn't read it). Backs the default `olle inbox`
+   *  filter. Newest first. The "open" status alone is decision-lifecycle;
+   *  this method also accounts for reader state so a resolved decision
+   *  with a new "done — see commit X" reply still surfaces in the
+   *  default view. */
+  listActionable(principalId: string, readerActorId: string, limit?: number): Decision[];
   get(id: string): Decision | undefined;
   /** Resolve a full id or unique prefix to a Decision. Returns undefined
    *  when nothing matches; throws when the prefix is ambiguous. The CLI
@@ -161,6 +169,29 @@ export function createInbox(opts: InboxOptions): Inbox {
       .orderBy(desc(tables.decisions.createdAt))
       .limit(limit)
       .all();
+  }
+
+  function listActionable(
+    principalId: string,
+    readerActorId: string,
+    limit = 100,
+  ): Decision[] {
+    // All decisions for this principal, then keep ones that are open OR
+    // have unread replies for the reader. Single query for the rows; one
+    // bulk query for unread counts (no N+1).
+    const rows = store
+      .select()
+      .from(tables.decisions)
+      .where(eq(tables.decisions.principalId, principalId))
+      .orderBy(desc(tables.decisions.createdAt))
+      .limit(limit)
+      .all();
+    if (rows.length === 0) return [];
+    const unread = unreadCountsByDecision(
+      rows.map((r) => r.id),
+      readerActorId,
+    );
+    return rows.filter((r) => r.status === "open" || (unread.get(r.id) ?? 0) > 0);
   }
 
   function listProposedBy(
@@ -425,6 +456,7 @@ export function createInbox(opts: InboxOptions): Inbox {
     propose,
     listOpen,
     listAll,
+    listActionable,
     listProposedBy,
     get,
     resolve,

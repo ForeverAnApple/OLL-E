@@ -451,14 +451,27 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: "principalId required" } });
           return;
         }
+        // Three filter modes:
+        //   "all"        — every decision for this principal
+        //   "open"       — strict status='open' only (lifecycle filter)
+        //   default      — actionable: open OR has unread replies for me
+        // The default treats "needs my attention" the way a real inbox
+        // does: a resolved decision with a new agent reply ("done — see
+        // commit X") still surfaces until I read it.
         const status = req.params?.status as string | undefined;
-        const rows =
-          status === "all" ? opts.inbox.listAll(principalId) : opts.inbox.listOpen(principalId);
+        const reader = principalId;
+        let rows;
+        if (status === "all") {
+          rows = opts.inbox.listAll(principalId);
+        } else if (status === "open") {
+          rows = opts.inbox.listOpen(principalId);
+        } else {
+          rows = opts.inbox.listActionable(principalId, reader);
+        }
         const enriched = opts.store ? enrichDecisions(opts.store, rows) : rows;
         // Per-decision unread reply counts for the principal — backs the
         // "(N new)" badge on the listing UI. One pair of queries for the
         // whole batch (no N+1).
-        const reader = principalId;
         const unread = opts.inbox.unreadCountsByDecision(
           enriched.map((r) => r.id),
           reader,

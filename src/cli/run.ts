@@ -1664,12 +1664,20 @@ async function cmdInbox(args: string[]): Promise<void> {
         return;
       }
       case "list": {
+        // Default filter is "active" (open OR has unread replies). Pass
+        // --all for everything, --open for the strict status='open' subset.
         const all = rest.includes("--all");
-        const rows = await client.call<InboxRow[]>("inbox.list", {
-          status: all ? "all" : undefined,
-        });
+        const open = rest.includes("--open");
+        const status = all ? "all" : open ? "open" : undefined;
+        const rows = await client.call<InboxRow[]>("inbox.list", { status });
         if (rows.length === 0) {
-          console.log(all ? "(no inbox items)" : "(no open inbox items)");
+          console.log(
+            all
+              ? "(no inbox items)"
+              : open
+                ? "(no open decisions)"
+                : "(inbox zero — nothing waiting for you)",
+          );
           return;
         }
         renderInboxList(rows);
@@ -1719,7 +1727,7 @@ function printHelp(): void {
       "",
       "  Inbox — async decisions awaiting your response (paired with mail_* tools):",
       "  inbox                                         interactive TUI (vim keys; ? for help)",
-      "  inbox list [--all]                            list open (or all) decisions",
+      "  inbox list [--all|--open]                     list active (default), all, or strictly-open",
       "  inbox show <id>                               full decision payload + agent reply thread",
       "  inbox respond <id> approve|deny|modify [--message ...] [--payload {json}]",
       "",

@@ -212,6 +212,8 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
 
   async function fetch(): Promise<void> {
     try {
+      // `undefined` = default = actionable (open OR unread replies).
+      // `all` = everything for audit. Tab toggles between the two.
       rows = await client.call<InboxRow[]>("inbox.list", {
         status: filterAll ? "all" : undefined,
       });
@@ -328,7 +330,10 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
     const open = rows.filter((r) => r.status === "open").length;
     const total = rows.length;
     const totalUnread = rows.reduce((acc, r) => acc + (r.unreadReplyCount ?? 0), 0);
-    const filter = filterAll ? "all" : "open";
+    // Filter labels:
+    //   "active" — default; rows that need attention (open OR unread replies)
+    //   "all"    — every decision, including resolved-and-read
+    const filter = filterAll ? "all" : "active";
     const title = mode === "detail" ? "olle inbox · view" : "olle inbox";
     const left = ` ${ANSI.bold}${title}${ANSI.reset}  ${ANSI.dim}filter:${ANSI.reset} ${filter}`;
     const unreadPart =
@@ -350,7 +355,7 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
         ? "(no inbox items)"
         : searchQuery
           ? `(no matches for "${searchQuery}")`
-          : "(no open inbox items — Tab to show all)";
+          : "(inbox zero — nothing waiting for you. Tab to show all.)";
       w(`${ANSI.dim}${pad(`  ${empty}`, cols)}${ANSI.reset}\n`);
       for (let i = 1; i < h; i++) w(`${pad("", cols)}\n`);
       return;

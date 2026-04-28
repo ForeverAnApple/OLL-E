@@ -304,6 +304,67 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
     expect(counts.get(did)).toBe(1);
   });
 
+  it("listActionable returns open decisions PLUS resolved-with-unread-replies", () => {
+    // The principal's inbox should surface anything needing attention:
+    // open decisions awaiting their vote, AND resolved decisions where
+    // the agent reported back and they haven't read it yet.
+    const r = rig();
+    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const stillOpen = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "still open",
+      payload: {},
+    });
+    const resolvedWithUnread = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "resolved + new agent reply",
+      payload: {},
+    });
+    r.inbox.respond({
+      decisionId: resolvedWithUnread.id,
+      actorId: principalId,
+      vote: "approve",
+    });
+    r.inbox.reply({
+      decisionId: resolvedWithUnread.id,
+      actorId: "proposer",
+      text: "shipped abc",
+    });
+    const resolvedAndRead = r.inbox.propose({
+      principalId,
+      proposingAgentId: "proposer",
+      tier: "operational",
+      summary: "resolved + reply already read",
+      payload: {},
+    });
+    r.inbox.respond({
+      decisionId: resolvedAndRead.id,
+      actorId: principalId,
+      vote: "approve",
+    });
+    r.inbox.reply({
+      decisionId: resolvedAndRead.id,
+      actorId: "proposer",
+      text: "shipped def",
+    });
+    r.inbox.markDecisionRead(resolvedAndRead.id, principalId);
+
+    const actionable = r.inbox.listActionable(principalId, principalId);
+    const ids = actionable.map((d) => d.id).sort();
+    expect(ids).toEqual([stillOpen.id, resolvedWithUnread.id].sort());
+    // Resolved-and-read is filtered out — neither open nor has unread.
+    expect(ids).not.toContain(resolvedAndRead.id);
+
+    // After viewing resolvedWithUnread, it falls out of actionable.
+    r.inbox.markDecisionRead(resolvedWithUnread.id, principalId);
+    const after = r.inbox.listActionable(principalId, principalId);
+    expect(after.map((d) => d.id)).toEqual([stillOpen.id]);
+  });
+
   it("unreadCountsByDecision returns 0 for decisions with no replies and is bulk-correct", () => {
     const r = rig();
     const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });

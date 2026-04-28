@@ -84,11 +84,42 @@ describe("inbox.* IPC", () => {
     const { id } = seedDecision(daemon, "resolve me");
     seedDecision(daemon, "stay open");
     await client.call("inbox.respond", { id, vote: "approve" });
-    const open = await client.call<Decision[]>("inbox.list");
+    const active = await client.call<Decision[]>("inbox.list");
     const all = await client.call<Decision[]>("inbox.list", { status: "all" });
-    expect(open).toHaveLength(1);
+    // Default filter is "active" — open OR has-unread. The resolved row
+    // has no replies, so it falls out of the default view.
+    expect(active).toHaveLength(1);
     expect(all).toHaveLength(2);
     expect(all.find((r) => r.id === id)?.status).toBe("approved");
+  });
+
+  it("inbox.list default surfaces resolved decisions with unread agent replies", async () => {
+    const { id } = seedDecision(daemon, "resolve + reply");
+    seedDecision(daemon, "stay open");
+    await client.call("inbox.respond", { id, vote: "approve" });
+    daemon.inbox.reply({ decisionId: id, actorId: daemon.rootAgentId, text: "shipped" });
+    // Default filter (no status param) should now show BOTH the open row
+    // and the resolved-with-unread row — the load-bearing fix for "I
+    // can't see the agent's reply unless I switch to all".
+    const active = await client.call<Decision[]>("inbox.list");
+    expect(active).toHaveLength(2);
+    expect(active.map((r) => r.id).sort()).toContain(id);
+
+    // After viewing the resolved one, it auto-marks read and falls out.
+    await client.call("inbox.get", { id });
+    const afterRead = await client.call<Decision[]>("inbox.list");
+    expect(afterRead.map((r) => r.id)).not.toContain(id);
+  });
+
+  it("inbox.list status=open is the strict lifecycle filter (no unread-replies expansion)", async () => {
+    const { id } = seedDecision(daemon, "resolve + reply");
+    seedDecision(daemon, "stay open");
+    await client.call("inbox.respond", { id, vote: "approve" });
+    daemon.inbox.reply({ decisionId: id, actorId: daemon.rootAgentId, text: "shipped" });
+    // status=open — strictly open status, regardless of unread state.
+    const strictlyOpen = await client.call<Decision[]>("inbox.list", { status: "open" });
+    expect(strictlyOpen).toHaveLength(1);
+    expect(strictlyOpen[0]!.id).not.toBe(id);
   });
 
   it("inbox.get returns full row plus reply messages; missing id errors", async () => {
