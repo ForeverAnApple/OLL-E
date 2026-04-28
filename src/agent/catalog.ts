@@ -89,6 +89,14 @@ const CATEGORY_PROSE: Record<string, { tagline: string; body: string }> = {
       "the task completes or times out. Use for intermediate artifacts,\n" +
       "draft documents, in-progress generations.",
   },
+  "tool results": {
+    tagline: "fetching spilled tool output",
+    body:
+      "Tool calls that return more than the inline byte cap get spilled\n" +
+      "to durable storage and replaced in your message history with a\n" +
+      "preview + handle. Reach here to fetch the rest on demand — slice\n" +
+      "with offset/limit so you only pay for the bytes you need.",
+  },
   [MISC]: {
     tagline: "uncategorized",
     body: "Tools that didn't declare a category. Treat each on its own merits.",

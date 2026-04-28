@@ -72,6 +72,11 @@ export interface ToolDef<I = unknown, O = unknown> {
    *  feeding the result back to the model. Ignored when sensitiveOutput is
    *  true. */
   sensitiveOutputFields?: string[];
+  /** Per-tool override for the rendered tool_result byte cap. Outputs above
+   *  this are spilled to the tool_results store and replaced inline with a
+   *  preview + handle the agent can fetch via `read_tool_result`. Capped
+   *  by the runtime's system-wide limit; leave unset to use the default. */
+  maxResultBytes?: number;
   execute(args: I, ctx: ToolExecuteContext): Promise<O> | O;
 }
 

@@ -104,7 +104,7 @@ Direct agent-authored task files (proposed via the inbox `register_task` action)
 
 ### Tool
 
-A typed callable capability: `{name, description, inputSchema (JSON Schema), validate?(input), execute(args, ctx)}`. The host↔extension boundary deliberately crosses plain data (JSON Schema) rather than a shared schema-library instance — extensions may author their `inputSchema` by hand or generate it from whichever library they prefer (Zod, Valibot, ArkType, etc.), keeping cross-module library identity out of the boundary. Tools may request permission gates (ctx.ask) and always carry attribution. Every tool call is logged.
+A typed callable capability: `{name, description, inputSchema (JSON Schema), validate?(input), execute(args, ctx)}`. The host↔extension boundary deliberately crosses plain data (JSON Schema) rather than a shared schema-library instance — extensions may author their `inputSchema` by hand or generate it from whichever library they prefer (Zod, Valibot, ArkType, etc.), keeping cross-module library identity out of the boundary. Tools may request permission gates (ctx.ask) and always carry attribution. Every tool call is logged. Tools may also declare `maxResultBytes` to set a tighter cap than the system default for inline output (see "Tool-result truncation"); over-cap output is spilled to durable storage and replaced with a recovery handle.
 
 ### Store
 
@@ -130,6 +130,8 @@ extensions    (id, name, path, status, last_smoke_at, last_commit_sha)
 events        (id, hlc, host_id, actor_id, type, payload_json, parent_event_id)
 claims        (event_id, task_id, agent_id, claimed_at, status)
 tool_calls    (id, task_id, tool_id, args_json, result_json, tokens_used, started_at, ended_at)
+tool_results  (id, hlc, host_id, actor_id, thread_id, tool_name, content, bytes, created_at)
+              -- spilled over-cap tool output, recovered via read_tool_result
 
 decisions     (id, principal_id, proposing_agent_id, tier, summary, payload, status, staleness, created_at, resolved_at)
 approvals     (decision_id, actor_id, vote, message, at)     -- for quorum/ask-up chains
@@ -259,6 +261,36 @@ Both report unknown / no-op cases per-name without aborting the call. Cost: a `l
 
 **Why no progressive catalog folding.** As tool counts grow, the simple-tier catalog grows too. Earlier draft proposed B/C/D fold tiers (collapse taglines → categories → degenerate to flat keyword search). Rejected for v0: the parallel specialist-delegation plan offers a cleaner answer to scale — agents specialize by domain, each agent's catalog stays small, out-of-domain work is `delegate_to(specialist)` rather than catalog inflation. If that doesn't pan out, fold tiers and `ToolSearch`-style discovery resurrect for v0.1+.
 
+## Tool-result truncation
+
+Tool calls return arbitrary-sized payloads, and a single fat result inflates W (cache_creation) for the whole rest of the conversation — every subsequent inner round-trip re-caches the prefix it landed in. Per LOG 2026-04-27 a single ~60k-token `github_list_issues` result accounted for ~25% of one session's bill.
+
+The runtime caps every tool result at a system byte limit before it enters the message history. Outputs above the cap are spilled to the `tool_results` table and replaced inline with a stable preview block:
+
+```
+<persisted-output>
+Output too large (243.0KB). Full output saved to: tool-result/<tool_use_id>
+
+Preview (first 8.0KB):
+<head of the content>
+...
+Use read_tool_result(handle="<id>", offset=N, limit=N) to fetch more.
+</persisted-output>
+```
+
+The agent recovers the rest via `read_tool_result(handle, offset?, limit?)` — always-loaded so the recovery path costs no extra round-trip. Slices are clamped at a per-call max; the response carries `hasMore` and `nextOffset` for pagination.
+
+**Two caps, both runtime-enforced:**
+
+- **Per-call cap** — `DEFAULT_MAX_RESULT_BYTES = 50_000`. Tools may declare a tighter `maxResultBytes` on their `ToolDef`; the system cap is the upper bound. Sensitive-output tools (`sensitiveOutput: true`) are never spilled — the redaction substitute already collapses to a constant.
+- **Per-message aggregate cap** — `DEFAULT_MAX_MESSAGE_BYTES = 200_000`. Catches the "N parallel tools each at 49KB" failure mode the per-call cap leaves open. Largest blocks spill first until the message fits.
+
+**Stable replacement state.** `Thread.truncationState` carries a `Map<tool_use_id, preview>` — once a result has been spilled, every later rendering of the block uses the byte-identical preview from the map. Without this, replaying the same conversation would produce different preview text each turn (different size string, different timestamp) and the prompt-cache prefix would invalidate. We pay 1.25× per cache write — a single replacement-instability bug erases the entire reason to truncate.
+
+**Schema.** `tool_results (id, hlc, host_id, actor_id, thread_id, tool_name, content, bytes, created_at)`, indexed by `(thread_id, created_at)` and `(actor_id, created_at)`. The `id` is the LLM-emitted `tool_use_id` — already globally unique per invocation and embedded in the preview, so no separate ULID. `INSERT OR IGNORE` makes the persist idempotent under retries.
+
+**Why a row, not a file.** Federation merge is a union+sort over rows; a blob on disk is a separate sync target. The full content sits next to events and ledger rows in one store, with the same `host_id`/`actor_id`/`hlc` provenance every other user-facing record carries.
+
 ## Memory tiers
 
 Three scopes, enforced at write/read:
@@ -289,7 +321,9 @@ The unified flow for adding capabilities — channels, tools, trigger types, any
 5. **Hot-load**: daemon detects new/changed extension, validates manifest, loads into runtime. If load throws or smoke fails → extension is left on disk, marked inactive, inbox item emitted with error detail.
 6. **Live**: extension now participates in event routing; its tools/triggers available.
 
-Manifests are the visible authority boundary for extensions. `callsTools` lists cross-extension tool calls; `eventReads` and `eventWrites` list bus event types the extension may subscribe to or emit through direct publishes, triggers, or scheduler tasks. A broader event surface is authored as a normal manifest edit and passes through the same smoke + hot-load path.
+Manifests are the visible authority boundary for extensions. `callsTools` lists cross-extension tool calls; `eventReads` lists bus event types the extension may subscribe to; `eventWrites` lists event types the extension may emit imperatively (via `api.publish` or task-handler `emit`). A broader event surface is authored as a normal manifest edit and passes through the same smoke + hot-load path.
+
+Trigger declarations are themselves authority statements for their `type` field — a `registerTrigger({ type: "channel-message", ... })` is the manifest-visible promise that this extension emits `channel-message` events from that trigger. Re-listing the trigger type in `eventWrites` is harmless but not required; a trigger can never emit anything other than its declared type, so the cross-check would only ever catch manifest drift, not an actual unauthorised emit (LOG 2026-04-27).
 
 ### Core bundle (shipped in binary, not an extension)
 
@@ -302,6 +336,7 @@ Manifests are the visible authority boundary for extensions. `callsTools` lists 
 - Meta-tools: `write_extension`, `run_smoke_test`, `register_extension`, `revert_extension`, `read_extension_file`, `extension_history`, `query_host_context`
 - Loadout meta-tools: `load_tools`, `unload_tools` — bring deferred tool schemas into / out of a thread's context (see "Tool catalog and lazy loading")
 - Observability tools: `query_my_usage`, `query_my_budget`, `query_my_runs`, `query_my_threads`, `query_self`, `query_events` — agents read their own world; CLI uses the same query layer
+- Tool-result recovery: `read_tool_result` — fetch a slice of a spilled tool output by handle (see "Tool-result truncation")
 
 ### Starter templates (shipped read-only; agents clone and modify)
 

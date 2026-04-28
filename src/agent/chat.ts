@@ -33,6 +33,12 @@ import { and, eq } from "drizzle-orm";
 import { loadPrinciples, renderPrinciples } from "../memory/principles.ts";
 import { renderToolCatalog } from "./catalog.ts";
 import { buildLoadoutTools, markLoaded, type LoadResultEntry } from "../tools/loadout.ts";
+import {
+  createTruncationState,
+  DEFAULT_MAX_MESSAGE_BYTES,
+  DEFAULT_MAX_RESULT_BYTES,
+  type TruncationState,
+} from "./tool-truncate.ts";
 import { runAgent, type AgentStep } from "./runtime.ts";
 import { buildRedactionMap, mergeRedactionMap, redactInput, redactMessages } from "./redaction.ts";
 
@@ -65,6 +71,15 @@ export interface AgentLoopOptions {
    *  MAIL_WAKE_DEBOUNCE_MS. Set to 0 to fire synchronously per event
    *  (useful in tests that don't want to await timers). */
   mailWakeDebounceMs?: number;
+  /** Tool-result truncation hooks. When supplied, oversize tool outputs
+   *  spill to the durable handle returned by `persist`; the runtime keeps
+   *  per-thread state stable so replays produce byte-identical previews
+   *  (preserving the prompt cache prefix). Omit in tests that don't care. */
+  toolTruncate?: {
+    persist(input: { id: string; threadId: string; toolName: string; content: string }): void;
+    maxBytesPerCall?: number;
+    maxBytesPerMessage?: number;
+  };
 }
 
 interface Thread {
@@ -82,6 +97,11 @@ interface Thread {
    *  loaded tools are not tracked here — they're sent every turn
    *  regardless. Per-thread runtime state, not persisted. */
   loadedTools: Set<string>;
+  /** Stable replacement state for the tool-result truncator. Once a
+   *  tool_use_id has been spilled, every later rendering of that block
+   *  uses the byte-identical preview from this map — without it the
+   *  prefix would invalidate every turn the conversation rehydrates. */
+  truncationState: TruncationState;
 }
 
 export interface AgentLoop {
@@ -123,6 +143,7 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
       pending: [],
       pendingOrigin: [],
       loadedTools: new Set<string>(),
+      truncationState: createTruncationState(),
     };
     threads.set(id, t);
     return t;
@@ -327,6 +348,21 @@ async function runTurn(
         secrets: {},
       },
       messages: thread.messages,
+      truncate: opts.toolTruncate
+        ? {
+            state: thread.truncationState,
+            maxBytesPerCall: opts.toolTruncate.maxBytesPerCall ?? DEFAULT_MAX_RESULT_BYTES,
+            maxBytesPerMessage:
+              opts.toolTruncate.maxBytesPerMessage ?? DEFAULT_MAX_MESSAGE_BYTES,
+            persist: ({ id, toolName, content }) =>
+              opts.toolTruncate!.persist({
+                id,
+                threadId: thread.id,
+                toolName,
+                content,
+              }),
+          }
+        : undefined,
       onStep: (step) => emitStep(opts, thread.id, origin, step, redactToolInput),
       authorize: (tool) =>
         checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),

@@ -657,6 +657,80 @@ Follow-up still owed: `reportFailure` emits `extension.crashed` events but does 
 
 ---
 
+## 2026-04-27 — Decision continuations: task-ref `on_resolve`, sidebar implicit-ack
+
+A real chatlog with the running root agent surfaced the gap: the agent files `mail_propose`, ends turn, principal approves by email, agent never resumes. Principal opens a fresh chat asking "what happened?" Agent self-diagnoses as "no wake scheduled" and proposes to write itself a memory note saying "remember to check `mail_list direction=out` each turn." Both are wrong shape.
+
+The wake from LOG 2026-04-26 *is* implemented — `agent/chat.ts` subscribes to `decision.resolved` and synthesizes a `chat.input` on `mailbox:<agentId>`. But the principal was sitting on the original chat thread, where the existing `buildMailboxSidebar` surfaces other-thread activity but says nothing about decision resolutions in flight. So the wake landed somewhere the principal wasn't watching, and the agent's instinct to fix this with discipline ("remember to look") was the exact failure mode VISION calls out — discipline-as-fix instead of physics-as-fix.
+
+Two parallel surfaces resolve this — one for tasks (which have lifecycle), one for chat agents (which have only thread context):
+
+**The shape that landed:**
+
+- **`decisions.on_resolve_task_id` / `on_stale_task_id` columns.** Nullable, soft-FK to `tasks.id` (matches the weak-ref pattern from migration 0003). When `inbox.respond()` writes `decision.resolved`, it also publishes a derived `decision.<id>.resolved` event so a registered task subscribed to that exact topic gets dispatched by the scheduler the same way any event-driven task does. `sweepStale()` does the same with `decision.<id>.stale`. No new task-run state, no scheduler internals change — the continuation is a normal task run; the original proposing run completes after `mail_propose` returns. Pending-state would have required serializing in-flight JS state across a daemon restart; large surface, no v0 demand.
+- **`mail_propose({onResolve, onStale})`** parameters take `{taskId, payload?}`. Caller registers the task ahead of time (or, eventually, via a one-shot helper). Returns the decisionId so external registration paths can correlate.
+- **`decisions.acked_at` column + extended sidebar.** `buildMailboxSidebar` gains a section listing unacked resolved decisions where the calling agent was the proposer. Implicit ack on render: the same render call stamps `acked_at = now`. Means the agent sees each resolution exactly once in whichever thread runs the next turn, then it falls off. Pull-side (`mail_list({direction:'out', includeResolved:true})`) remains for retrospective audit and for catching anything the implicit ack missed.
+
+**The four design calls:**
+
+1. **Continuation as task-ref, not inline closure.** Task refs are durable across daemon restart, replay through the event log, and federate cleanly via the same mesh seam tasks already use. Inline closures would die on restart and be invisible to durable history. Cost: one-shot follow-ups have to be packaged as registered tasks. A thin `register_one_shot` helper would cover the ergonomics without inventing a second primitive — deferred below.
+2. **No new `pending_decision` task-run state.** The continuation pattern collapses onto existing `task_runs` lifecycle: original run completes after proposing; resolution-driven run is a separate row with its own start/end, attributed to the same agent. Pending-state would require pausing a slot mid-handler and serializing JS state across daemon restart. Continuation pattern asks the task author to think in two halves — the only price, and a price the actor model has charged for decades.
+3. **Implicit-ack on sidebar render.** Alternative was an explicit `mail_ack(ids)` tool. Explicit feels more agentic but introduces nagging — the agent has to remember to ack, and the sidebar stays loud forever if it forgets. Implicit-on-render bounds the noise and matches "physics, not discipline." Failure mode: turn crashes mid-render and the agent never sees the rendered text. Recovery is the always-available pull surface; not perfect, but on the right side of the tradeoff for v0.
+4. **Extending the existing sidebar, not a new "decisions sidebar."** The mailbox sidebar already lives in volatile turn-context. Adding another section to it keeps situational awareness unified — "here's what changed since you last spoke" — instead of fragmenting into one sidebar per concern. Future pushable awareness (memory updates from peers, budget threshold crossings) joins the same block.
+
+**Two `[DEFERRED]` items:**
+
+- **`[DEFERRED-to-v0.1]` Per-id event topics as a generalized bus pattern.** The cut here publishes `decision.<id>.resolved` ad-hoc from the inbox module. If a second primitive (memory, ledger?) wants the same per-instance topic shape, factor a small bus helper. Today one call site doesn't justify it. **Resurrect when:** a second per-id topic appears in the wild.
+- **`[DEFERRED-to-v0.1]` `register_one_shot(taskDef)` core helper.** Wraps `scheduler.register` and auto-deregisters after first successful dispatch. Common-case continuation is "fire once on resolve and disappear." Userspace (`unregister` in handler) works; bundling it once in core is cheaper than every continuation re-implementing it. **Resurrect when:** more than two continuations show the same auto-unregister boilerplate.
+
+**Why the sidebar acks instead of the wake events.** The mail wake (LOG 2026-04-26) collapsed bursts into one chat.input on `mailbox:<agentId>` — that's the *push* path, fired from idle. The sidebar is the *visibility-on-next-turn* path — strictly broader because it covers the case where the proposing agent is mid-conversation in some other thread when resolution lands (the chatlog above). Both surfaces stay; complementary, not duplicate. Acking from the sidebar (not the wake) is the right boundary because acking should mean "the agent had a chance to read this," not "the bus delivered an event somewhere."
+
+**Why nothing changes for `decision.escalated`.** That event is deferred from LOG 2026-04-26 and is observability-only — intermediate hops along an ask-up chain. Continuations only fire on terminal resolve, which is the right boundary; the escalated event lands without a continuation hook because nobody's asking to *do something* on a hop, only to know it happened.
+
+---
+
+## 2026-04-27 — Trigger declarations are their own authority statement; transactional `load()`; first-wins tool registration
+
+Three stacked bugs surfaced in a single chatlog: agent registered three discord extensions, the first failed manifest validation, and every subsequent agent turn — including unrelated `hello?` — died on `runAgent: duplicate tool name "discord_send" in registry — refusing to call provider`. The agent was wedged with no path to recover via its own tools.
+
+**Root causes, deepest first:**
+
+1. **The eventWrites gate on triggers was redundant double-bookkeeping.** LOG 2026-04-26 (extension event scopes) added `assertTriggerWrite` inside `startTriggers`, requiring `eventWrites: ["channel-message"]` even though the trigger itself was declared with `type: "channel-message"`. A trigger's `type` field at registration *is* the manifest-visible promise of what it emits — its `start(emit, …)` closure can never publish anything else. The cross-check could only ever catch manifest drift (an old on-disk extension predating the gate), never an actual unauthorised emit. That is exactly what hit here: a starter installed three days before the gate landed lacked the field a newer binary now demanded. The elegant fix is dropping the redundant check; `eventWrites` continues to gate imperative `api.publish()` and task-handler `emit()` where the authority surface really is unbounded without a manifest declaration. `ARCHITECTURE.md` updated to spell out the rule: trigger declarations are themselves authority statements for their type; eventWrites gates imperative emits.
+
+2. **`load()` was non-transactional.** `impl.register(api)` populated `toolsByName`/`toolsByExt` with the discord tools, then `startTriggers` threw, and the throw escaped `load()` with no rollback — the registered tools were left orphaned in the registry while the extension itself was absent from `loaded`. A retry of the same extension (or a sibling extension declaring the same tool name) collided with the orphans. Fixed by wrapping `impl.register → startTriggers` in try/catch with a `purgeRegistry(extensionId, name)` helper that drops `toolsByName`/`toolsByExt`/`subs`/`tasksByExt`/`triggersByExt` and stops any partially-started triggers. `markStatus(extensionId, "inactive")` so the failure stays auditable in the DB. Extracted the same helper out of `unload()` since it does identical work — same job, two callers.
+
+3. **`registerTool` and `resolveTools` had inconsistent duplicate semantics.** `registerTool` overwrote `toolsByName` on collision but pushed unconditionally into `toolsByExt`; `host.tools()` flattens `toolsByExt`, so two extensions claiming the same name produced a duplicated list, which `resolveTools` then refused with a thrown error that killed the agent loop before it ever reached the LLM. Made `registerTool` first-wins (rejects the second registrant with a `tool.collision-rejected` event and a warning log) so the registry is self-consistent by construction. Softened `resolveTools` to dedupe-first-wins + warn rather than throw — defense in depth. Limits should feel like physics, not refusals; the daemon must never trap the agent on a registry inconsistency.
+
+**Why this is the elegant shape, not a migration story.** An inbox-item-with-suggested-edit flow for stale manifests was on the table — host detects a missing `eventWrites` entry, opens a decision proposing the manifest patch. Rejected because the gate itself was the bug: a check that can only catch manifest drift, never an actual authority violation, is bookkeeping cosplay. Removing it dissolves the migration problem entirely; the on-disk discord extension just works on the next reload, with no host code editing the agent's own files (which would have violated the agent's agency over its environment) and no inbox dance for a deviation that wasn't real.
+
+**What stays.** `eventWrites` and `eventReads` continue to gate the imperative paths where they earn their weight. `boot/invariants.ts` keeps the static-startup duplicate-tool check as a fail-loud — at boot, a duplicate is a config bug worth refusing to start over; at runtime, it's a registry inconsistency the daemon should observe and walk past. The two surfaces have different right answers.
+
+---
+
+## 2026-04-27 — Tool-result truncation: cap inline output, spill to handle, recover on demand
+
+**The empirical pull.** Investigating a session that read `↑29 ↓7.8k R737k W299k $7.30`, daaaa pushed back on the observability surface — 737k cache reads felt impossible. The math reconciled (real bill, every byte priced correctly), but a single tool call dominated turn 1's W: `github_list_issues` returned 243KB (~60k tokens) in one shot. With caching costing 1.25× to write and 0.1× to read, that one tool result cost ~$1.85 of the $7.30 bill — 25% — and propagated into turns 2 and 3 as cache reads. The structural finding: W is dictated by what tools dump into the conversation, not by where we place cache markers. The lever isn't `anthropic.ts`; it's per-tool output discipline.
+
+**The decision.** Cap every tool result at a system byte limit before it enters the message history. Outputs above the cap spill to a new `tool_results` table and are replaced inline with a stable preview block carrying the `tool_use_id` as a recovery handle. The agent recovers the rest via `read_tool_result(handle, offset?, limit?)` — always-loaded so the recovery path doesn't burn an extra round-trip.
+
+**Implementation details:**
+
+- **Two caps.** Per-call default 50KB, per-message aggregate 200KB. Tools may declare `maxResultBytes` for a tighter per-call ceiling. Per-message cap catches the "N parallel tools each at 49KB" failure mode the per-call cap leaves open; largest blocks spill first.
+- **Stable replacement state on `Thread`.** A `Map<tool_use_id, preview>` ensures every later rendering of a spilled block uses the byte-identical preview. Without this, replays would produce different preview text (different size string), invalidating the prompt-cache prefix — the very thing we're optimizing for. A single instability bug erases the entire savings.
+- **`tool_results` table, not a file.** Federation merge is a union+sort over rows. Keeping spill in the same SQLite store as events/ledger gives spilled content the same `host_id`/`actor_id`/`hlc` provenance every other user-facing record carries, and one sync target instead of two. `INSERT OR IGNORE` on `tool_use_id` makes persist idempotent under retry/replay.
+- **Sensitive output stays sensitive.** Tools with `sensitiveOutput: true` are never spilled — the redaction substitute is already constant-size and there's no semantic gain from persisting `[redacted]`.
+- **`read_tool_result` is always-loaded, not deferred.** Spilling happens reactively; the agent didn't choose to be in the recovery path. Forcing a `load_tools` hop just to learn the recovery surface is a papercut habitat philosophy is supposed to delete. Loadout cost: ~one tool's schema in every tool list. Cheap.
+
+**Vision check.** This is the strongest "constraints feel like physics" example we have: the agent doesn't experience refusal — it experiences a smaller view of a large response with a handle to the rest, mirroring how real disks deliver large files. Tiebreaker passes: the agent has *more* agency (can choose to slice further or move on), not less. Self-modification holds — agents can edit `maxResultBytes` in their own extensions; raising the system cap goes through propose-up. Transport-agnostic — every tool is capped uniformly, no special-cased "human-friendly" tool. None of the six tests fails.
+
+**What this does NOT do.** It doesn't change the cache-marker strategy in `src/llm/anthropic.ts` (we'd already verified that's not the problem). It doesn't add cross-extension `maxBytes` per call class — single system cap, simple to reason about. It doesn't summarize tool output — the head of the bytes is always a strict prefix; if the agent wants summarization it asks the tool for a smaller projection or summarizes the head itself.
+
+**One `[DEFERRED]` item:**
+
+- **`[DEFERRED-to-v0.1]` Starter-template patches.** The empirical case was the bundled `github` starter's `github_list_issues` returning unbounded pages. The starter template at `src/starters/templates.ts` could declare `maxResultBytes: 8_000` on listing tools and ship a `summary: true` projection by default. Held back deliberately: the agent owns its installed copy of the starter and can edit it through the extension authoring loop — that's the demo. Once we see whether the cap alone is enough, or whether starter authors keep tripping the same wire, backport the per-tool override into the seed. **Resurrect when:** more than one fat-output starter tool surfaces in real ledgers.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.

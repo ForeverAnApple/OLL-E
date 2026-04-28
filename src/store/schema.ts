@@ -375,6 +375,31 @@ export const memories = sqliteTable(
   }),
 );
 
+// Over-cap tool output spilled out of the conversation prefix and replaced
+// inline with a preview + handle. The id is the LLM-emitted tool_use_id —
+// already unique per invocation and embedded in the preview so the agent
+// can recover it via `read_tool_result`.
+export const toolResults = sqliteTable(
+  "tool_results",
+  {
+    id: text("id").primaryKey(),
+    hlc: text("hlc").notNull(),
+    hostId: text("host_id")
+      .notNull()
+      .references(() => hosts.id),
+    actorId: text("actor_id").notNull(),
+    threadId: text("thread_id").notNull(),
+    toolName: text("tool_name").notNull(),
+    content: text("content").notNull(),
+    bytes: integer("bytes").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => ({
+    byThread: index("tool_results_thread").on(t.threadId, t.createdAt),
+    byActor: index("tool_results_actor").on(t.actorId, t.createdAt),
+  }),
+);
+
 export const memoryReads = sqliteTable(
   "memory_reads",
   {

@@ -17,6 +17,11 @@ import type {
   ToolSpec,
   Usage,
 } from "../llm/index.ts";
+import {
+  enforceMessageBudget,
+  maybeTruncateOne,
+  type TruncateOptions,
+} from "./tool-truncate.ts";
 
 export interface AgentRunOptions {
   llm: Llm;
@@ -60,6 +65,12 @@ export interface AgentRunOptions {
    *  grant_scope proposal on the inbox per the vision "constraints feel
    *  like physics" clause. */
   onDenied?: (info: { tool: ToolDef; reason: string; input: unknown }) => void;
+  /** Tool-result truncation policy. When supplied, oversize outputs are
+   *  spilled to a durable handle and replaced with a stable preview block.
+   *  Per-thread state is the caller's responsibility — pass the same
+   *  TruncationState across turns of one thread to keep the prompt cache
+   *  prefix stable. */
+  truncate?: TruncateOptions;
 }
 
 export type AgentStep =
@@ -82,19 +93,24 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
 
   // Resolve the tool surface for the next round-trip. `getTools` (when
   // supplied) is re-read each call so a mid-turn register/unload becomes
-  // visible immediately. Duplicate-name check runs here, not at function
-  // entry, so a hot-reload collision surfaces as a named local error
-  // instead of a generic provider 400.
+  // visible immediately. Duplicates are deduped first-wins rather than
+  // thrown — the provider would 400 on the second copy, but trapping the
+  // whole agent loop on a registry inconsistency is anti-vision (limits
+  // should feel like physics, not refusals). The registration boundary
+  // is the canonical guard; this is defense-in-depth.
   function resolveTools(): { tools: ToolDef[]; byName: Map<string, ToolDef> } {
-    const tools = opts.getTools ? opts.getTools() : opts.tools ?? [];
+    const raw = opts.getTools ? opts.getTools() : opts.tools ?? [];
+    const tools: ToolDef[] = [];
     const byName = new Map<string, ToolDef>();
-    for (const t of tools) {
+    for (const t of raw) {
       if (byName.has(t.name)) {
-        throw new Error(
-          `runAgent: duplicate tool name "${t.name}" in registry — refusing to call provider`,
+        console.warn(
+          `[runAgent] duplicate tool name "${t.name}" in registry — keeping first, dropping later copy`,
         );
+        continue;
       }
       byName.set(t.name, t);
+      tools.push(t);
     }
     return { tools, byName };
   }
@@ -142,14 +158,15 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
       };
     }
 
-    const toolResults: ContentBlock[] = [];
+    interface PendingResult {
+      id: string;
+      name: string;
+      content: string;
+      isError: boolean;
+    }
+    const pending: PendingResult[] = [];
     const pushResult = (id: string, name: string, content: string, isError: boolean) => {
-      toolResults.push(
-        isError
-          ? { type: "tool_result", tool_use_id: id, content, is_error: true }
-          : { type: "tool_result", tool_use_id: id, content },
-      );
-      opts.onStep?.({ kind: "tool_result", id, name, content, isError });
+      pending.push({ id, name, content, isError });
     };
     for (const block of completion.content) {
       if (block.type !== "tool_use") continue;
@@ -177,11 +194,42 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
         const result = await tool.execute(args, opts.toolCtx);
         const safeResult = redactToolResult(tool, result);
         const rendered = typeof safeResult === "string" ? safeResult : JSON.stringify(safeResult);
-        pushResult(block.id, block.name, rendered, false);
+        let final = rendered;
+        if (opts.truncate && !tool.sensitiveOutput) {
+          final = maybeTruncateOne({
+            id: block.id,
+            toolName: block.name,
+            content: rendered,
+            perToolMaxBytes: tool.maxResultBytes,
+            options: opts.truncate,
+          });
+        }
+        pushResult(block.id, block.name, final, false);
       } catch (err) {
         const msg = (err as Error).message ?? String(err);
         pushResult(block.id, block.name, msg, true);
       }
+    }
+    if (opts.truncate) {
+      enforceMessageBudget(
+        pending.filter((p) => !p.isError),
+        opts.truncate,
+      );
+    }
+    const toolResults: ContentBlock[] = [];
+    for (const r of pending) {
+      toolResults.push(
+        r.isError
+          ? { type: "tool_result", tool_use_id: r.id, content: r.content, is_error: true }
+          : { type: "tool_result", tool_use_id: r.id, content: r.content },
+      );
+      opts.onStep?.({
+        kind: "tool_result",
+        id: r.id,
+        name: r.name,
+        content: r.content,
+        isError: r.isError,
+      });
     }
     messages.push({ role: "user", content: toolResults });
   }

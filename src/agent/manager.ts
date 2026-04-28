@@ -44,6 +44,15 @@ export interface AgentManagerDeps {
   model?: string;
   /** Stable host coordinates injected into default child prompts. */
   hostContext?: string;
+  /** Tool-result truncation hooks shared with every child loop, so a
+   *  child agent's huge tool output spills to the same store the parent
+   *  uses. Persistence is keyed by tool_use_id, not actor — agents that
+   *  inherit a thread can keep recovering each other's prior spills. */
+  toolTruncate?: {
+    persist(input: { id: string; threadId: string; toolName: string; content: string }): void;
+    maxBytesPerCall?: number;
+    maxBytesPerMessage?: number;
+  };
 }
 
 export interface SpawnOptions {
@@ -196,6 +205,7 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
       principalId: deps.principalId,
       threadsDir: deps.threadsDir,
       model: deps.model,
+      toolTruncate: deps.toolTruncate,
       system:
         opts.systemPrompt ??
         // Default prompt makes clear to the child that it's a worker

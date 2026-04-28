@@ -15,6 +15,8 @@ import {
 import { buildMetaTools } from "../tools/meta.ts";
 import { buildObservabilityTools } from "../tools/observability.ts";
 import { buildInboxTools } from "../tools/inbox.ts";
+import { buildToolResultTools } from "../tools/tool-results.ts";
+import { createToolResultStore } from "../store/tool-results.ts";
 import { checkCoreInvariants, formatFailures } from "../boot/invariants.ts";
 import { startChatHealthMonitor, type ChatHealthMonitor } from "./chat-health.ts";
 import { installFaultIsolation, type FaultIsolation } from "./fault-isolation.ts";
@@ -159,6 +161,27 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   if (anthropicKey) {
     chatAgentId = rootAgentId;
     const llm = createAnthropicAdapter({ apiKey: anthropicKey });
+    // Spilled tool-output store. Owned by the daemon so chat-loop
+    // truncation and the read_tool_result recovery tool share one row
+    // surface — same physics on write and read.
+    const toolResultStore = createToolResultStore({ db: store.raw, hostId });
+    const persistActorId = chatAgentId;
+    const toolTruncate = {
+      persist: ({
+        id,
+        threadId,
+        toolName,
+        content,
+      }: { id: string; threadId: string; toolName: string; content: string }) =>
+        toolResultStore.persist({
+          id,
+          threadId,
+          toolName,
+          content,
+          actorId: persistActorId,
+          hostId,
+        }),
+    };
     // Manager first — meta-tools need a reference so spawn_agent etc.
     // resolve. The root loop gets registered into it after start.
     const agentManager = createAgentManager({
@@ -172,6 +195,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       principalId: rootPrincipalId,
       threadsDir: paths.threadsDir,
       hostContext: buildHostContextPrompt(paths, hostId),
+      toolTruncate,
     });
     managerHolder.ref = agentManager;
     const coreTools = [
@@ -193,6 +217,10 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       // (orientation tool); mail_respond is deferred (only needed when
       // voting on a proposal).
       ...buildInboxTools({ inbox, principalId: rootPrincipalId, bus, hostId, store }),
+      // Recovery surface for spilled tool output. Always-loaded — when an
+      // oversize result lands, the agent needs this in the same turn or
+      // it'd burn an extra round-trip just to learn the recovery path.
+      ...buildToolResultTools({ store: toolResultStore }),
     ];
     // Boot invariants — last gate before chat goes live. Tool-name
     // duplication, malformed schemas, etc. surface here as a named
@@ -249,6 +277,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         inbox,
         principalId: rootPrincipalId,
         threadsDir: paths.threadsDir,
+        toolTruncate,
         system: [
           "You are olle, a helpful assistant living inside OLL-E — a habitat built for agents like you.",
           "Your job is to accomplish what the human asks. OLL-E is yours to reshape: when the world is missing something you need, extend it.",

@@ -31,6 +31,7 @@ describe("store migrations", () => {
       "team_members",
       "teams",
       "tool_calls",
+      "tool_results",
       "tools",
       "triggers",
     ]) {
