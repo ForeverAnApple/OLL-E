@@ -78,6 +78,29 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   const scheduler = createScheduler({ bus, store, hostId });
   scheduler.recoverLost();
   const inbox = createInbox({ bus, store, hostId });
+  // Staleness sweeper. Each decision carries a wall-clock deadline; nothing
+  // moves it from `open` → `stale` unless someone calls sweepStale(). Run
+  // it on a timer so async-by-default actually means async — agents that
+  // proposed and moved on get their `decision.resolved` (vote=stale) when
+  // the deadline lapses, regardless of whether anyone reads the inbox.
+  // 30s is comfortably above the cost of a single SELECT and below the
+  // staleness windows we expect agents to set (typically minutes/hours).
+  const sweepIntervalMs = 30_000;
+  const sweepTimer = setInterval(() => {
+    try {
+      inbox.sweepStale();
+    } catch (err) {
+      // Transient store failure shouldn't kill the timer. Log loudly;
+      // the next tick tries again.
+      if (!opts.quiet) {
+        // eslint-disable-next-line no-console -- daemon infra
+        console.error(`olle: inbox sweepStale failed: ${(err as Error).message ?? err}`);
+      }
+    }
+  }, sweepIntervalMs);
+  // Don't keep the event loop alive purely to sweep — if everything else
+  // (IPC, bus, projector) has shut down, the daemon should exit.
+  if (typeof sweepTimer.unref === "function") sweepTimer.unref();
   // Memory projector — folds memory.* events into the `memories` table.
   // Must start before any memory writes happen (extensions loading,
   // agent spawn, etc.) so nothing is lost before the subscriber is live.
@@ -366,6 +389,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     managerHolder.ref?.shutdown();
     chatHealth?.stop();
     chat?.stop();
+    clearInterval(sweepTimer);
     memoryProjector.stop();
     scheduler.close();
     for (const ext of extensions.list()) {
