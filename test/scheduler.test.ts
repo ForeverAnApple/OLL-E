@@ -12,12 +12,20 @@ function rig() {
   store.insert(tables.hosts).values({ id: hostId, hostname: "t", createdAt: Date.now() }).run();
   const bus = createBus({ hostId, persist: persistToStore(store) });
   const scheduler = createScheduler({ bus, store, hostId });
-  return { store, bus, scheduler, hostId };
+  function seedAgent(id: string): void {
+    store
+      .insert(tables.agents)
+      .values({ id, name: id, hostId, scope: {}, createdAt: Date.now() })
+      .onConflictDoNothing()
+      .run();
+  }
+  return { store, bus, scheduler, hostId, seedAgent };
 }
 
 describe("scheduler", () => {
   it("dispatches a registered task on matching event", async () => {
-    const { bus, scheduler, hostId } = rig();
+    const { bus, scheduler, hostId, seedAgent } = rig();
+    seedAgent("a1");
     const seen: number[] = [];
     scheduler.register({
       id: "t1",
@@ -36,7 +44,8 @@ describe("scheduler", () => {
   });
 
   it("respects concurrency cap and queues overflow", async () => {
-    const { bus, scheduler, hostId } = rig();
+    const { bus, scheduler, hostId, seedAgent } = rig();
+    seedAgent("a");
     let active = 0;
     let peak = 0;
     const done: Array<() => void> = [];
@@ -103,7 +112,8 @@ describe("scheduler", () => {
   });
 
   it("emits task.<id>.completed and task.<id>.failed", async () => {
-    const { bus, scheduler, hostId } = rig();
+    const { bus, scheduler, hostId, seedAgent } = rig();
+    seedAgent("a");
     const seen: string[] = [];
     bus.subscribe("*", (e) => {
       if (e.type.startsWith("task.")) seen.push(e.type);

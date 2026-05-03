@@ -79,47 +79,70 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
       console.error(`[scheduler] ${t.id} on ${ev.type} threw:`, e);
     });
 
-  // Bun sqlite tags FK violations with this code. Real schema bugs surface
-  // any other error code/shape and must rethrow so they don't get buried.
-  function isFkMiss(err: unknown): boolean {
-    return (err as { code?: string } | null)?.code === "SQLITE_CONSTRAINT_FOREIGNKEY";
-  }
-  function logFkMiss(where: string, task: TaskDef, err: unknown, event?: Event): void {
+  // Persistence errors during dispatch (claims / task_runs) are logged
+  // loudly but kept off the dispatch hot path — the bus.publish for the
+  // done-event MUST still fire so subscribers waiting on resume don't
+  // hang. register() is the strict surface: it throws on failed insert
+  // so misconfigured callers (missing agent row, etc.) fail fast at
+  // setup time instead of dropping audit rows in production.
+  function logPersistError(where: string, task: TaskDef, err: unknown, event?: Event): void {
     const evPart = event ? ` event=${event.id} type=${event.type}` : "";
     // eslint-disable-next-line no-console -- scheduler is infra
-    console.warn(
-      `[scheduler] ${where} skipped FK miss for task=${task.id}${evPart}: ${(err as Error).message}`,
+    console.error(
+      `[scheduler] ${where} failed for task=${task.id}${evPart}: ${(err as Error).message ?? err}`,
+    );
+  }
+
+  // claims.event_id and task_runs.event_id reference events(id). Most
+  // events that trigger a tracked task are durable and were already
+  // persisted by the bus; non-durable triggers (chat deltas, ext
+  // api.publish defaults, scheduler done-events) aren't. The scheduler
+  // is the system that knows audit is now warranted, so it upserts the
+  // triggering event row idempotently before recording. Cheaper than
+  // forcing every publisher to think about audit.
+  const ensureEventStmt = opts.store.raw.prepare(
+    `INSERT OR IGNORE INTO events
+       (id, hlc, host_id, actor_id, type, payload, parent_event_id, to_agent_id, thread_id, parent_thread_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  function ensureEventPersisted(event: Event): void {
+    ensureEventStmt.run(
+      event.id,
+      event.hlc,
+      event.hostId,
+      event.actorId,
+      event.type,
+      JSON.stringify(event.payload ?? null),
+      event.parentEventId ?? null,
+      event.toAgentId ?? null,
+      event.threadId ?? null,
+      event.parentThreadId ?? null,
+      event.createdAt,
     );
   }
 
   function persistTask(task: TaskDef): void {
-    // Idempotent: onConflictDoNothing handles both re-registrations and
-    // shared task ids across test rigs. Outer try swallows FK misses in
-    // tests where agent rows aren't seeded.
-    try {
-      opts.store
-        .insert(tables.tasks)
-        .values({
-          id: task.id,
-          agentId: task.agentId,
-          triggerRefs: task.eventType === "*" ? [] : [task.eventType],
-          handlerRef: `code:${task.id}`,
-          tier: task.tier,
-          scope: {},
-          tokenEst: task.tokenEst ?? 0,
-          createdAt: Date.now(),
-        })
-        .onConflictDoNothing()
-        .run();
-    } catch (err) {
-      if (!isFkMiss(err)) throw err;
-      logFkMiss("persistTask", task, err);
-    }
+    // Idempotent on (id) via onConflictDoNothing — both re-registration
+    // and tests that share task ids land safely. Any other failure
+    // (FK violation, schema drift) propagates so the caller knows the
+    // registration is bad before any dispatch is attempted.
+    opts.store
+      .insert(tables.tasks)
+      .values({
+        id: task.id,
+        agentId: task.agentId,
+        triggerRefs: task.eventType === "*" ? [] : [task.eventType],
+        handlerRef: `code:${task.id}`,
+        tier: task.tier,
+        scope: {},
+        tokenEst: task.tokenEst ?? 0,
+        createdAt: Date.now(),
+      })
+      .onConflictDoNothing()
+      .run();
   }
 
   function recordClaim(task: TaskDef, event: Event, status: "winner" | "failed"): void {
-    // Claims require both the event and the task to exist in the store.
-    // In v0 many event/task rows are stub-only; guard rather than crash.
     try {
       opts.store
         .insert(tables.claims)
@@ -132,8 +155,7 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
         })
         .run();
     } catch (err) {
-      if (!isFkMiss(err)) throw err;
-      logFkMiss("recordClaim", task, err, event);
+      logPersistError("recordClaim", task, err, event);
     }
   }
 
@@ -154,8 +176,7 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
         .run();
       return id;
     } catch (err) {
-      if (!isFkMiss(err)) throw err;
-      logFkMiss("startRun", task, err, event);
+      logPersistError("startRun", task, err, event);
       return null;
     }
   }
@@ -175,8 +196,7 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
         .where(eq(tables.taskRuns.id, runId))
         .run();
     } catch (err) {
-      if (!isFkMiss(err)) throw err;
-      logFkMiss("endRun", task, err, event);
+      logPersistError("endRun", task, err, event);
     }
   }
 
@@ -185,6 +205,11 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
     const claimable = Boolean(
       (event.payload as Record<string, unknown>)?.claimable,
     );
+    try {
+      ensureEventPersisted(event);
+    } catch (err) {
+      logPersistError("ensureEventPersisted", task, err, event);
+    }
     if (claimable) recordClaim(task, event, "winner");
     const runId = startRun(task, event);
     const ctx: TaskContext = {
