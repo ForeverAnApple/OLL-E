@@ -58,7 +58,7 @@ function writeDiscordStub(dir: string): string {
     export function register(api) {
       api.registerTool({
         name: "discord_send",
-        description: "",
+        description: "test tool",
         inputSchema: { type: "object" },
         execute: (args, ctx) => {
           __sends.push({ args, actorId: ctx.actorId, extensionId: ctx.extensionId });

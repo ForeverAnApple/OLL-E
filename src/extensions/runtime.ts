@@ -26,6 +26,7 @@ import { readManifest } from "./manifest.ts";
 import { latestCommitsBySubtree } from "./git.ts";
 import type { Scheduler } from "../scheduler/index.ts";
 import { checkTool } from "../permissions/index.ts";
+import { checkToolInvariants } from "../boot/invariants.ts";
 import type { AgentScope } from "../store/schema.ts";
 import type {
   CallToolOptions,
@@ -286,6 +287,13 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
             `[extensions] tool "${tool.name}" from "${callerName}" has no inputSchema — defaulting to { type: "object" }; please update the extension to declare a JSON Schema`,
           );
           guarded = { ...tool, inputSchema: { type: "object" } };
+        }
+        const invariants = checkToolInvariants(guarded);
+        if (!invariants.ok) {
+          const details = invariants.failures.map((f) => `[${f.code}] ${f.message}`).join("; ");
+          throw new Error(
+            `extensions: tool "${tool.name}" from "${callerName}" failed provider invariants: ${details}`,
+          );
         }
         const entry: RegisteredToolEntry = {
           extensionId,

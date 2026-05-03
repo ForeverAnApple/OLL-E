@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installStarter, listStarters, getStarter } from "../src/starters/index.ts";
 import { validateManifest } from "../src/extensions/manifest.ts";
 import { history } from "../src/extensions/git.ts";
+import { createBus, persistToStore } from "../src/bus/index.ts";
+import { createExtensionHost } from "../src/extensions/index.ts";
+import { ulid } from "../src/id/index.ts";
+import { openStore, tables } from "../src/store/index.ts";
 
 let tmp: string;
 beforeEach(() => {
@@ -31,6 +35,50 @@ describe("starter templates", () => {
     for (const s of listStarters()) {
       expect(s.files["index.ts"]).toBeDefined();
       expect(s.files["smoke.ts"]).toBeDefined();
+    }
+  });
+
+  it("broad external write tools declare strategic tier", () => {
+    const claude = getStarter("claude-code")!.files["index.ts"]!;
+    expect(claude).toMatch(/name: "claude_code"[\s\S]*?tier: "strategic"/);
+
+    const discord = getStarter("discord")!.files["index.ts"]!;
+    expect(discord).toMatch(/name: "discord_react"[\s\S]*?tier: "strategic"/);
+
+    const github = getStarter("github")!.files["index.ts"]!;
+    for (const name of ["github_create_issue", "github_add_comment", "github_close_issue"]) {
+      expect(github).toMatch(new RegExp(`name: "${name}"[\\s\\S]*?tier: "strategic"`));
+    }
+  });
+
+  it("cron-trigger unload clears its interval", async () => {
+    installStarter({ name: "cron-trigger", extensionsDir: tmp, authorName: "a" });
+    const manifestPath = join(tmp, "cron-trigger", "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.config.intervalMs = 20;
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const store = openStore({ path: ":memory:" });
+    const hostId = ulid();
+    store.insert(tables.hosts).values({ id: hostId, hostname: "t", createdAt: Date.now() }).run();
+    const bus = createBus({ hostId, persist: persistToStore(store) });
+    let ticks = 0;
+    bus.subscribe("cron.fire", () => {
+      ticks += 1;
+    });
+    const host = createExtensionHost({ bus, store, hostId, extensionsDir: tmp });
+    try {
+      await host.load("cron-trigger");
+      await new Promise((resolve) => setTimeout(resolve, 55));
+      expect(ticks).toBeGreaterThanOrEqual(1);
+      await host.unload("cron-trigger");
+      const afterUnload = ticks;
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      expect(ticks).toBe(afterUnload);
+    } finally {
+      await host.unload("cron-trigger");
+      bus.close();
+      store.close();
     }
   });
 });

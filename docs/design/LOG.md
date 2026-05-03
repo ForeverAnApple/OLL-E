@@ -855,6 +855,12 @@ The compacted `0001_init.sql` defines the final-state CREATE TABLE / CREATE INDE
 
 ---
 
+## 2026-05-03 — Starter write-tool tiers and transport replies
+
+Starter tools that broadly mutate code or third-party state are strategic by default: `claude_code`, GitHub issue create/comment/close, and Discord reactions now declare `tier: "strategic"` so direct agent/tool calls route through the same permission physics as other world-changing actions. `discord_send` stays operational for v0 because the Discord communication bridge uses it as the transport reply path for `chat.turn-end`, analogous to the CLI printing the assistant's reply; making that path strategic would special-case Discord humans behind an approval wall and violate transport-agnostic chat. The unresolved edge is arbitrary channel sends through the same tool name; resurrect when channel/repo-scoped tool permissions exist, or split transport replies from proactive outbound posting.
+
+---
+
 ## Open questions carried forward
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.

@@ -33,6 +33,7 @@ const cronTrigger: StarterTemplate = {
 
 const DEFAULT_INTERVAL = 60000;
 const DEFAULT_TYPE = "cron.fire";
+let cronTimer: ReturnType<typeof setInterval> | null = null;
 
 export function register(api) {
   // Read config from the manifest we shipped beside us.
@@ -45,17 +46,16 @@ export function register(api) {
   const eventType = cfg.eventType ?? DEFAULT_TYPE;
 
   let ticks = 0;
-  const timer = setInterval(() => {
+  if (cronTimer) clearInterval(cronTimer);
+  cronTimer = setInterval(() => {
     ticks += 1;
     api.publish(eventType, { tick: ticks, at: Date.now() }, { durable: true });
   }, intervalMs);
-
-  // Store the timer on the api object so unload() can clear it.
-  api.__cronTimer = timer;
 }
 
 export function unload() {
-  // Best effort; if the api object is lost we accept leaking one timer.
+  if (cronTimer) clearInterval(cronTimer);
+  cronTimer = null;
 }
 `,
     "smoke.ts":
@@ -143,6 +143,7 @@ export function register(api) {
     name: "claude_code",
     description:
       "Run the claude CLI with a prompt inside a verified absolute working directory and return its stdout. Useful for delegating code changes. If this fails, inspect query_host_context for cwd/PATH and command availability before retrying.",
+    tier: "strategic",
     inputSchema: {
       type: "object",
       properties: {
@@ -498,6 +499,7 @@ export function register(api: any) {
   api.registerTool({
     name: "discord_react",
     description: "Add a reaction to a message. emoji is unicode (e.g. \\\"👍\\\") or custom \\\"name:id\\\".",
+    tier: "strategic",
     inputSchema: {
       type: "object",
       properties: {
@@ -664,6 +666,7 @@ export function register(api: any) {
   api.registerTool({
     name: "github_create_issue",
     description: "Open a new issue in a repo. Attach body, labels, assignees as needed.",
+    tier: "strategic",
     inputSchema: {
       type: "object",
       properties: {
@@ -687,6 +690,7 @@ export function register(api: any) {
   api.registerTool({
     name: "github_add_comment",
     description: "Add a comment to an existing issue or PR.",
+    tier: "strategic",
     inputSchema: {
       type: "object",
       properties: {
@@ -729,6 +733,7 @@ export function register(api: any) {
   api.registerTool({
     name: "github_close_issue",
     description: "Close an issue. Optional reason: completed or not_planned.",
+    tier: "strategic",
     inputSchema: {
       type: "object",
       properties: {

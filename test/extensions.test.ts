@@ -173,6 +173,63 @@ describe("manifest validation", () => {
     expect(entry!.tool.inputSchema).toEqual({ type: "object" });
   });
 
+  it("rejects provider-invalid tool names at extension registration", async () => {
+    const r = rig();
+    writeExt(tmp, "bad-tool-name", {
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "bad-name",
+            description: "invalid because providers reject dashes",
+            inputSchema: { type: "object" },
+            execute: () => "nope",
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("bad-tool-name")).rejects.toThrow(/invalid-tool-name/);
+    expect(host.tools()).toHaveLength(0);
+  });
+
+  it("rejects non-object extension tool schemas before chat can see them", async () => {
+    const r = rig();
+    writeExt(tmp, "bad-tool-schema", {
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "bad_schema",
+            description: "invalid because provider tool inputs must be objects",
+            inputSchema: { type: "string" },
+            execute: () => "nope",
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("bad-tool-schema")).rejects.toThrow(/non-object-input-schema/);
+    expect(host.tools()).toHaveLength(0);
+  });
+
+  it("rejects extension tools with no description", async () => {
+    const r = rig();
+    writeExt(tmp, "bad-tool-description", {
+      index: `
+        export function register(api) {
+          api.registerTool({
+            name: "nodesc",
+            description: "",
+            inputSchema: { type: "object" },
+            execute: () => "nope",
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("bad-tool-description")).rejects.toThrow(/missing-description/);
+    expect(host.tools()).toHaveLength(0);
+  });
+
   it("requires manifest.eventWrites before publishing events", async () => {
     const r = rig();
     writeExt(tmp, "talker", {
@@ -527,7 +584,7 @@ describe("hot reload + failure tracking", () => {
         export function register(api) {
           api.registerTool({
             name: "v1",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: () => "v1",
           });
@@ -544,7 +601,7 @@ describe("hot reload + failure tracking", () => {
         export function register(api) {
           api.registerTool({
             name: "v2",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: () => "v2",
           });
@@ -692,7 +749,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "echo_b",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             ${calleeToolDef ?? ""}
             execute: (args, ctx) => ({
@@ -712,7 +769,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "run_cross",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: async (args) => api.callTool("echo_b", args),
           });
@@ -780,7 +837,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "run",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: () => api.callTool("nobody_home", {}),
           });
@@ -809,7 +866,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "dangerous",
-            description: "",
+            description: "test tool",
             tier: "strategic",
             inputSchema: { type: "object" },
             execute: () => "should not run",
@@ -823,7 +880,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "try",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: () => api.callTool("dangerous", {}),
           });
@@ -853,7 +910,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "sleep",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: (_args, ctx) => new Promise((_resolve, reject) => {
               const t = setTimeout(() => _resolve("done"), 1000);
@@ -872,7 +929,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "run",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: () => api.callTool("sleep", {}, { timeoutMs: 30 }),
           });
@@ -918,7 +975,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "echo_b",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: (args) => args,
           });
@@ -931,7 +988,7 @@ describe("cross-extension callTool", () => {
         export function register(api) {
           api.registerTool({
             name: "run_as_agent",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: async () => api.callTool("echo_b", {}, { asAgent: "narrow-agent" }),
           });
@@ -979,7 +1036,7 @@ describe("secrets + scratch dir", () => {
         export function register(api) {
           api.registerTool({
             name: "reveal",
-            description: "",
+            description: "test tool",
             inputSchema: { type: "object" },
             execute: () => api.secrets.TOKEN,
           });

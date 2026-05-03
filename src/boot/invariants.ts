@@ -31,6 +31,47 @@ export interface InvariantResult {
 
 const TOOL_NAME_RE = /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/;
 
+function collectToolShapeFailures(t: ToolDef): InvariantFailure[] {
+  const failures: InvariantFailure[] = [];
+  if (!TOOL_NAME_RE.test(t.name)) {
+    failures.push({
+      code: "invalid-tool-name",
+      message: `tool name "${t.name}" doesn't match /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/ — provider may reject it`,
+      offenders: [t.name],
+    });
+  }
+  const schema = t.inputSchema as Record<string, unknown> | undefined;
+  if (!schema || typeof schema !== "object") {
+    failures.push({
+      code: "missing-input-schema",
+      message: `tool "${t.name}" has no inputSchema`,
+      offenders: [t.name],
+    });
+  } else if (schema.type !== "object") {
+    failures.push({
+      code: "non-object-input-schema",
+      message: `tool "${t.name}" inputSchema.type must be "object" (got ${JSON.stringify(schema.type)})`,
+      offenders: [t.name],
+    });
+  }
+  if (typeof t.description !== "string" || t.description.length === 0) {
+    failures.push({
+      code: "missing-description",
+      message: `tool "${t.name}" has no description — providers may reject and the catalog has nothing to render`,
+      offenders: [t.name],
+    });
+  }
+  return failures;
+}
+
+/** Validate one provider-facing tool spec. Extension registration uses this
+ *  so agent-authored tools cannot hot-load a shape that later bricks every
+ *  chat turn with a provider 400. */
+export function checkToolInvariants(tool: ToolDef): InvariantResult {
+  const failures = collectToolShapeFailures(tool);
+  return { ok: failures.length === 0, failures };
+}
+
 /**
  * Validate the assembled core tool set. Returns every failure rather
  * than throwing on the first — boot-time output should name *all* the
@@ -61,36 +102,7 @@ export function checkCoreInvariants(tools: ToolDef[]): InvariantResult {
   }
 
   for (const t of tools) {
-    if (!TOOL_NAME_RE.test(t.name)) {
-      failures.push({
-        code: "invalid-tool-name",
-        message: `tool name "${t.name}" doesn't match /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/ — provider may reject it`,
-        offenders: [t.name],
-      });
-    }
-    const schema = t.inputSchema as Record<string, unknown> | undefined;
-    if (!schema || typeof schema !== "object") {
-      failures.push({
-        code: "missing-input-schema",
-        message: `tool "${t.name}" has no inputSchema`,
-        offenders: [t.name],
-      });
-      continue;
-    }
-    if (schema.type !== "object") {
-      failures.push({
-        code: "non-object-input-schema",
-        message: `tool "${t.name}" inputSchema.type must be "object" (got ${JSON.stringify(schema.type)})`,
-        offenders: [t.name],
-      });
-    }
-    if (typeof t.description !== "string" || t.description.length === 0) {
-      failures.push({
-        code: "missing-description",
-        message: `tool "${t.name}" has no description — providers may reject and the catalog has nothing to render`,
-        offenders: [t.name],
-      });
-    }
+    failures.push(...collectToolShapeFailures(t));
   }
 
   return { ok: failures.length === 0, failures };
