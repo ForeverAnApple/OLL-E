@@ -1,6 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { runAgent } from "../src/agent/runtime.ts";
-import type { Completion, CompletionRequest, ContentBlock, Llm } from "../src/llm/types.ts";
+import type {
+  Completion,
+  CompletionRequest,
+  ContentBlock,
+  Llm,
+  ToolUseBlock,
+} from "../src/llm/types.ts";
 import type { ToolDef } from "../src/extensions/types.ts";
 
 /** Scriptable mock LLM. Each entry is the completion to return for the
@@ -384,7 +390,7 @@ describe("runAgent", () => {
       const m = r.messages[i]!;
       if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
       const toolUseIds = m.content
-        .filter((b): b is { type: "tool_use"; id: string } => b.type === "tool_use")
+        .filter((b): b is ToolUseBlock => b.type === "tool_use")
         .map((b) => b.id);
       if (toolUseIds.length === 0) continue;
       const next = r.messages[i + 1];
