@@ -1,7 +1,7 @@
 import { startDaemon } from "../daemon/daemon.ts";
 import { resolvePaths } from "../paths.ts";
 import { connectIpc, type IpcClient } from "../ipc/client.ts";
-import { withIpc } from "./ipc-helper.ts";
+import { connectOrExit, withIpc } from "./ipc-helper.ts";
 import { plainTheme, renderMarkdown } from "./markdown.ts";
 import type {
   AgentSelf,
@@ -97,21 +97,18 @@ async function cmdRun(): Promise<void> {
 
 async function cmdStatus(): Promise<void> {
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile).catch((e) => {
-    console.error(`olle: daemon not reachable (${e.message})`);
-    process.exit(1);
+  await withIpc(paths.socketFile, async (client) => {
+    const value = await client.call<{ hostId: string; pid: number; uptimeMs: number }>("status");
+    console.log(
+      `host: ${value.hostId}\npid:  ${value.pid}\nup:   ${Math.round(value.uptimeMs / 1000)}s`,
+    );
   });
-  const value = await client.call<{ hostId: string; pid: number; uptimeMs: number }>("status");
-  client.close();
-  console.log(
-    `host: ${value.hostId}\npid:  ${value.pid}\nup:   ${Math.round(value.uptimeMs / 1000)}s`,
-  );
 }
 
 async function cmdTail(args: string[]): Promise<void> {
   const type = args[0] ?? "*";
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
+  const client = await connectOrExit(paths.socketFile);
   const sub = client.stream("tail", { type });
   const stop = () => {
     void sub.cancel().then(() => {
@@ -134,24 +131,31 @@ async function cmdPublish(args: string[]): Promise<void> {
     console.error("usage: olle publish <type> [json-payload]");
     process.exit(2);
   }
-  const payload = rest.length ? JSON.parse(rest.join(" ")) : {};
+  let payload: unknown = {};
+  if (rest.length) {
+    try {
+      payload = JSON.parse(rest.join(" "));
+    } catch (err) {
+      console.error(`olle publish: invalid JSON payload — ${(err as Error).message}`);
+      process.exit(2);
+    }
+  }
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  const res = await client.call<{ id: string; hlc: string }>("publish", {
-    type,
-    payload,
-    actorId: "cli",
-    durable: true,
+  await withIpc(paths.socketFile, async (client) => {
+    const res = await client.call<{ id: string; hlc: string }>("publish", {
+      type,
+      payload,
+      actorId: "cli",
+      durable: true,
+    });
+    console.log(`${res.hlc} ${res.id}`);
   });
-  client.close();
-  console.log(`${res.hlc} ${res.id}`);
 }
 
 async function cmdExtension(args: string[]): Promise<void> {
   const [sub, ...rest] = args;
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
+  await withIpc(paths.socketFile, async (client) => {
     switch (sub) {
       case undefined:
       case "list": {
@@ -211,16 +215,13 @@ async function cmdExtension(args: string[]): Promise<void> {
       default:
         throw new Error(`unknown extension subcommand: ${sub}`);
     }
-  } finally {
-    client.close();
-  }
+  });
 }
 
 async function cmdStarter(args: string[]): Promise<void> {
   const [sub, ...rest] = args;
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
+  await withIpc(paths.socketFile, async (client) => {
     switch (sub) {
       case undefined:
       case "list": {
@@ -252,16 +253,13 @@ async function cmdStarter(args: string[]): Promise<void> {
       default:
         throw new Error(`unknown starter subcommand: ${sub}`);
     }
-  } finally {
-    client.close();
-  }
+  });
 }
 
 async function cmdSecret(args: string[]): Promise<void> {
   const [sub, ...rest] = args;
   const paths = resolvePaths();
-  const client = await connectIpc(paths.socketFile);
-  try {
+  await withIpc(paths.socketFile, async (client) => {
     switch (sub) {
       case undefined:
       case "list": {
@@ -312,9 +310,7 @@ async function cmdSecret(args: string[]): Promise<void> {
       default:
         throw new Error(`unknown secret subcommand: ${sub}`);
     }
-  } finally {
-    client.close();
-  }
+  });
 }
 
 async function cmdChat(): Promise<void> {
@@ -322,7 +318,7 @@ async function cmdChat(): Promise<void> {
   // Initial connect — fail-fast if the daemon is not up at launch.
   // Once we're in the chat session, transient daemon outages are
   // recovered by the reconnect loop below.
-  let current = await connectIpc(paths.socketFile);
+  let current = await connectOrExit(paths.socketFile);
   // Fetch the root agent's id so we can address events to its mailbox.
   // Falls back to "root" only as a last resort — ids are ULID so the
   // lookup is cheap and authoritative.
