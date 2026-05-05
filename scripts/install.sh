@@ -183,12 +183,21 @@ daemon_reachable() {
   "$BIN_DIR/olle" status >/dev/null 2>&1
 }
 
+# Poll daemon_reachable for up to ~5s; Bun cold-start + migrations + socket
+# bind routinely take 2s+, so a single post-start check trips false negatives.
+wait_for_daemon() {
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    daemon_reachable && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
 cmd_install() {
   build_binary
   install_binary
   service_load
-  sleep 1
-  if daemon_reachable; then
+  if wait_for_daemon; then
     log "daemon is up — try: olle status"
   else
     warn "daemon not reachable yet; check $OLLE_HOME/logs/daemon.err"
@@ -202,8 +211,7 @@ cmd_update() {
   install_binary
   log "starting daemon"
   service_load
-  sleep 1
-  if daemon_reachable; then
+  if wait_for_daemon; then
     log "update complete"
   else
     warn "daemon not reachable after update; check $OLLE_HOME/logs/daemon.err"
