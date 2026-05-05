@@ -861,7 +861,17 @@ Starter tools that broadly mutate code or third-party state are strategic by def
 
 ---
 
-## Open questions carried forward
+## 2026-05-05 — Chat agent hot-reloads on `secret.set`; daemon restart becomes an explicit escape hatch
+
+Fresh-install flow surfaced the bug: `olle secret set ANTHROPIC_API_KEY <val>` writes the file but `daemon.ts` only reads the key once at boot, so chat stays disabled until a daemon restart. The user-facing message even said "then restart the daemon," which is exactly the framework gunk vision rejects — constraints should feel like physics, and "you must restart for the system to notice the thing you just gave it" is the opposite.
+
+**The fix.** Both secret-write paths (IPC `secrets.set` and the agent-callable `set_secret` tool) publish a `secret.set` event carrying `{ name, bytes }` — never the value. Keeping the value out of the event payload preserves the redaction story (`set_secret` already declares `sensitiveInputFields: ["value"]` so audit events and persisted session messages strip it; the wire format follows the same rule, so any future bridge that mirrors events doesn't suddenly become an exfil channel). The daemon subscribes; when the name is `ANTHROPIC_API_KEY` and chat is currently *not* up, it re-runs the bringup helper. The chat-input bouncer (which echoes `chat.error` while chat is disabled) carries an unsub handle that gets torn down the moment chat goes live. From the principal's perspective: paste the key, run `olle chat`, you're in. No restart, no second command.
+
+**What we deliberately did not do.** When chat is *already* up and someone resets `ANTHROPIC_API_KEY`, the handler does nothing. The running LLM adapter captured the prior key and rotation requires rebuilding the adapter graph (and the agent manager that holds it) — that's a fresh process, not a hot-reload. Calling that out as a constraint is honest; pretending hot-reload covers rotation would silently keep the old key in flight. The escape hatch for rotation (and any other "I want a clean process" need) is the new `olle daemon restart` CLI.
+
+**`olle daemon restart`.** SIGTERMs the daemon by pid (read via the `status` IPC method, not by parsing the pid file directly — same data, one source of truth) and polls the socket for the supervisor-restarted process. Works on both linux (systemd-user `Restart=always`) and macOS (launchd `KeepAlive`); foreground `olle run` users get a clear "re-run `olle run`" message when the timeout lapses. No new IPC method on the daemon side — SIGTERM hits the existing handler in `cmdRun`, so the restart command is a thin shell wrapper over what `systemctl --user restart olle.service` already did. CLI parity for convenience, not a privileged path.
+
+**Why subscribe rather than re-read.** Considered making `readSecret` lazy at chat-bringup time and re-checking on every chat.input. Rejected: that's polling-flavored work on every event, and conflates the "secret available" question with the "agent alive" question. An event is the right unit — secrets are written deliberately, the write moment is observable, and other future subscribers (e.g., extensions that need to react to a token landing) get the same hook for free. The `secret.set` event is durable so it lands in the audit log alongside other state changes.
 
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.
 

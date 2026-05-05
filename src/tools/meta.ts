@@ -20,6 +20,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import type { EventBus } from "../bus/index.ts";
 import type { ExtensionHost, ExtensionInventoryEntry, ToolDef } from "../extensions/index.ts";
 import type { AgentManager } from "../agent/index.ts";
 import type { AgentScope } from "../store/schema.ts";
@@ -41,6 +42,11 @@ export interface MetaToolsOptions {
   /** Dir where file-backed secrets live. When omitted, secret meta-tools
    *  are not registered. */
   secretsDir?: string;
+  /** Event bus. Used by `set_secret` to publish a `secret.set` event
+   *  (name only — never the value) so subscribers like the chat-agent
+   *  bringup hot-reload can react. Optional so tests/agent-managers
+   *  that compose meta-tools without a bus still build. */
+  bus?: EventBus;
   /** Agent manager. When present, spawn / kill / retarget meta-tools
    *  are registered so the agent can grow its own workforce. The
    *  spawning agent id is taken from `authorName` — the chat loop
@@ -582,7 +588,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
         required: ["name", "value"],
         additionalProperties: false,
       },
-      execute: async ({ name, value }) => {
+      execute: async ({ name, value }, ctx) => {
         if (!SECRET_NAME_RE.test(name)) {
           throw new Error(`set_secret: name must match /^[A-Z][A-Z0-9_]{0,63}$/`);
         }
@@ -591,7 +597,20 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
         }
         mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
         writeFileSync(join(secretsDir, name), value, { mode: 0o600 });
-        return { name, bytes: value.length };
+        const bytes = Buffer.byteLength(value, "utf8");
+        // Attribute to the *calling* agent (ctx.actorId), not the agent
+        // whose tool set this was built into — child agents call the same
+        // tool through delegation, and their writes need to land in the
+        // event log under their own id for federation provenance to read
+        // honestly.
+        opts.bus?.publish({
+          type: "secret.set",
+          hostId: opts.bus.hostId,
+          actorId: ctx.actorId,
+          durable: true,
+          payload: { name, bytes },
+        });
+        return { name, bytes };
       },
     };
 

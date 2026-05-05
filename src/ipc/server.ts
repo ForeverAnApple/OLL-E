@@ -378,7 +378,23 @@ async function dispatch(
         mkdirSync(opts.paths.secretsDir, { recursive: true, mode: 0o700 });
         const p = join(opts.paths.secretsDir, name);
         writeFileSync(p, value, { mode: 0o600 });
-        send({ id: req.id, ok: true, value: { name, bytes: value.length } });
+        const bytes = Buffer.byteLength(value, "utf8");
+        // Publish a `secret.set` event (name only — never the value).
+        // Lets subscribers react to a fresh secret without polling: the
+        // chat-agent bringup, for one, hot-reloads on ANTHROPIC_API_KEY.
+        // The CLI socket is mode 0600 owned by the principal, so callers
+        // here are the principal acting through their CLI — attribute to
+        // their principal id when available so federation provenance is
+        // honest. Falls back to host-as-actor only if the IPC server was
+        // wired without one (tests, headless probes).
+        opts.bus.publish({
+          type: "secret.set",
+          hostId: opts.bus.hostId,
+          actorId: opts.rootPrincipalId ?? opts.bus.hostId,
+          durable: true,
+          payload: { name, bytes },
+        });
+        send({ id: req.id, ok: true, value: { name, bytes } });
         return;
       }
       case "secrets.remove": {

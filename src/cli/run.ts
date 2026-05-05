@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { startDaemon } from "../daemon/daemon.ts";
 import { resolvePaths } from "../paths.ts";
 import { connectIpc, type IpcClient } from "../ipc/client.ts";
@@ -31,6 +32,9 @@ export async function runCli(args: string[]): Promise<void> {
       return;
     case "status":
       await cmdStatus();
+      return;
+    case "daemon":
+      await cmdDaemon(rest);
       return;
     case "tail":
       await cmdTail(rest);
@@ -103,6 +107,67 @@ async function cmdStatus(): Promise<void> {
       `host: ${value.hostId}\npid:  ${value.pid}\nup:   ${Math.round(value.uptimeMs / 1000)}s`,
     );
   });
+}
+
+async function cmdDaemon(args: string[]): Promise<void> {
+  const [sub] = args;
+  switch (sub) {
+    case "restart":
+      await cmdDaemonRestart();
+      return;
+    default:
+      throw new Error(
+        `usage: olle daemon restart   (relies on the service supervisor — systemd-user / launchd — to bring the daemon back; in foreground mode you'll have to re-run \`olle run\`)`,
+      );
+  }
+}
+
+async function cmdDaemonRestart(): Promise<void> {
+  const paths = resolvePaths();
+  // Read the live pid so we can detect the supervisor-restarted process by
+  // its new pid below. Reading via IPC lets us fail fast with a clear
+  // message when the daemon is already down.
+  let oldPid: number;
+  try {
+    const c = await connectIpc(paths.socketFile);
+    const status = await c.call<{ pid: number }>("status");
+    c.close();
+    oldPid = status.pid;
+  } catch (err) {
+    throw new Error(
+      `daemon not reachable on ${paths.socketFile} — already down? (${(err as Error).message})`,
+    );
+  }
+  // SIGTERM the daemon; the SIGTERM handler in `cmdRun` calls
+  // daemon.shutdown() and exits cleanly. Service supervisors
+  // (systemd-user `Restart=always`, launchd `KeepAlive`) bring it back.
+  // In foreground mode the daemon just exits.
+  process.kill(oldPid, "SIGTERM");
+  console.log(`signalled pid ${oldPid}; waiting for daemon to come back...`);
+  // Poll the socket. ~10s budget covers Bun cold-start + migrations + bind.
+  const deadline = Date.now() + 10_000;
+  let lastErr: Error | undefined;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      const c = await connectIpc(paths.socketFile);
+      const status = await c.call<{ pid: number }>("status");
+      c.close();
+      if (status.pid !== oldPid) {
+        console.log(`daemon back up (pid ${status.pid})`);
+        return;
+      }
+      // Same pid means we're still talking to the prior process —
+      // SIGTERM hasn't been delivered yet, or its shutdown handler is
+      // still running. Keep polling; the new daemon binds the socket
+      // only after the old one releases it.
+    } catch (e) {
+      lastErr = e as Error;
+    }
+  }
+  throw new Error(
+    `daemon did not come back within 10s${lastErr ? ` (last: ${lastErr.message})` : ""}.\n  Check the supervisor: \`systemctl --user status olle.service\` or \`launchctl print gui/$(id -u)/sh.olle.daemon\`.\n  In foreground mode, re-run \`olle run\`.`,
+  );
 }
 
 async function cmdTail(args: string[]): Promise<void> {
@@ -1804,6 +1869,7 @@ function printHelp(): void {
       "Commands:",
       "  run                         start foreground daemon",
       "  status                      show daemon status",
+      "  daemon restart              SIGTERM the daemon and wait for the supervisor to bring it back",
       "  chat                        REPL connected to the default agent",
       "  tail [type]                 stream events (default: all)",
       "  publish <type> [json]       emit a durable event",

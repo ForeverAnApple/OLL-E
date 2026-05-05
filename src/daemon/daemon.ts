@@ -1,6 +1,6 @@
 import { ensurePaths, resolvePaths, type OllePaths } from "../paths.ts";
 import { openStore, tables, type Store } from "../store/index.ts";
-import { createBus, persistToStore, type EventBus } from "../bus/index.ts";
+import { createBus, persistToStore, type EventBus, type Unsubscribe } from "../bus/index.ts";
 import { createIpcServer, type IpcServer } from "../ipc/server.ts";
 import { createExtensionHost, ensureRepo, type ExtensionHost } from "../extensions/index.ts";
 import { createLedger, type Ledger } from "../ledger/index.ts";
@@ -182,116 +182,145 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // still runs but `olle chat` just bounces with chat.error. Note: this
   // is no longer a "chat agent"; it's the generic agent drain loop
   // anchored to root's mailbox. Bridges publish into that mailbox.
-  const anthropicKey = readSecret(paths.secretsDir, "ANTHROPIC_API_KEY");
-  if (anthropicKey) {
-    chatAgentId = rootAgentId;
-    const llm = createAnthropicAdapter({ apiKey: anthropicKey });
-    // Spilled tool-output store. Owned by the daemon so chat-loop
-    // truncation and the read_tool_result recovery tool share one row
-    // surface — same physics on write and read.
-    const toolResultStore = createToolResultStore({ db: store.raw, hostId });
-    const persistActorId = chatAgentId;
-    const toolTruncate = {
-      persist: ({
-        id,
-        threadId,
-        toolName,
-        content,
-      }: { id: string; threadId: string; toolName: string; content: string }) =>
-        toolResultStore.persist({
+  //
+  // Bringup is split into a helper so it runs in two scenarios: at boot
+  // (when the key is already on disk) and on a `secret.set` event for
+  // ANTHROPIC_API_KEY (when the principal sets the key after install).
+  // The latter is the "constraints feel like physics" path — adding the
+  // key brings the agent alive without a daemon restart.
+  const tryBringChatAgentUp = (): { brought: boolean; reason?: string } => {
+    // Idempotent: a `secret.set` event that races with another bringup
+    // attempt sees chat already running and short-circuits cleanly.
+    if (chat) return { brought: true };
+    const anthropicKey = readSecret(paths.secretsDir, "ANTHROPIC_API_KEY");
+    if (!anthropicKey) {
+      return {
+        brought: false,
+        reason:
+          "No ANTHROPIC_API_KEY secret stored. Set it with: `olle secret set ANTHROPIC_API_KEY` (paste value or pipe on stdin) — chat will come alive automatically.",
+      };
+    }
+    const rootLoopAgentId = rootAgentId;
+    // Construction is split into two phases:
+    //   1. Build everything into LOCAL bindings.
+    //   2. Commit to the outer closure state only after every step succeeds.
+    // If anything in phase 1 throws (e.g. createToolResultStore against a
+    // wedged db, startAgentLoop against a corrupt threads dir), the outer
+    // state stays untouched — the bouncer keeps reflecting the old reason
+    // and a future `secret.set` retries from a clean slate.
+    let localManager: AgentManager | undefined;
+    let localChat: AgentLoop | undefined;
+    let localHealth: ChatHealthMonitor | undefined;
+    try {
+      const llm = createAnthropicAdapter({ apiKey: anthropicKey });
+      // Spilled tool-output store. Owned by the daemon so chat-loop
+      // truncation and the read_tool_result recovery tool share one row
+      // surface — same physics on write and read.
+      const toolResultStore = createToolResultStore({ db: store.raw, hostId });
+      const persistActorId = rootLoopAgentId;
+      const toolTruncate = {
+        persist: ({
           id,
           threadId,
           toolName,
           content,
-          actorId: persistActorId,
-          hostId,
-        }),
-    };
-    // Manager first — meta-tools need a reference so spawn_agent etc.
-    // resolve. The root loop gets registered into it after start.
-    const agentManager = createAgentManager({
-      bus,
-      store,
-      hostId,
-      llm,
-      extensions,
-      ledger,
-      inbox,
-      principalId: rootPrincipalId,
-      threadsDir: paths.threadsDir,
-      hostContext: buildHostContextPrompt(paths, hostId),
-      toolTruncate,
-    });
-    managerHolder.ref = agentManager;
-    const coreTools = [
-      ...buildMetaTools({
-        extensions,
-        extensionsDir: paths.extensionsDir,
-        authorName: chatAgentId,
-        secretsDir: paths.secretsDir,
-        agentManager,
-        paths,
-      }),
-      ...buildMemoryTools({ bus, store, hostId }),
-      // World legibility — agents read their own ledger, runs, threads,
-      // budget, and self-state through these. Same query layer the CLI
-      // uses (no privileged human read surface).
-      ...buildObservabilityTools({ store }),
-      // Decision-inbox surface — same Inbox the askUp chain writes to and
-      // the CLI (`olle inbox`) reads from. mail_list is always-loaded
-      // (orientation tool); mail_respond is deferred (only needed when
-      // voting on a proposal).
-      ...buildInboxTools({ inbox, principalId: rootPrincipalId, bus, hostId, store }),
-      // Recovery surface for spilled tool output. Always-loaded — when an
-      // oversize result lands, the agent needs this in the same turn or
-      // it'd burn an extra round-trip just to learn the recovery path.
-      ...buildToolResultTools({ store: toolResultStore }),
-    ];
-    // Boot invariants — last gate before chat goes live. Tool-name
-    // duplication, malformed schemas, etc. surface here as a named
-    // failure instead of as a provider 400 on every turn. Daemon stays
-    // up either way; chat refuses to start when the registry is broken,
-    // and the principal hears via the inbox if the store is reachable.
-    const invariants = checkCoreInvariants(coreTools);
-    if (!invariants.ok) {
-      const summary = formatFailures(invariants);
-      chatDisabledReason = `${summary} — see \`olle inbox\` for the full diagnostic.`;
-      if (!opts.quiet) console.error(`olle: ${summary}`);
-      bus.publish({
-        type: "daemon.invariant-failed",
+        }: { id: string; threadId: string; toolName: string; content: string }) =>
+          toolResultStore.persist({
+            id,
+            threadId,
+            toolName,
+            content,
+            actorId: persistActorId,
+            hostId,
+          }),
+      };
+      // Manager first — meta-tools need a reference so spawn_agent etc.
+      // resolve. The root loop gets registered into it after start.
+      localManager = createAgentManager({
+        bus,
+        store,
         hostId,
-        actorId: hostId,
-        durable: true,
-        payload: { failures: invariants.failures },
+        llm,
+        extensions,
+        ledger,
+        inbox,
+        principalId: rootPrincipalId,
+        threadsDir: paths.threadsDir,
+        hostContext: buildHostContextPrompt(paths, hostId),
+        toolTruncate,
       });
-      try {
-        inbox.propose({
-          principalId: rootPrincipalId,
-          // FK on decisions.proposing_agent_id → agents; hostId would
-          // violate it. Root agent is the closest legitimate proposer
-          // for environment-level diagnostics.
-          proposingAgentId: rootAgentId,
-          tier: "vision",
-          summary: "core tool invariants failed — chat is disabled",
-          payload: {
-            action: "system_diagnostic",
-            kind: "boot-invariants",
-            failures: invariants.failures,
-            recovery:
-              "Inspect recent commits to src/tools/* and src/daemon/daemon.ts; revert the registration that introduced the offender(s).",
-          },
-          rollbackPlan: "git log -- src/tools/ src/daemon/daemon.ts",
+      const coreTools = [
+        ...buildMetaTools({
+          bus,
+          extensions,
+          extensionsDir: paths.extensionsDir,
+          authorName: rootLoopAgentId,
+          secretsDir: paths.secretsDir,
+          agentManager: localManager,
+          paths,
+        }),
+        ...buildMemoryTools({ bus, store, hostId }),
+        // World legibility — agents read their own ledger, runs, threads,
+        // budget, and self-state through these. Same query layer the CLI
+        // uses (no privileged human read surface).
+        ...buildObservabilityTools({ store }),
+        // Decision-inbox surface — same Inbox the askUp chain writes to and
+        // the CLI (`olle inbox`) reads from. mail_list is always-loaded
+        // (orientation tool); mail_respond is deferred (only needed when
+        // voting on a proposal).
+        ...buildInboxTools({ inbox, principalId: rootPrincipalId, bus, hostId, store }),
+        // Recovery surface for spilled tool output. Always-loaded — when an
+        // oversize result lands, the agent needs this in the same turn or
+        // it'd burn an extra round-trip just to learn the recovery path.
+        ...buildToolResultTools({ store: toolResultStore }),
+      ];
+      // Boot invariants — last gate before chat goes live. Tool-name
+      // duplication, malformed schemas, etc. surface here as a named
+      // failure instead of as a provider 400 on every turn. Daemon stays
+      // up either way; chat refuses to start when the registry is broken,
+      // and the principal hears via the inbox if the store is reachable.
+      const invariants = checkCoreInvariants(coreTools);
+      if (!invariants.ok) {
+        const summary = formatFailures(invariants);
+        const reason = `${summary} — see \`olle inbox\` for the full diagnostic.`;
+        if (!opts.quiet) console.error(`olle: ${summary}`);
+        bus.publish({
+          type: "daemon.invariant-failed",
+          hostId,
+          actorId: hostId,
+          durable: true,
+          payload: { failures: invariants.failures },
         });
-      } catch {
-        // Inbox propose is best-effort — never let a secondary failure
-        // mask the primary diagnostic on stderr.
+        try {
+          inbox.propose({
+            principalId: rootPrincipalId,
+            // FK on decisions.proposing_agent_id → agents; hostId would
+            // violate it. Root agent is the closest legitimate proposer
+            // for environment-level diagnostics.
+            proposingAgentId: rootAgentId,
+            tier: "vision",
+            summary: "core tool invariants failed — chat is disabled",
+            payload: {
+              action: "system_diagnostic",
+              kind: "boot-invariants",
+              failures: invariants.failures,
+              recovery:
+                "Inspect recent commits to src/tools/* and src/daemon/daemon.ts; revert the registration that introduced the offender(s).",
+            },
+            rollbackPlan: "git log -- src/tools/ src/daemon/daemon.ts",
+          });
+        } catch {
+          // Inbox propose is best-effort — never let a secondary failure
+          // mask the primary diagnostic on stderr.
+        }
+        // localManager has no registered loops yet; safe to drop on the
+        // floor (its shutdown is a no-op over an empty map).
+        return { brought: false, reason };
       }
-    } else {
       // Children inherit the same tool set so they can themselves spawn,
       // read extension files, etc. Scope still gates what they get to use.
-      agentManager.setCoreTools(coreTools);
-      const rootLoopAgentId = chatAgentId;
-      chat = startAgentLoop({
+      localManager.setCoreTools(coreTools);
+      localChat = startAgentLoop({
         bus,
         store,
         hostId,
@@ -313,24 +342,44 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
             ? buildNormalPrompt(paths, hostId)
             : buildBootstrapPrompt(paths, hostId),
       });
-      agentManager.register(rootLoopAgentId, chat);
+      localManager.register(rootLoopAgentId, localChat);
       // Crash funnel: repeated chat.error events auto-propose an inbox
       // diagnostic so the principal hears even when chat itself is dead.
-      chatHealth = startChatHealthMonitor({
+      localHealth = startChatHealthMonitor({
         bus,
         inbox,
         hostId,
         principalId: rootPrincipalId,
-        agentId: chatAgentId,
+        agentId: rootLoopAgentId,
       });
+    } catch (err) {
+      // Roll back any partial wiring before reporting up. Manager owns
+      // every loop it registered (only `localChat` here), so a single
+      // shutdown call cleans both.
+      try {
+        localManager?.shutdown();
+      } catch {
+        /* best-effort */
+      }
+      try {
+        localHealth?.stop();
+      } catch {
+        /* best-effort */
+      }
+      return {
+        brought: false,
+        reason: `chat-agent bringup threw: ${(err as Error).message ?? err}. Check ~/.olle/logs/.`,
+      };
     }
-  } else {
-    chatDisabledReason =
-      "No ANTHROPIC_API_KEY secret stored. Set it with: `olle secret set ANTHROPIC_API_KEY` (paste value or pipe on stdin), then restart the daemon.";
-    if (!opts.quiet) {
-      console.log("olle: no ANTHROPIC_API_KEY secret — chat agent disabled (set with `olle secret set ANTHROPIC_API_KEY`)");
-    }
-  }
+    // Phase 2 — commit to outer state. Once any of these is set, the
+    // bouncer's next dispatch sees chat alive and the secret.set handler
+    // skips re-entry.
+    chat = localChat;
+    chatAgentId = rootLoopAgentId;
+    chatHealth = localHealth;
+    managerHolder.ref = localManager;
+    return { brought: true };
+  };
 
   // Dead-mailbox bouncer. Whenever chat is disabled (no key or invariants
   // failed), every chat.input addressed to root would otherwise sit on
@@ -339,8 +388,13 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // first contact (and any future channel) gets a clear diagnostic
   // instead of dead air. Transport-agnostic by construction: the same
   // event reaches the CLI, Discord, GitHub, anything.
-  if (!chat) {
-    bus.subscribe("chat.input", (ev) => {
+  //
+  // The unsub handle is captured so we can tear the bouncer down the
+  // moment chat comes alive (initial bringup or via secret.set).
+  let bouncerUnsub: Unsubscribe | undefined;
+  const installBouncer = (): void => {
+    if (bouncerUnsub) return;
+    bouncerUnsub = bus.subscribe("chat.input", (ev) => {
       if (ev.toAgentId !== rootAgentId) return;
       if (!ev.threadId) return;
       bus.publish({
@@ -355,7 +409,53 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         },
       });
     });
+  };
+  const removeBouncer = (): void => {
+    bouncerUnsub?.();
+    bouncerUnsub = undefined;
+  };
+
+  // Initial bringup. If the key is already on disk, chat goes live now;
+  // otherwise the bouncer stays installed until a `secret.set` event for
+  // ANTHROPIC_API_KEY arrives (see subscription below).
+  //
+  // This call is also the safety net that makes the IPC startup race
+  // benign: between `ipc.listen()` and the secret.set subscription
+  // below, a `secrets.set` IPC arrival writes the file and publishes an
+  // event with no subscriber yet. The event is dropped, but the file
+  // is on disk, and `tryBringChatAgentUp` re-reads the secrets dir, so
+  // the dropped-event path still ends with chat alive.
+  const initial = tryBringChatAgentUp();
+  if (!initial.brought) {
+    chatDisabledReason = initial.reason;
+    if (!opts.quiet) {
+      console.log(`olle: chat agent disabled — ${initial.reason}`);
+    }
+    installBouncer();
   }
+
+  // Hot-reload: when the principal stores the API key after install, wake
+  // chat without forcing a daemon restart. We deliberately do NOT swap
+  // adapters when chat is already up — the running LLM client captured
+  // the prior key and rotation requires a fresh adapter graph; that's a
+  // restart concern, not a hot-reload one. (Hence `olle daemon restart`.)
+  bus.subscribe<{ name?: string }>("secret.set", (ev) => {
+    const name = ev.payload?.name;
+    if (name !== "ANTHROPIC_API_KEY") return;
+    if (chat) return;
+    const r = tryBringChatAgentUp();
+    if (r.brought) {
+      chatDisabledReason = undefined;
+      removeBouncer();
+      if (!opts.quiet) {
+        console.log("olle: ANTHROPIC_API_KEY received — chat agent live");
+      }
+    } else if (r.reason) {
+      // Only update on real failures — the idempotent early-return
+      // (chat already up) goes through the `r.brought` branch above.
+      chatDisabledReason = r.reason;
+    }
+  });
 
   writeFileSync(paths.pidFile, String(process.pid), "utf8");
 
