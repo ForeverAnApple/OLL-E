@@ -304,6 +304,95 @@ describe("agent loop over the mailbox", () => {
     expect(texts).toEqual(["r1", "r2", "r3"]);
   });
 
+  it("folds extendTurn=true mid-turn input into the running turn and emits chat.input-folded", async () => {
+    const r = rig();
+    // Two LLM responses are scripted; the first call is gated on a
+    // promise so we can publish the mid-turn input *while runAgent is
+    // still inside the LLM call* (which is when activeAbort is set
+    // and the inflight-inbox routing applies). Without the gate, the
+    // mock returns synchronously and the turn ends before the second
+    // publish ever sees activeAbort.
+    const seen: Array<Array<string>> = [];
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const llm: Llm = {
+      provider: "mock",
+      defaultModel: "mock-1",
+      async complete(req) {
+        seen.push(
+          req.messages.map((m) =>
+            typeof m.content === "string" ? m.content : "<blocks>",
+          ),
+        );
+        if (seen.length === 1) await firstHeld;
+        return endTurn(`r${seen.length}`);
+      },
+    };
+    startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+    });
+
+    const folded: Array<{ count: number; stranded?: boolean }> = [];
+    r.bus.subscribe("chat.input-folded", (e) => {
+      folded.push(e.payload as { count: number; stranded?: boolean });
+    });
+    let turnEnds = 0;
+    const done = new Promise<void>((resolve) => {
+      r.bus.subscribe("chat.turn-end", () => {
+        turnEnds += 1;
+        if (turnEnds === 1) resolve();
+      });
+    });
+
+    // Initial request — starts the turn. The worker spawns, runTurn
+    // assigns activeAbort, and runAgent's first llm.complete blocks
+    // on `firstHeld`.
+    r.bus.publish({
+      type: "chat.input",
+      hostId: r.hostId,
+      actorId: "cli",
+      durable: true,
+      toAgentId: r.agentId,
+      threadId: "tx",
+      payload: { text: "hello" },
+    });
+    // One microtask flush is enough to let the worker enter the held
+    // LLM call. Now activeAbort is set and the in-flight inbox path
+    // applies for the next publish.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    r.bus.publish({
+      type: "chat.input",
+      hostId: r.hostId,
+      actorId: "cli",
+      durable: true,
+      toAgentId: r.agentId,
+      threadId: "tx",
+      payload: { text: "and also do X", extendTurn: true },
+    });
+    // Release the first LLM call so runAgent can proceed: end_turn
+    // → late drain → fold "and also do X" → second LLM call.
+    releaseFirst();
+    await done;
+
+    // Exactly one turn ran (the second message was folded in, not its
+    // own turn) and the second LLM call's messages array carried the
+    // extension-message as a fresh user turn after the first
+    // assistant reply.
+    expect(turnEnds).toBe(1);
+    expect(seen.length).toBe(2);
+    expect(seen[1]?.at(-1)).toBe("and also do X");
+    // chat.input-folded fired once with count=1 (not stranded, since
+    // it landed on the late-drain path inside runAgent).
+    expect(folded.length).toBe(1);
+    expect(folded[0]).toEqual({ count: 1 });
+  });
+
   it("runs different threads independently — different histories, interleaved drains", async () => {
     // The loop keeps per-thread history; inputs to thread A must not
     // appear in thread B's LLM context.

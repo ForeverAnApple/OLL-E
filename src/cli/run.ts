@@ -670,6 +670,7 @@ async function cmdChat(): Promise<void> {
     promptCont: ui.promptContString(),
     frameTop: () => ui.frameTop(),
     frameBottom: () => ui.frameBottom(),
+    tray: () => ui.trayLines(),
     callbacks: {
       onSubmit: handleSubmit,
       onAbort: () => idleCtrlC(),
@@ -776,15 +777,21 @@ async function cmdChat(): Promise<void> {
     // fold the message into the in-flight turn rather than queue it
     // as a fresh one.
     const wasBusy = turnBusy;
-    // Mid-turn submit: the agent is still streaming above the input
-    // frame. Freeze whatever pending markdown tail is on screen so the
-    // user gutter lands on a clean row underneath, but keep the
-    // assistant block "open" — the next delta continues into the same
-    // header rather than starting a new one. Between turns this is a
-    // no-op (no headerWritten).
-    if (wasBusy) ui.flushPendingTail();
-    ui.commitUserInput(text);
-    if (!turnBusy) turnBusy = true;
+    if (wasBusy) {
+      // Mid-turn submit: park the message in the editor's tray so it
+      // visually pins above the input frame as "queued, not yet seen
+      // by the agent." The actual scrollback commit is deferred until
+      // `chat.input-folded` fires — at that point the message slides
+      // into the natural conversational slot (between the agent's
+      // previous output and its next round-trip), not at submit time
+      // when the agent hasn't read it yet.
+      ui.enqueueTrayMessage(text);
+    } else {
+      // Between turns: normal scrollback commit, message lands as a
+      // user gutter directly above the next agent block.
+      ui.commitUserInput(text);
+      turnBusy = true;
+    }
     // Editor stays live on purpose — the user can keep typing through
     // the agent's response, and the daemon-side mailbox folds those
     // mid-stream sends into the next LLM round-trip. The old suspend()
@@ -869,6 +876,20 @@ async function cmdChat(): Promise<void> {
           if (!id || !renderedToolResults.has(id)) {
             ui.toolResult(String(p.content ?? ""), Boolean(p.isError));
             if (id) renderedToolResults.add(id);
+          }
+        } else if (ev.type === "chat.input-folded") {
+          // Daemon just drained N messages from its in-flight inbox
+          // and is about to fold them into the next LLM round-trip.
+          // Move that many off the front of the tray (FIFO) and
+          // commit each as a regular user gutter — the message has
+          // graduated from "pinned, unread" to "part of the
+          // conversation." commitUserInput already wraps in the
+          // frame-erase/refresh dance, so the tray repaints without
+          // those rows on the next refresh.
+          const count = numFrom(p.count);
+          if (count > 0) {
+            const drained = ui.dequeueTrayMessages(count);
+            for (const text of drained) ui.commitUserInput(text);
           }
         } else if (ev.type === "chat.api-retry") {
           ui.retry({
@@ -1153,6 +1174,15 @@ export function createChatUI(opts: ChatUIOpts) {
   // factory to the LineEditor type.
   let framePad = 0;
   let frameHook: { erase(): void; refresh(): void } | undefined;
+  // Mid-turn submits land here first instead of going straight to
+  // scrollback. The editor renders these as a small pinned tray just
+  // above the input frame so the user sees their just-submitted
+  // message hanging in a "queued" state — visually distinct from the
+  // already-committed history above and the agent's stream still
+  // flowing. When the daemon emits `chat.input-folded`, the
+  // corresponding entries are popped FIFO and committed to scrollback
+  // at the natural conversational position.
+  const trayQueue: string[] = [];
 
   // Cumulative session stats — accumulated across every chat.turn-end
   // and rendered as a single dim line above the next prompt.
@@ -1453,6 +1483,47 @@ export function createChatUI(opts: ChatUIOpts) {
      *  Called once after the editor is constructed. */
     attachFrame(hook: { erase(): void; refresh(): void }): void {
       frameHook = hook;
+    },
+
+    /** Render-time accessor the LineEditor's `tray` option calls every
+     *  paint. Each entry is a one-row formatted string ready to write
+     *  verbatim — dim styled with the user gutter so the eye reads
+     *  them as "user messages, not yet seen by the agent." */
+    trayLines(): string[] | null {
+      if (trayQueue.length === 0) return null;
+      const w = Math.max(20, termWidth() - 4);
+      const gutter = color(`${ANSI.dim}${ANSI.secondary}`, "▎");
+      return trayQueue.map((text) => {
+        // Collapse to a single line and clip to width so the row stays
+        // exactly one visual line — the editor's row math depends on it.
+        const oneLine = text.replace(/\s+/g, " ").trim();
+        const trimmed = oneLine.length > w ? `${oneLine.slice(0, w - 1)}…` : oneLine;
+        return `${gutter} ${color(`${ANSI.dim}${ANSI.muted}`, trimmed)}`;
+      });
+    },
+
+    /** Push a message into the tray and repaint the frame so the
+     *  pinned row appears immediately. The text stays in the tray
+     *  until `dequeueTrayMessages` drains it (driven by the
+     *  `chat.input-folded` event). */
+    enqueueTrayMessage(text: string): void {
+      trayQueue.push(text);
+      if (out.isTTY && frameHook) frameHook.refresh();
+    },
+
+    /** Drain `count` entries off the front of the tray, return them
+     *  to the caller (which commits each into scrollback as a normal
+     *  user gutter), and repaint so the tray shrinks. Match-by-count
+     *  (FIFO) keeps daemon and CLI state aligned without round-
+     *  tripping per-message ids — the daemon's `chat.input-folded`
+     *  event carries the count of messages it just pulled, the CLI
+     *  pops the same number off its FIFO. */
+    dequeueTrayMessages(count: number): string[] {
+      const n = Math.min(Math.max(0, count), trayQueue.length);
+      if (n === 0) return [];
+      const drained = trayQueue.splice(0, n);
+      if (out.isTTY && frameHook) frameHook.refresh();
+      return drained;
     },
 
     /** Snapshot whatever pending markdown tail is on screen as

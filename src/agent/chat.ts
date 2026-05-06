@@ -426,6 +426,21 @@ async function runTurn(
         // second call in the same turn doesn't replay messages.
         if (thread.inFlightInbox.length === 0) return [];
         const drained = thread.inFlightInbox.splice(0);
+        // Tell observers (CLI tray, future bridges) which messages
+        // just got folded into the running turn so a "queued"
+        // visual indicator can transition into scrollback at the
+        // correct conversational position. Non-durable: this is UX
+        // signalling, not a record-of-what-happened — the original
+        // chat.input events are durable and carry the canonical text.
+        opts.bus.publish({
+          type: "chat.input-folded",
+          hostId: opts.hostId,
+          actorId: opts.agentId,
+          parentEventId: origin.id,
+          threadId: thread.id,
+          durable: false,
+          payload: { count: drained.length },
+        });
         // The thread.messages array is mutated by runAgent through the
         // shared reference, so injecting here also keeps the durable
         // snapshot consistent — the post-turn `thread.messages =
@@ -600,11 +615,25 @@ async function runTurn(
     // will pick it up as the start of a fresh turn. Origin is reused
     // from the closing turn — there's no per-message origin event for
     // the in-flight queue and reusing keeps causal chains pointing at
-    // a real, durable parent.
+    // a real, durable parent. Emit `chat.input-folded` too so the
+    // CLI tray (which has been pinning these messages as "queued")
+    // knows to commit them into scrollback now — they're about to
+    // run as their own turn rather than getting folded into this
+    // one, but from the user's standpoint they've graduated from
+    // "agent hasn't seen this" either way.
     if (thread.inFlightInbox.length > 0) {
       const stranded = thread.inFlightInbox.splice(0);
       thread.pending.push(...stranded);
       for (let i = 0; i < stranded.length; i++) thread.pendingOrigin.push(origin);
+      opts.bus.publish({
+        type: "chat.input-folded",
+        hostId: opts.hostId,
+        actorId: opts.agentId,
+        parentEventId: origin.id,
+        threadId: thread.id,
+        durable: false,
+        payload: { count: stranded.length, stranded: true },
+      });
     }
   }
 }

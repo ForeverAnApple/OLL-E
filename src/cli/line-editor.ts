@@ -51,6 +51,16 @@ export interface LineEditorOpts {
   /** Optional bottom frame line drawn directly below the input area. Same
    *  contract as `frameTop`. */
   frameBottom?: () => string | null | undefined;
+  /** Optional tray rows drawn inside the frame, between the top border
+   *  and the input prompt. Used for queued user messages awaiting the
+   *  daemon's mailbox drain (see `chat.input-folded`) — visually they
+   *  sit pinned above the input until the agent folds them in, at
+   *  which point the caller drops them and the regular scrollback
+   *  commit lands. Each entry is a single pre-styled visible row (no
+   *  embedded `\n`); long entries should be truncated by the caller
+   *  to avoid soft-wrapping the editor frame's row math. Returning
+   *  null/undefined or an empty array elides the section. */
+  tray?: () => string[] | null | undefined;
   callbacks: LineEditorCallbacks;
 }
 
@@ -212,6 +222,17 @@ export class LineEditor {
     const frameTop = this.opts.frameTop?.() ?? null;
     if (frameTop) out.write(frameTop + "\n");
 
+    // Tray sits between the frame top and the input prompt. Each entry
+    // is one visible row; we trust the caller to keep them within
+    // `out.columns` (run.ts truncates queued messages before passing
+    // them in) so the row math stays accurate without needing
+    // soft-wrap accounting here.
+    const trayLines = this.opts.tray?.() ?? null;
+    const trayRows = trayLines?.length ?? 0;
+    if (trayLines) {
+      for (const line of trayLines) out.write(line + "\n");
+    }
+
     const lines = this.buffer.split("\n");
     const promptLen = visibleLen(this.opts.prompt);
     const contLen = visibleLen(this.opts.promptCont);
@@ -295,8 +316,9 @@ export class LineEditor {
     const aboveRows = this.aboveLine !== null ? 1 : 0;
     const topRows = frameTop ? 1 : 0;
     const bottomRows = frameBottom ? 1 : 0;
-    this.renderedRow = aboveRows + topRows + inputVisualRow;
-    this.renderedRows = aboveRows + topRows + totalInputRows + bottomRows;
+    this.renderedRow = aboveRows + topRows + trayRows + inputVisualRow;
+    this.renderedRows =
+      aboveRows + topRows + trayRows + totalInputRows + bottomRows;
 
     this.opts.callbacks.onChange?.(this.buffer);
   }
