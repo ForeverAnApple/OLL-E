@@ -182,6 +182,14 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
     const pushResult = (id: string, name: string, content: string, isError: boolean) => {
       pending.push({ id, name, content, isError });
     };
+    // Emit each tool_result onStep the moment its tool finishes executing
+    // — not after the whole batch is done. The user-facing reason: a slow
+    // first tool used to leave the chat looking frozen between the call
+    // line and the eventual dump-of-everything; live streaming makes the
+    // turn feel responsive even when a tool blocks. The aggregate-budget
+    // truncation pass below may still trim a result before it joins the
+    // assistant message — when that happens we re-emit so the CLI shows
+    // the same content the model receives.
     for (const block of completion.content) {
       if (block.type !== "tool_use") continue;
       opts.onStep?.({
@@ -192,14 +200,18 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
       });
       const tool = toolByName.get(block.name);
       if (!tool) {
-        pushResult(block.id, block.name, `unknown tool: ${block.name}`, true);
+        const content = `unknown tool: ${block.name}`;
+        pushResult(block.id, block.name, content, true);
+        opts.onStep?.({ kind: "tool_result", id: block.id, name: block.name, content, isError: true });
         continue;
       }
       if (opts.authorize) {
         const gate = opts.authorize(tool);
         if (!gate.ok) {
           opts.onDenied?.({ tool, reason: gate.reason, input: block.input });
-          pushResult(block.id, block.name, `permission denied: ${gate.reason}`, true);
+          const content = `permission denied: ${gate.reason}`;
+          pushResult(block.id, block.name, content, true);
+          opts.onStep?.({ kind: "tool_result", id: block.id, name: block.name, content, isError: true });
           continue;
         }
       }
@@ -219,32 +231,32 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
           });
         }
         pushResult(block.id, block.name, final, false);
+        opts.onStep?.({ kind: "tool_result", id: block.id, name: block.name, content: final, isError: false });
       } catch (err) {
         const msg = (err as Error).message ?? String(err);
         pushResult(block.id, block.name, msg, true);
+        opts.onStep?.({ kind: "tool_result", id: block.id, name: block.name, content: msg, isError: true });
       }
     }
     if (opts.truncate) {
+      // Aggregate-budget pass — only mutates `pending`'s content for
+      // blocks whose combined size exceeds the per-message cap, replacing
+      // them with `<persisted-output>` recovery markers. We deliberately
+      // do NOT re-emit a tool_result step for those: the user already
+      // saw the live (untruncated) content, and re-emitting would either
+      // duplicate the rendered block in the CLI or, since chat.tool-result
+      // is durable, write a second persisted event for the same id. The
+      // model still receives the truncated form via `toolResults` below.
       enforceMessageBudget(
         pending.filter((p) => !p.isError),
         opts.truncate,
       );
     }
-    const toolResults: ContentBlock[] = [];
-    for (const r of pending) {
-      toolResults.push(
-        r.isError
-          ? { type: "tool_result", tool_use_id: r.id, content: r.content, is_error: true }
-          : { type: "tool_result", tool_use_id: r.id, content: r.content },
-      );
-      opts.onStep?.({
-        kind: "tool_result",
-        id: r.id,
-        name: r.name,
-        content: r.content,
-        isError: r.isError,
-      });
-    }
+    const toolResults: ContentBlock[] = pending.map((r) =>
+      r.isError
+        ? { type: "tool_result", tool_use_id: r.id, content: r.content, is_error: true }
+        : { type: "tool_result", tool_use_id: r.id, content: r.content },
+    );
     messages.push({ role: "user", content: toolResults });
   }
 

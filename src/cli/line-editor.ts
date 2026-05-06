@@ -51,6 +51,29 @@ function visibleLen(s: string): number {
   return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").length;
 }
 
+/** Strip non-printable control bytes from pasted content, keeping only
+ *  newline and tab. A clipboard snippet that includes BEL, BS, FF, raw
+ *  ESC etc. would otherwise either ring the terminal bell, repaint the
+ *  prompt mid-buffer, or worse — bracketed-paste only protects against
+ *  embedded `\n` becoming submits, not against arbitrary control bytes. */
+function sanitizePaste(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    const code = ch.charCodeAt(0);
+    if (ch === "\n" || ch === "\t") {
+      out += ch;
+      continue;
+    }
+    // C0 controls (0x00-0x1F) other than \n/\t, plus DEL (0x7F) and the
+    // C1 range (0x80-0x9F). Everything else passes through (including
+    // multi-byte UTF-8 since this is a JS string of code units).
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) continue;
+    out += ch;
+  }
+  return out;
+}
+
 export class LineEditor {
   private buffer = "";
   private cursor = 0;
@@ -243,10 +266,56 @@ export class LineEditor {
   // ── Buffer mutations ───────────────────────────────────────────────
 
   private insert(text: string): void {
+    const fast = this.canFastAppend(text);
     this.buffer = this.buffer.slice(0, this.cursor) + text + this.buffer.slice(this.cursor);
     this.cursor += text.length;
     this.invalidateHistory();
+    if (fast) {
+      this.opts.out.write(text);
+      this.opts.callbacks.onChange?.(this.buffer);
+      // setAboveLine() (driven by onChange) will only call render() if
+      // the slot's content actually changed — and during plain typing
+      // outside slash-prefix mode it doesn't, so we stay on the fast
+      // path and avoid the full erase+redraw per keystroke.
+      return;
+    }
     this.render();
+  }
+
+  /** True iff an insert of `text` can be painted by writing it straight
+   *  to stdout without invoking the full erase+redraw. Conditions:
+   *
+   *   - TTY output (otherwise we have nothing to write into);
+   *   - editor not suspended (the agent is streaming; nothing to paint);
+   *   - cursor sits at the end of the buffer (otherwise the chars after
+   *     the cursor would be visually overwritten);
+   *   - text contains no newline (multi-line edits change row layout);
+   *   - the inserted chars don't reach the soft-wrap column (crossing
+   *     `width` parks the cursor on the next visual row, which our
+   *     bookkeeping doesn't track on the fast path).
+   *
+   *  This is the dominant case during ordinary typing, so the fast path
+   *  saves the full prompt+buffer rewrite on every keystroke.
+   */
+  private canFastAppend(text: string): boolean {
+    if (!this.opts.out.isTTY) return false;
+    if (this.suspended) return false;
+    if (this.cursor !== this.buffer.length) return false;
+    if (text.length === 0) return false;
+    if (text.includes("\n")) return false;
+    const w = Math.max(1, this.opts.out.columns ?? 80);
+    const nlIdx = this.buffer.lastIndexOf("\n");
+    const lastLine = nlIdx === -1 ? this.buffer : this.buffer.slice(nlIdx + 1);
+    const promptVis =
+      nlIdx === -1 ? visibleLen(this.opts.prompt) : visibleLen(this.opts.promptCont);
+    const totalVis = promptVis + lastLine.length;
+    const beforeCol = totalVis % w;
+    // "Parked" — content written exactly fills a visual row, cursor is
+    // at col=w (or col=0 of next, terminal-dependent). Bail to full
+    // render so the next char's row offset is recomputed from scratch.
+    if (totalVis > 0 && beforeCol === 0) return false;
+    // Inserted chars must not reach or cross the wrap column.
+    return beforeCol + text.length < w;
   }
 
   private backspace(): void {
@@ -268,6 +337,30 @@ export class LineEditor {
     this.buffer = "";
     this.cursor = 0;
     this.invalidateHistory();
+    this.render();
+  }
+
+  /** Ctrl+W — delete the word ending at the cursor. Word boundary is
+   *  whitespace; runs of trailing whitespace immediately before the
+   *  cursor count as part of the word being killed (so a single Ctrl+W
+   *  on `foo bar |` lands on `foo `, not `foo bar`). */
+  private killPrevWord(): void {
+    if (this.cursor === 0) return;
+    let i = this.cursor;
+    while (i > 0 && /\s/.test(this.buffer[i - 1]!)) i--;
+    while (i > 0 && !/\s/.test(this.buffer[i - 1]!)) i--;
+    this.buffer = this.buffer.slice(0, i) + this.buffer.slice(this.cursor);
+    this.cursor = i;
+    this.invalidateHistory();
+    this.render();
+  }
+
+  /** Ctrl+L — wipe the screen and re-anchor the prompt at the top. */
+  private clearScreen(): void {
+    if (!this.opts.out.isTTY) return;
+    this.opts.out.write("\x1b[H\x1b[2J\x1b[3J");
+    this.renderedRow = 0;
+    this.renderedRows = 0;
     this.render();
   }
 
@@ -376,7 +469,7 @@ export class LineEditor {
         }
         this.pasteBuf += chunk.slice(i, end);
         i = end + "\x1b[201~".length;
-        const paste = this.pasteBuf.replace(/\r\n?/g, "\n");
+        const paste = sanitizePaste(this.pasteBuf.replace(/\r\n?/g, "\n"));
         this.pasteBuf = "";
         this.pasting = false;
         this.insert(paste);
@@ -437,6 +530,16 @@ export class LineEditor {
         i++;
         continue;
       } // Ctrl+U
+      if (ch === "\x17") {
+        this.killPrevWord();
+        i++;
+        continue;
+      } // Ctrl+W
+      if (ch === "\x0c") {
+        this.clearScreen();
+        i++;
+        continue;
+      } // Ctrl+L
       if (ch === "\x01") {
         this.moveLineStart();
         i++;
