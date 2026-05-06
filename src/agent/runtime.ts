@@ -75,6 +75,16 @@ export interface AgentRunOptions {
    *  aborts at network level; also checked between rounds so a fired
    *  abort during a tool call ends the turn before the next LLM hop. */
   signal?: AbortSignal;
+  /** Mid-turn user inbox. Drained at every round-trip boundary (and
+   *  one final time when the model would otherwise end_turn). New
+   *  user messages typed while the agent was streaming or running a
+   *  tool get folded into the next LLM call as turn-extending input —
+   *  the conversational counterpart to "humans are events." Returns
+   *  the messages to append (caller is expected to splice them out of
+   *  whatever queue holds them, so calling drains). When omitted, the
+   *  loop behaves exactly as before: messages are captured once at
+   *  turn-top and never re-read. */
+  mailbox?: () => Message[];
 }
 
 export type AgentStep =
@@ -138,6 +148,17 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
 
   for (let turn = 0; turn < maxTurns; turn++) {
     if (opts.signal?.aborted) throw abortError(opts.signal);
+    // Drain the mid-turn mailbox before the next LLM call. Mailbox
+    // delivery only ever lands user-role messages, and only at this
+    // boundary (between a completed `tool_result` and the next
+    // assistant call) — the API rejects user messages between a
+    // `tool_use` and its `tool_result`, so this is the single safe
+    // injection point. On iteration 0 the mailbox is normally empty
+    // (messages that arrived before runAgent are already in the
+    // initial array); a non-empty drain here just means the caller
+    // bundled extras explicitly.
+    const earlyInbox = opts.mailbox?.() ?? [];
+    if (earlyInbox.length > 0) messages.push(...earlyInbox);
     const { tools: roundTools, byName: toolByName } = resolveTools();
     const visibleTools = filterVisibleTools(roundTools, opts.isLoaded);
     const toolSpecs: ToolSpec[] | undefined = visibleTools?.map(toToolSpec);
@@ -173,11 +194,22 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
     // that nonetheless include tool_use blocks.
     const hasToolUse = completion.content.some((b) => b.type === "tool_use");
     if (!hasToolUse) {
-      return {
-        messages,
-        stopReason: completion.stopReason,
-        totalUsage: total,
-      };
+      // Last chance to extend this turn with anything the user typed
+      // while the model was producing its closing response. If the
+      // mailbox is empty, the turn ends. If something's there, we
+      // append it as a fresh user message and keep going — feels like
+      // "I was about to wrap, but you spoke," not "your message had
+      // to wait for the next turn."
+      const lateInbox = opts.mailbox?.() ?? [];
+      if (lateInbox.length === 0) {
+        return {
+          messages,
+          stopReason: completion.stopReason,
+          totalUsage: total,
+        };
+      }
+      messages.push(...lateInbox);
+      continue;
     }
 
     interface PendingResult {

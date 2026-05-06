@@ -480,6 +480,16 @@ async function cmdChat(): Promise<void> {
       onStreamCancel: () => void cancelTurn(),
     },
   });
+  // Hand the editor's frame lifecycle to the UI factory so each
+  // scrollback write paints with the input frame still in place at
+  // the bottom (erase → write → re-render). Without this the agent's
+  // streaming output would walk over the prompt frame as it grew, and
+  // we'd be back to the suspend()-during-streaming model that blocked
+  // mid-turn user input.
+  ui.attachFrame({
+    erase: () => editor.eraseRender(),
+    refresh: () => editor.refresh(),
+  });
 
   function idleCtrlC(): void {
     // First press: arm; second press within the window: exit.
@@ -555,13 +565,36 @@ async function cmdChat(): Promise<void> {
       }
       return;
     }
+    // Snapshot the busy state *before* mutating it — `extendTurn` is
+    // true only when the user submitted while the previous turn was
+    // still running, which is the signal we use on the daemon side to
+    // fold the message into the in-flight turn rather than queue it
+    // as a fresh one.
+    const wasBusy = turnBusy;
+    // Mid-turn submit: the agent is still streaming above the input
+    // frame. Freeze whatever pending markdown tail is on screen so the
+    // user gutter lands on a clean row underneath, but keep the
+    // assistant block "open" — the next delta continues into the same
+    // header rather than starting a new one. Between turns this is a
+    // no-op (no headerWritten).
+    if (wasBusy) ui.flushPendingTail();
     ui.commitUserInput(text);
-    turnBusy = true;
-    editor.suspend();
+    if (!turnBusy) turnBusy = true;
+    // Editor stays live on purpose — the user can keep typing through
+    // the agent's response, and the daemon-side mailbox folds those
+    // mid-stream sends into the next LLM round-trip. The old suspend()
+    // call traded that responsiveness for a tidy "no prompt under
+    // streaming output" picture; the bounding-box frame now keeps
+    // visual order without needing the editor to disappear.
     try {
       await current.call("publish", {
         type: "chat.input",
-        payload: { text },
+        // `extendTurn` tells the daemon "this came in while the agent
+        // was already mid-turn and the user means it as part of that
+        // exchange." With the flag set the message folds into the
+        // running turn at the next round-trip; without it (the
+        // between-turns case), it queues normally as a fresh request.
+        payload: { text, extendTurn: wasBusy },
         actorId: "cli",
         durable: true,
         toAgentId: rootAgentId,
@@ -903,6 +936,18 @@ export function createChatUI(opts: ChatUIOpts) {
   let pendingText = ""; // post-boundary tail buffer
   let pendingRows = 0; // visual rows below the start of the pending tail
   let pendingCol = 0; // cursor column on the bottom pending row
+  // ── Frame integration (live editor during streaming) ──────────────────
+  // The line editor's bounding-box frame stays visible while the agent
+  // streams above it (so the user can keep typing). Each scrollback
+  // write erases the frame, paints, and re-renders the frame at the
+  // new cursor position. `framePad` records whether a `\n` was
+  // emitted between the pending tail's last row and the frame's top —
+  // the rewindPending / processDelta path needs to walk back through
+  // it to land on the start-of-pending row. The `frameHook` lets
+  // run.ts inject the editor lifecycle without coupling this UI
+  // factory to the LineEditor type.
+  let framePad = 0;
+  let frameHook: { erase(): void; refresh(): void } | undefined;
 
   // Cumulative session stats — accumulated across every chat.turn-end
   // and rendered as a single dim line above the next prompt.
@@ -942,12 +987,42 @@ export function createChatUI(opts: ChatUIOpts) {
     // Bounded by maxPendingRows() so this never tries to reach into
     // scrollback. Non-TTY: pending is never painted, nothing to rewind.
     if (!out.isTTY) return;
+    // If a previous redraw padded a `\n` between the pending tail and
+    // the (now-erased) frame top, walk past it before the normal rewind.
+    // After eraseRender the cursor sits where the frame's top row was,
+    // which is `framePad` rows below pending's last row.
+    if (framePad > 0) {
+      out.write(`\x1b[${framePad}F`);
+      framePad = 0;
+    }
     if (pendingRows === 0 && pendingCol === 0) return;
     if (pendingRows > 0) out.write(`\x1b[${pendingRows}F`);
     else out.write("\r");
     out.write("\x1b[0J");
     pendingRows = 0;
     pendingCol = 0;
+  }
+
+  /** Wrap a write that lands in scrollback so the input frame stays
+   *  pinned at the bottom of the stream. Erases the frame, runs the
+   *  action, then refreshes the frame at whatever row the cursor ends
+   *  on. Pads with a `\n` when the action left the cursor mid-row so
+   *  the frame's first content always lands at col 0; the pad is
+   *  remembered for the next `rewindPending`. */
+  function inFrame(action: () => void): void {
+    if (!out.isTTY || !frameHook) {
+      action();
+      return;
+    }
+    frameHook.erase();
+    action();
+    if (pendingCol > 0) {
+      out.write("\n");
+      framePad = 1;
+    } else {
+      framePad = 0;
+    }
+    frameHook.refresh();
   }
 
   function writeRawPending(text: string): void {
@@ -1168,6 +1243,29 @@ export function createChatUI(opts: ChatUIOpts) {
       return color(ANSI.border, "─".repeat(w));
     },
 
+    /** Plug the line editor into the UI so each scrollback write
+     *  erases and repaints the input frame around the new content.
+     *  Called once after the editor is constructed. */
+    attachFrame(hook: { erase(): void; refresh(): void }): void {
+      frameHook = hook;
+    },
+
+    /** Snapshot whatever pending markdown tail is on screen as
+     *  committed text, *without* closing the assistant block. Used
+     *  when the user submits a message mid-turn so the gutter block
+     *  lands cleanly underneath; the next assistant delta continues
+     *  into the same header rather than starting a fresh one. */
+    flushPendingTail(): void {
+      if (!headerWritten) return;
+      inFrame(() => {
+        // forceFlushPending freezes the painted pending tail as raw
+        // committed text and emits a `\n` if pendingCol > 0 — leaves
+        // the cursor on a fresh row so the next scrollback write
+        // (commitUserInput) lands at col 0 without overlap.
+        forceFlushPending();
+      });
+    },
+
     /** Write the user's submitted message into scrollback as a styled
      *  gutter block. Multi-line messages get one gutter mark on the
      *  first line and a blank-prefix indent on continuation lines, so
@@ -1178,31 +1276,48 @@ export function createChatUI(opts: ChatUIOpts) {
         out.write("\n");
         return;
       }
-      const lines = text.split("\n");
-      const gutter = color(`${ANSI.bold}${ANSI.secondary}`, "▎");
-      for (let i = 0; i < lines.length; i++) {
-        const body = color(ANSI.text, lines[i] ?? "");
-        out.write(i === 0 ? `${gutter} ${body}\n` : `  ${body}\n`);
-      }
-      out.write("\n");
+      inFrame(() => {
+        const lines = text.split("\n");
+        const gutter = color(`${ANSI.bold}${ANSI.secondary}`, "▎");
+        for (let i = 0; i < lines.length; i++) {
+          const body = color(ANSI.text, lines[i] ?? "");
+          out.write(i === 0 ? `${gutter} ${body}\n` : `  ${body}\n`);
+        }
+        out.write("\n");
+      });
     },
 
     /** Print the slash command list as a small agent-style help block. */
     printSlashHelp(cmds: Array<{ name: string; description: string }>): void {
-      out.write(color(`${ANSI.bold}${ANSI.primary}`, "◆ commands") + "\n");
-      const w = Math.max(...cmds.map((c) => c.name.length));
-      for (const c of cmds) {
-        out.write(
-          `  ${color(ANSI.primary, c.name.padEnd(w))}  ${color(ANSI.muted, c.description)}\n`,
-        );
-      }
-      out.write("\n");
+      inFrame(() => {
+        out.write(color(`${ANSI.bold}${ANSI.primary}`, "◆ commands") + "\n");
+        const w = Math.max(...cmds.map((c) => c.name.length));
+        for (const c of cmds) {
+          out.write(
+            `  ${color(ANSI.primary, c.name.padEnd(w))}  ${color(ANSI.muted, c.description)}\n`,
+          );
+        }
+        out.write("\n");
+      });
     },
 
-    /** Wipe screen + scrollback. */
+    /** Wipe screen + scrollback. The next inFrame call (or the
+     *  caller's reprompt) repaints the input frame at the home
+     *  position. */
     clearScrollback(): void {
       if (!out.isTTY) return;
       out.write("\x1b[H\x1b[2J\x1b[3J");
+      // Reset state that only made sense relative to the now-gone
+      // scrollback so the next paint isn't trying to rewind into
+      // empty space.
+      pendingText = "";
+      pendingRows = 0;
+      pendingCol = 0;
+      framePad = 0;
+      headerWritten = false;
+      committedText = "";
+      hasCommittedContent = false;
+      inFence = false;
     },
 
     /** Stream a chunk of assistant text. Each delta extends the pending
@@ -1212,7 +1327,7 @@ export function createChatUI(opts: ChatUIOpts) {
      *  whole reply once. */
     assistantDelta(text: string): void {
       if (!text) return;
-      processDelta(text);
+      inFrame(() => processDelta(text));
     },
 
     /** Authoritative full text. Commits any tail not already markdown-
@@ -1221,121 +1336,141 @@ export function createChatUI(opts: ChatUIOpts) {
      *  concatenated (rare), we render the un-committed tail of `full`
      *  rather than risk double-printing. */
     assistantText(full: string): void {
-      ensureHeader();
       if (!out.isTTY) {
+        ensureHeader();
         commitTail(full);
         finalizeBlock();
         return;
       }
-      rewindPending();
-      const tail = full.startsWith(committedText)
-        ? full.slice(committedText.length)
-        : pendingText;
-      commitTail(tail);
-      finalizeBlock();
+      inFrame(() => {
+        ensureHeader();
+        rewindPending();
+        const tail = full.startsWith(committedText)
+          ? full.slice(committedText.length)
+          : pendingText;
+        commitTail(tail);
+        finalizeBlock();
+      });
     },
 
     toolCall(name: string, input: unknown): void {
-      flushAssistant();
-      const icon = toolIcon(name);
-      const head = color(ANSI.muted, `  ${icon} `);
-      const body = `${color(ANSI.text, name)}${color(ANSI.muted, `(${summarizeInput(input)})`)}`;
-      out.write(`${head}${body}\n`);
+      inFrame(() => {
+        flushAssistant();
+        const icon = toolIcon(name);
+        const head = color(ANSI.muted, `  ${icon} `);
+        const body = `${color(ANSI.text, name)}${color(ANSI.muted, `(${summarizeInput(input)})`)}`;
+        out.write(`${head}${body}\n`);
+      });
     },
 
     toolResult(content: string, isError: boolean): void {
-      flushAssistant();
-      const text = (content ?? "").replace(/\s+$/, "");
-      const barColor = isError ? ANSI.error : ANSI.border;
-      const bodyColor = isError ? ANSI.error : ANSI.muted;
-      const bar = color(barColor, "│");
-      // Always render results inside a left-bar block so the eye binds
-      // them to the call line above. Single-line collapses to one bar
-      // row; multi-line stacks. Border picks up the error tone when
-      // the call failed so colour is the cue, not a tag.
-      if (!text) {
-        out.write(`    ${bar} ${color(bodyColor, "(empty)")}\n`);
-        return;
-      }
-      const lines = text.split("\n");
-      if (lines.length === 1) {
-        const oneLine = summarizeResult(text);
-        out.write(`    ${bar} ${color(bodyColor, oneLine)}\n`);
-        return;
-      }
-      const w = termWidth();
-      const inner = Math.max(20, w - 6); // 4 lead spaces + "│ "
-      const MAX_LINES = 12;
-      const shown = lines.slice(0, MAX_LINES);
-      for (const ln of shown) {
-        const trimmed = ln.length > inner ? `${ln.slice(0, inner - 1)}…` : ln;
-        out.write(`    ${bar} ${color(bodyColor, trimmed)}\n`);
-      }
-      if (lines.length > MAX_LINES) {
-        const more = `… ${lines.length - MAX_LINES} more line${lines.length - MAX_LINES === 1 ? "" : "s"}`;
-        out.write(`    ${bar} ${color(ANSI.muted, more)}\n`);
-      }
+      inFrame(() => {
+        flushAssistant();
+        const text = (content ?? "").replace(/\s+$/, "");
+        const barColor = isError ? ANSI.error : ANSI.border;
+        const bodyColor = isError ? ANSI.error : ANSI.muted;
+        const bar = color(barColor, "│");
+        // Always render results inside a left-bar block so the eye
+        // binds them to the call line above. Single-line collapses to
+        // one bar row; multi-line stacks. Border picks up the error
+        // tone when the call failed so colour is the cue, not a tag.
+        if (!text) {
+          out.write(`    ${bar} ${color(bodyColor, "(empty)")}\n`);
+          return;
+        }
+        const lines = text.split("\n");
+        if (lines.length === 1) {
+          const oneLine = summarizeResult(text);
+          out.write(`    ${bar} ${color(bodyColor, oneLine)}\n`);
+          return;
+        }
+        const w = termWidth();
+        const inner = Math.max(20, w - 6); // 4 lead spaces + "│ "
+        const MAX_LINES = 12;
+        const shown = lines.slice(0, MAX_LINES);
+        for (const ln of shown) {
+          const trimmed = ln.length > inner ? `${ln.slice(0, inner - 1)}…` : ln;
+          out.write(`    ${bar} ${color(bodyColor, trimmed)}\n`);
+        }
+        if (lines.length > MAX_LINES) {
+          const more = `… ${lines.length - MAX_LINES} more line${lines.length - MAX_LINES === 1 ? "" : "s"}`;
+          out.write(`    ${bar} ${color(ANSI.muted, more)}\n`);
+        }
+      });
     },
 
     retry(info: { attempt: number; status?: number; waitMs: number; message?: string }): void {
-      flushAssistant();
-      const waitS = (info.waitMs / 1000).toFixed(1);
-      const statusStr = info.status ? ` HTTP ${info.status}` : "";
-      const reason =
-        info.status === 529 || info.status === 503
-          ? "API overloaded"
-          : info.status === 429
-            ? "rate limited"
-            : "API hiccup";
-      const line = `  ⟳ ${reason}${statusStr} — retrying in ${waitS}s (attempt ${info.attempt + 1})`;
-      out.write(color(ANSI.warning, line) + "\n");
+      inFrame(() => {
+        flushAssistant();
+        const waitS = (info.waitMs / 1000).toFixed(1);
+        const statusStr = info.status ? ` HTTP ${info.status}` : "";
+        const reason =
+          info.status === 529 || info.status === 503
+            ? "API overloaded"
+            : info.status === 429
+              ? "rate limited"
+              : "API hiccup";
+        const line = `  ⟳ ${reason}${statusStr} — retrying in ${waitS}s (attempt ${info.attempt + 1})`;
+        out.write(color(ANSI.warning, line) + "\n");
+      });
     },
 
     error(msg: string): void {
-      flushAssistant();
-      out.write(color(ANSI.error, `  ⚠ ${msg}`) + "\n\n");
+      inFrame(() => {
+        flushAssistant();
+        out.write(color(ANSI.error, `  ⚠ ${msg}`) + "\n\n");
+      });
     },
 
     /** "we asked the daemon to cancel; waiting on the abort to land". */
     cancelling(): void {
-      out.write(color(ANSI.warning, "  ⏹ cancelling…") + "\n");
+      inFrame(() => {
+        out.write(color(ANSI.warning, "  ⏹ cancelling…") + "\n");
+      });
     },
 
     /** Daemon confirmed the turn was aborted. */
     cancelled(): void {
-      flushAssistant();
-      out.write(color(ANSI.warning, "  ⏹ turn cancelled") + "\n\n");
+      inFrame(() => {
+        flushAssistant();
+        out.write(color(ANSI.warning, "  ⏹ turn cancelled") + "\n\n");
+      });
     },
 
     /** Plain dim status note (no agent attribution). */
     note(msg: string): void {
-      out.write(color(ANSI.muted, `  ${msg}`) + "\n\n");
+      inFrame(() => {
+        out.write(color(ANSI.muted, `  ${msg}`) + "\n\n");
+      });
     },
 
-    /** Spell out the cumulative session cost in a multi-line block. The
-     *  one-liner above the prompt is glanceable; this is the "give me the
-     *  numbers" form for `/cost`. */
+    /** Spell out the cumulative session cost in a multi-line block.
+     *  Currently unreachable from the chat surface (the `/cost` slash
+     *  command was retired); kept as a private helper because the
+     *  data it formats is also useful from a future tool / view. */
     printCost(): void {
-      const s = sessionStats;
-      const total =
-        s.inputTokens + s.outputTokens + s.cacheReadTokens + s.cacheCreationTokens;
-      if (total === 0 && s.usdMicros === 0) {
-        out.write(color(ANSI.muted, "  no turns this session yet.") + "\n\n");
-        return;
-      }
-      const label = (s: string) => color(ANSI.muted, s.padEnd(13));
-      const value = (s: string) => color(ANSI.text, s);
-      const lines = [
-        color(`${ANSI.bold}${ANSI.primary}`, "◆ session cost"),
-        `  ${label("input")}${value(formatTokens(s.inputTokens))}`,
-        `  ${label("output")}${value(formatTokens(s.outputTokens))}`,
-        `  ${label("cache read")}${value(formatTokens(s.cacheReadTokens))}`,
-        `  ${label("cache create")}${value(formatTokens(s.cacheCreationTokens))}`,
-        `  ${label("total tokens")}${value(formatTokens(total))}`,
-        `  ${label("total cost")}${value(formatUsd(s.usdMicros))}`,
-      ];
-      if (s.model) lines.push(`  ${label("model")}${color(ANSI.muted, s.model)}`);
-      out.write(lines.join("\n") + "\n\n");
+      inFrame(() => {
+        const s = sessionStats;
+        const total =
+          s.inputTokens + s.outputTokens + s.cacheReadTokens + s.cacheCreationTokens;
+        if (total === 0 && s.usdMicros === 0) {
+          out.write(color(ANSI.muted, "  no turns this session yet.") + "\n\n");
+          return;
+        }
+        const label = (s: string) => color(ANSI.muted, s.padEnd(13));
+        const value = (s: string) => color(ANSI.text, s);
+        const lines = [
+          color(`${ANSI.bold}${ANSI.primary}`, "◆ session cost"),
+          `  ${label("input")}${value(formatTokens(s.inputTokens))}`,
+          `  ${label("output")}${value(formatTokens(s.outputTokens))}`,
+          `  ${label("cache read")}${value(formatTokens(s.cacheReadTokens))}`,
+          `  ${label("cache create")}${value(formatTokens(s.cacheCreationTokens))}`,
+          `  ${label("total tokens")}${value(formatTokens(total))}`,
+          `  ${label("total cost")}${value(formatUsd(s.usdMicros))}`,
+        ];
+        if (s.model) lines.push(`  ${label("model")}${color(ANSI.muted, s.model)}`);
+        out.write(lines.join("\n") + "\n\n");
+      });
     },
 
     /** Accumulate per-turn usage into running session totals. The
@@ -1352,18 +1487,20 @@ export function createChatUI(opts: ChatUIOpts) {
       stopReason: string;
       model: string;
     }): void {
-      flushAssistant();
       sessionStats.inputTokens += stats.inputTokens;
       sessionStats.outputTokens += stats.outputTokens;
       sessionStats.cacheReadTokens += stats.cacheReadTokens;
       sessionStats.cacheCreationTokens += stats.cacheCreationTokens;
       sessionStats.usdMicros += stats.usdMicros;
       if (stats.model) sessionStats.model = stats.model;
-      // Surface non-normal stop reasons immediately — user shouldn't
-      // wait for the next prompt to learn the turn cut off early.
-      if (stats.stopReason && stats.stopReason !== "end_turn") {
-        out.write(color(ANSI.muted, `  ⌁ stop: ${stats.stopReason}`) + "\n");
-      }
+      inFrame(() => {
+        flushAssistant();
+        // Surface non-normal stop reasons immediately — user shouldn't
+        // wait for the next prompt to learn the turn cut off early.
+        if (stats.stopReason && stats.stopReason !== "end_turn") {
+          out.write(color(ANSI.muted, `  ⌁ stop: ${stats.stopReason}`) + "\n");
+        }
+      });
     },
 
     /** Format the dim cumulative status line. Returns null when there's

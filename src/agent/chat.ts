@@ -102,6 +102,13 @@ interface Thread {
    *  aborts at network level and the turn returns control to the user
    *  without burning the rest of the round-trip budget. */
   activeAbort?: AbortController;
+  /** Mid-turn user mailbox. `chat.input` events that land while the
+   *  thread already has a turn in flight queue here instead of in
+   *  `pending` — runAgent drains this between round-trips so the new
+   *  message reaches the model on its next LLM call rather than
+   *  waiting for the whole turn to finish. The inverse of "humans are
+   *  events": the agent is also expected to keep listening. */
+  inFlightInbox: string[];
   /** Tool names whose schemas the agent has pulled into context for this
    *  thread. Mutated by load_tools / unload_tools meta-tools. Always-
    *  loaded tools are not tracked here — they're sent every turn
@@ -171,6 +178,7 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
       messages: loaded ?? [],
       pending: [],
       pendingOrigin: [],
+      inFlightInbox: [],
       loadedTools: new Set<string>(),
       truncationState: createTruncationState(),
       mailHwm: loopStartMs,
@@ -188,6 +196,18 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
     if (typeof p?.text !== "string") return;
 
     const thread = getOrCreate(ev.threadId);
+    // The publisher signals "I typed this while the agent was mid-turn
+    // and I want it folded in" via `extendTurn: true`. When a turn is
+    // actually in flight on this thread, route to the in-flight inbox
+    // so runAgent picks it up at its next round-trip boundary. Without
+    // the flag (or when the turn has already ended) we fall through to
+    // the normal `pending` queue — three sequential publishes from a
+    // batch script become three turns, not one mega-turn.
+    const extendTurn = (ev.payload as { extendTurn?: boolean })?.extendTurn === true;
+    if (extendTurn && thread.activeAbort) {
+      thread.inFlightInbox.push(p.text);
+      return;
+    }
     thread.pending.push(p.text);
     thread.pendingOrigin.push(ev);
     if (!thread.worker) {
@@ -399,6 +419,20 @@ async function runTurn(
       },
       signal: turnAbort.signal,
       messages: thread.messages,
+      mailbox: () => {
+        // runAgent calls this between round-trips. Drain the in-flight
+        // inbox into Message[] so the next LLM hop sees any user input
+        // that landed since the last drain. Splice (not slice) so a
+        // second call in the same turn doesn't replay messages.
+        if (thread.inFlightInbox.length === 0) return [];
+        const drained = thread.inFlightInbox.splice(0);
+        // The thread.messages array is mutated by runAgent through the
+        // shared reference, so injecting here also keeps the durable
+        // snapshot consistent — the post-turn `thread.messages =
+        // result.messages` assignment captures whichever messages the
+        // model actually saw.
+        return drained.map((text) => ({ role: "user" as const, content: text }));
+      },
       truncate: opts.toolTruncate
         ? {
             state: thread.truncationState,
@@ -553,6 +587,19 @@ async function runTurn(
     });
   } finally {
     if (thread.activeAbort === turnAbort) thread.activeAbort = undefined;
+    // Race window: a `chat.input` could have landed between runAgent's
+    // last mailbox drain and us clearing activeAbort. Anything still
+    // sitting in the in-flight inbox at this point would be lost
+    // unless we promote it back to `pending`, where the drain loop
+    // will pick it up as the start of a fresh turn. Origin is reused
+    // from the closing turn — there's no per-message origin event for
+    // the in-flight queue and reusing keeps causal chains pointing at
+    // a real, durable parent.
+    if (thread.inFlightInbox.length > 0) {
+      const stranded = thread.inFlightInbox.splice(0);
+      thread.pending.push(...stranded);
+      for (let i = 0; i < stranded.length; i++) thread.pendingOrigin.push(origin);
+    }
   }
 }
 
