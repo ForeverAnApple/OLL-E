@@ -1,8 +1,48 @@
 # OLL-E — Decision Log
 
-The reasoning trail behind OLL-E's design. Append-only. When a decision is reversed, add a new entry referencing the old one — do not edit history.
+The reasoning trail behind OLL-E's design. Append-only narrative; the lens that shaped what's in `VISION.md` and `ARCHITECTURE.md`. Reverse a decision by adding a new entry, not by editing history.
 
-Entries document *why* we chose something. `VISION.md` and `ARCHITECTURE.md` document *what* we chose; this file is for the reasoning.
+Entries document *why* we chose something. `VISION.md` and `ARCHITECTURE.md` document *what* we chose. Don't duplicate them here.
+
+## Reading this log
+
+You usually do not read this file linearly — it is dense and most of it is not relevant to any single task. Read in this order, stopping as soon as you have what you need:
+
+1. **`VISION.md`** — the philosophy, what's load-bearing, what's explicitly out.
+2. **`ARCHITECTURE.md`** — the *what*: primitives, schema, surfaces, current state.
+3. **`AGENTS.md` / `CLAUDE.md`** — working norms + the six tests every change runs through.
+4. **The active deferred queue** (live + archived):
+   ```
+   grep -nE '\[DEFERRED-' docs/design/LOG.md docs/design/LOG-archive.md
+   ```
+   The VISION ship-gate requires every `[DEFERRED-]` entry to be triaged before v0 ships.
+5. **Specific entries on demand** — find by topic with grep:
+   ```
+   grep -nE '^## ' docs/design/LOG.md docs/design/LOG-archive.md   # all decision titles
+   grep -inB2 -A20 'memory|identity' docs/design/LOG.md            # topic search
+   ```
+
+If a question is already answered in `VISION.md` or `ARCHITECTURE.md`, defer to those.
+
+## Adding an entry
+
+- Date-stamp, label the decision area, record the decision and the reasoning. One paragraph per decision is usually enough. Keep entries focused on the *why*; the *what* belongs in `ARCHITECTURE.md`.
+- New `[DEFERRED-to-vX.Y]` items must include a `**Resurrect when:**` clause naming an observable trigger (event count, ledger signal, repeated proposal — not a calendar date).
+- Reversing a decision: add a new entry referencing the old one. Do not edit the reversed entry.
+- When in doubt: write the entry. Future contributors will be grateful for the context.
+
+## Archiving an entry
+
+Older shipped milestones live in `LOG-archive.md`. Move an entry there when ALL of:
+
+- the decision has shipped and stabilized;
+- the lasting lens (if any) is captured in `VISION.md`, `ARCHITECTURE.md`, or code comments;
+- it has no open `[DEFERRED-]` markers;
+- it is not foundational philosophy that newcomers need for orientation.
+
+Archival is *relocation*, not editing. Copy the entry verbatim into `LOG-archive.md`, add a one-line note in the archive's index naming where the lasting lens (if any) now lives, then remove from this file. The git history preserves the move; the archive preserves the reasoning verbatim. If `LOG-archive.md` grows past comfortable (~1000 lines), split by quarter (`LOG-archive-2026Q1.md` etc) — until then, one file is enough.
+
+Why not SQLite, or one file per decision, or topic-split files? The reasoning trail is fundamentally narrative; agents reason in markdown natively; federation is git+repo merge, not DB merge. A single append-only file with a grep-friendly title convention is the most-agentic shape that survives self-modification — agents can edit it as a normal file, propose archival via the inbox, and find prior decisions with one tool (`grep`). When this stops scaling, the next move is splitting `LOG-archive.md` by quarter, not introducing structure.
 
 ---
 
@@ -160,37 +200,6 @@ Chat-thread-as-inbox-delivery-channel preserves "humans are events" under stress
 5. Write the inbox-to-Discord delivery task (subscribes to `decision.proposed`, posts card into origin thread; subscribes to `channel-message` replies in decision threads, calls `inbox.respond()`).
 
 Steps 1–2 are this session's work. 3–5 are subsequent.
-
----
-
-## 2026-04-22 — Scheduler wired into the daemon; `task_runs` durability lands
-
-Pre-existing drift diagnosed and closed. `src/scheduler/scheduler.ts` has shipped since `9cf0c1b` (scheduler + ledger + claim seam) but was never instantiated in `daemon.ts` — only two tests called `createScheduler`. The chat-first MVP ran everything through bus subscriptions + the chat handler, so the scheduler sat as test-only code. No prior entry parked it; this was drift, not a decision.
-
-### Decided
-
-- **Scheduler runs in the daemon.** Constructed alongside bus/store/ledger; `scheduler.recoverLost()` fires once at startup. Extension host takes a `scheduler` + `defaultTaskAgentId` so `api.registerTask(...)` goes through the same codepath as core-registered tasks.
-- **`task_runs` table for execution durability.** New table (migration 0002). One row per dispatch: `status ∈ {queued, running, succeeded, failed, lost}`. The scheduler transitions the row inline. `recoverLost()` marks orphaned `running` rows as `lost` on restart so operators can audit what was interrupted.
-- **Root agent always exists.** Previously `ensureAgentRow(store, "root")` only ran when `ANTHROPIC_API_KEY` was set (chat agent path). Moved unconditional so extensions can register tasks even on a chat-less host. Chat agent now borrows the same row.
-- **Done-event convention.** Every handler run ends with `task.<taskId>.completed` or `task.<taskId>.failed` (including `lost` runs, delivered as `failed` with `error: "lost"`). Subscribers waiting on a task don't poll `task_runs` or couple to scheduler internals.
-- **Task registration surface.** `api.registerTask(...)` added to `ExtensionApi`. Extension-registered tasks get namespaced ids (`ext:<extensionName>:<localId>`) so collisions across extensions are impossible.
-
-### Deliberately deferred
-
-- **Agent-direct `register_task` meta-tool / inbox action.** LOG 2026-04-22 line 150 already parked task-only authoring behind extension packaging for v0. The `register_task` action type in the self-mod vocabulary (LOG line 109) stays blessed-but-unbuilt. Revisit when an agent actually wants to author a task file without wrapping it in an extension.
-- **Cancellation, pause, resume of in-flight runs.** Nanoclaw and openclaw both have this; v0 doesn't need it. `task_runs.status` has room for `cancelled` when we get there.
-- **Time-domain scheduling (run at timestamp T).** The `cron-trigger` starter owns the timer inside the extension, emits `cron.fire`, and a task subscribes. Consistent with "extension = capability" — the scheduler stays reactive.
-
-### Why
-
-The async-by-default framing in VISION ("an event-driven, self-modifying, async-by-default agent system") means the scheduler isn't optional infrastructure; it's load-bearing. `task_runs` durability is the minimum the "system tolerates and recovers" clause demands — before this, a daemon crash mid-handler left no record at all. The done-event convention keeps resume logic on the bus rather than forcing subscribers to walk SQL. Every other alternative we considered (shared in-memory Promise registry, separate TaskFlowRecord primitive à la openclaw, callback tables) either broke "humans-are-events" symmetry or invented a new primitive where composition of existing ones sufficed.
-
-### Survey: what this does *not* touch
-
-- No change to the extension authoring loop (`write_extension`, `register_extension`, smoke gate, git rollback).
-- No change to the inbox / ask-up / decision primitives.
-- No change to the chat agent's meta-tools.
-- No new concepts in VISION or AGENTS.md — every change above descends from existing framing.
 
 ---
 
@@ -356,7 +365,7 @@ The earlier Q1. Under the identity frame, is private "readable by ancestors in t
 
 ### `[DEFERRED-to-v0.1]` Scratch lifecycle binding to `task_runs.id`
 
-So `scheduler.recoverLost()` (LOG 2026-04-22) can sweep orphaned scratch on restart. Small, mechanical.
+So `scheduler.recoverLost()` (LOG 2026-04-22 — archived) can sweep orphaned scratch on restart. Small, mechanical.
 
 **Resurrect when:** memory surface migration lands.
 
@@ -605,12 +614,6 @@ Two design calls embedded:
 
 ---
 
-## 2026-04-26 — Caller identity for `retargetThread` (resolved same day)
-
-The `retarget_thread` meta-tool now passes `ctx.actorId` through to `manager.retargetThread`, so `thread.retargeted` events attribute to the agent that requested the redirect rather than to the manager process. `callerId` is required on the manager API; the previous `agentFromCall()` placeholder is removed. The earlier same-day [DEFERRED-to-v0.1] entry is retired — promoted in the same review pass that flagged the dead-weight parameter.
-
----
-
 ## 2026-04-26 — `mail_propose`: agent-initiated decisions, symmetric wake on reply
 
 The decision inbox primitive existed and was wired into `askUp()`, but `askUp()` only fired *as a side effect* of the permission gate denying a call. No agent — child or root — had a tool to **proactively** open an ask up the chain. The asymmetry the running olle agent surfaced ("children have a more reliable way to reach me than I have to reach you") is real, but the deeper diagnosis is that *no* agent has the capability today; root just feels it most because no scheduler ever denies anything on its behalf. Fixing it for root alone would re-introduce the special-cased human path the architecture is moving away from. Fix it universally instead.
@@ -761,42 +764,6 @@ Three shapes were considered:
 
 ---
 
-## 2026-04-28 — `threadInventory` cache stats sourced from `chat.turn-end`, not `chat.usage`
-
-`query_my_threads` was reporting `cacheHitRatio: 0` on every live thread in production. Root cause: `threadInventory` folded cache fields from `chat.usage` events queried from the durable events table, but `chat.usage` is published with `durable: false` (it's the per-call live stream for CLI tail / future bridges, intentionally not persisted — see `chat.ts` `kind === "usage"` branch). The events table never has `chat.usage` rows, so the rollup was always empty. The pre-existing observability test passed because its fixture published `chat.usage` with `durable: true`, which doesn't match production.
-
-**Decision: read cache fields from `chat.turn-end` instead.** That event is already durable, fires once per turn (one row per turn instead of one per inner round-trip), and carries `inputTokens` + `cacheReadTokens` + `cacheCreationTokens` + `totalTokens` directly. Considered the alternative (flip `chat.usage` to `durable: true`): rejected because it would write 5–10× more event rows for the same information and `chat.usage` is by-design transient — its job is the *live* stream, the durable record is `chat.turn-end`. The fix was a four-line change in `threadInventory` plus the field-name update (`cacheReadInputTokens` → `cacheReadTokens` to match the turn-end payload shape).
-
-The all-time cache-ratio rollup in `usageStats` was unaffected — it reads the ledger, which is correctly populated. The artifact users were seeing in `query_my_threads` (0 ratio on a thread that was clearly hitting cache) is gone.
-
----
-
-## 2026-04-28 — Inbox UI/UX: read tracking, unread badges, visibility-first show view
-
-Manual-test of `mail_reply` (LOG 2026-04-27) revealed the next visibility gap: the principal had no way to know an agent had replied. `olle inbox list` showed the same row as before; nothing distinguished "agent posted a follow-up" from "no change since I last looked." Read tracking was the obvious fix; the rest of the cut leaned into "visibility-first" — colored glyphs, unread badges, generous whitespace, `[NEW]` markers on previously-unread replies in the show view, and a sectioned layout that gives the proposal, payload, and reply thread their own breathing room.
-
-**The shape that landed:**
-
-- **Migration `0008_decision_message_reads.sql`** — `(message_id, reader_actor_id, at)` composite PK plus `reader_actor_id` index. Same shape as `memory_reads`. Federation-ready: per-reader rows mean future quorum-of-principals or team-shared inboxes work without schema change. Single-principal v0 always carries the root principal as reader.
-- **Inbox APIs** — `markDecisionRead(decisionId, readerActorId)` (idempotent, returns count newly marked), `readMessageIdsFor(decisionId, readerActorId)` (Set, used to render `[NEW]` flags), and `unreadCountsByDecision(decisionIds, readerActorId)` (bulk Map for listing badges, two queries instead of N+1).
-- **IPC enrichment** — `inbox.list` adds `unreadReplyCount` per row. `inbox.get` adds `messages: [...]` with each carrying `read: boolean` (state captured *before* this call's side-effects) AND auto-marks all replies read for the requester. `markRead: false` opt-out for observability peeks. Default reader is the root principal. Same handler also resolves `actorName` for each message via the existing enrichment pattern, so the CLI doesn't print 26-char ULIDs where a name fits.
-- **`olle inbox list`** — colored status glyphs (cyan-bold when unread replies are waiting, otherwise yellow=open / green=approved / red=denied / cyan=modified / gray=stale), bold-cyan `(N new)` badge appended to summaries with unread, and a header line showing total + total-unread when non-zero. Generous summary width.
-- **`olle inbox show <id>`** — restructured: title block (id + double-rule), key-value pairs (status / tier / from / to / age / stale / resolved) on indented lines, wrapped summary with breathing room, `── payload ──` rule before the JSON, `── replies (N) · M new ──` rule before the threaded replies. Each reply gets a timestamp, author name, optional `[NEW]` cyan tag, and indented body with soft-wrap. Auto-marked-read by the IPC handler.
-- **TUI** — list rows now show the cyan-bold glyph + `(N new)` badge when unread. Preview pane gained a replies block at the bottom rendered in the same shape as the CLI show. Selection-changes fire an async `inbox.get` (auto-marks read, refreshes the listing); listing's unread badge drops on next refresh. Detail-fetch dedupes against the cached selection so navigation doesn't thrash IPC.
-
-**The four design calls:**
-
-1. **Auto-mark on view.** Considered explicit `mail_ack` (more agentic-feeling, principal in control). Rejected for the principal-facing surface: the principal's role here is *consumer*, not author. Forcing them to ack each reply would be the same nagging-discipline anti-pattern we rejected for the agent-facing sidebar (LOG 2026-04-27). Opening the decision IS reading it. The `markRead: false` flag exists for the rare programmatic peek. Symmetric to how the agent-side sidebar auto-acks on render.
-2. **Unread state per-reader, not per-message.** The state needing per-reader split is "did *I* see this," not "has anyone seen this." `decision_message_reads` is the right shape; a `read_at` column on `decision_messages` would either lock us to single-reader or muddle the semantics. Cost: one more table; gain: the federation seam is honest.
-3. **Cyan-bold for "needs attention."** ANSI color choices land on convention: yellow=open (waiting), green=approved (done well), red=denied, cyan=modified, gray=stale. Cyan-bold reserved for "you have unread replies" because it's the signal we want eye-catching without being alarming (red would imply error). Single-color signaling beats glyph-substitution for accessibility — even on color-blind terminals the badge text still reads clearly.
-4. **One-call list view.** `inbox.list` could have stayed plain and `unreadReplyCount` could ride a separate `inbox.unreadCount` call. Rejected: the listing shows N rows and would do N round-trips, defeating the rendering UX work. Bulk enrichment server-side keeps the listing snappy and the CLI/TUI dumb.
-
-**One `[DEFERRED]` item:**
-
-- **Mark-unread / per-message granular state.** Today the principal gets one knob: viewing the decision marks ALL replies on it read. No way to revisit a single reply as "I want to come back to this." Considered: `mail_unread(decisionId, messageId?)` tool, or a TUI hotkey. Skipped because no concrete need yet — the search/scan affordances cover "find that reply again." **Resurrect when:** a real workflow needs revisit-tracking on individual messages (likely paired with bridges that push notifications, where re-surfacing matters).
-
----
-
 ## 2026-04-28 — Soul-seeding via bootstrap prompt; identity moves out of the binary
 
 The conversation that surfaced this: the root agent's identity ("you are olle, a helpful assistant…") was hardcoded at `daemon.ts:252-260`, which means an agent with full `memory_write` authority could *append* principles but never *replace* the identity that ships in the binary. Code is structurally more authoritative than any principle the agent will ever write — that violates "the environment is clay, not prison" and "every extension is replaceable by the agent itself." The fix is to move identity out of the binary and into seeded memory rows the agent (and its principal) own and can rewrite.
@@ -817,18 +784,6 @@ The conversation that surfaced this: the root agent's identity ("you are olle, a
 **Phase 2 (`[DEFERRED-to-v0.1]`).** Living calibration — agent observes its own behavior against principles, surfaces stated-vs-lived drift to inbox via Socratic elenchus. Schema is already designed for it (memories are event-sourced; principles carry depth). **Resurrect when:** 2+ weeks of v0 use produces real divergence the principal complains about, OR the bootstrap prompt produces consistently bad seeds.
 
 **`memory_write` joins the always-loaded core.** Soul-seeding's bootstrap turn instructs the agent to record what it learns via `memory_write` — but `memory_write` was deferred, forcing a `load_tools(["memory_write"])` round-trip on the very first first-contact turn. That's exactly the kind of papercut habitat philosophy is supposed to delete. Promoting it is symmetric with `memory_search` (the read half is already always-loaded) and bounded — `memory_write` is the only write surface for the persistent self, not a wide-open category — so the always-loaded core grows from four tools to five (`load_tools`, `query_self`, `mail_list`, `memory_search`, `memory_write`). ARCHITECTURE.md's "Tool catalog and lazy loading" updated to reflect.
-
----
-
-## 2026-04-28 — Migrations 0001-0008 collapsed into a single `0001_init.sql`
-
-Pre-v1; no installed-user upgrade path to preserve. The eight historical migrations were a development artifact (each one a real schema decision logged separately) rather than a contract with users. Carrying them forward means every fresh install walks through CREATE → ALTER → CREATE → ALTER replays of the same end state, plus the reasoning-trail noise of the historical names is now in `_migrations` instead of `LOG.md` where it belongs.
-
-The compacted `0001_init.sql` defines the final-state CREATE TABLE / CREATE INDEX statements (matching `schema.ts`). `migrate.ts` now imports only the single migration. Verified by the full test suite (280 tests pass against the new schema). The reasoning behind each table's shape stays in `LOG.md` (search for the table name); the SQL file just records what's in the store today.
-
-**Cost we paid:** historical commits' migration-numbered filenames no longer resolve at HEAD. The git history is the audit trail; `git log -- src/store/migrations/` reconstructs the per-decision sequence if anyone needs it.
-
-**Resurrect when:** v1 ships and we have installed users. From that point forward, schema changes are append-only migrations again, never collapsed.
 
 ---
 
@@ -923,19 +878,3 @@ Agents have an `id` (ULID) and a `name` (formal designation set at spawn, alphan
 **Why one column, not two source-of-truth surfaces.** Considered keeping the column out and querying memory at every CLI header render. Rejected: the chat header repaints on every editor refresh (which, after the async-input change above, fires on every assistant delta). A SELECT against `memories` on every keystroke is real overhead. The column trades one schema migration for an O(1) read on every render. The asymmetry — memory authoritative, column cached — keeps the philosophy clean while paying for performance.
 
 **Surface coverage.** `observability.agentSelf` (and the `query_self` tool that wraps it) returns `displayName: string | null`; the CLI chat header resolves to `displayName ?? name ?? "agent"`. `inbox/enrich.ts` (decisions and decision messages) prefers display name over formal name when surfacing authorship to the principal. The `tool.denied` ask-up summary picks the display name when crafting the grant-scope proposal. `olle inspect agent` shows `called: <name>` when set. Every renderer treats display name as the social face of the agent and `name` as the formal designation; both stay separate (`name` is what scripts and code reference, `displayName` is what humans read).
-
-These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.
-
-- **Exact service-manager lifecycle.** `olle daemon install` shape on mac (launchd) vs linux (systemd). Whether auto-start-on-login is opt-in during install or always prompted.
-- **CLI chat REPL UX.** Since minimal-core means CLI chat is the only channel until other extensions grow, its quality matters more than it would otherwise. What does first-contact look like? What's the prompt? What commands are slash-invokable? Deferred until first drafting of the chat client.
-- **Starter template source.** Bundled in the binary or fetched from a well-known URL at first-run? Bundled is simpler and works offline; fetched is smaller binary. Lean: bundled for v0, consider fetch-on-demand in v1.
-- **Exact IPC protocol.** JSON-over-unix-socket is fine; might want subscribe-streams for event tailing. WebSocket upgrade path for future web UI.
-- **Peer bridge skeleton.** The interface is clear; the first implementation needs to decide whether v0 ships any real cross-host code at all, or whether the "two-laptop demo" uses a local-mock bridge for the first pass.
-
----
-
-## How to use this log
-
-- **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
-- **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
-- **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.

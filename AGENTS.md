@@ -12,9 +12,15 @@ The two docs above are auto-imported into every session. Vision is the anchor �
 
 ## Read on demand
 
-- `docs/design/ROADMAP.md` — what v0 ships and what it deliberately doesn't. Read before proposing any feature to check it isn't explicitly a non-goal.
-- `docs/design/LOG.md` — the reasoning trail. Read when a prior decision is relevant; append to it when a real decision lands.
-- `docs/design/REFERENCES.md` — prior art and what we took/left from each.
+- `docs/design/LOG.md` — the reasoning trail. Read its top "Reading this log" block first; it tells you when to grep, when to read entries whole, and how to add or archive entries. Append to it when a real decision lands.
+- `docs/design/LOG-archive.md` — older shipped milestones, preserved verbatim. Grep across both LOG files for prior decisions or `[DEFERRED-]` markers.
+- `VISION.md` "References we drew from" — prior art and what we took/left from each (pi-mono, opencode, nanoclaw, PocketFlow, crewAI, deer-flow).
+
+The version roadmap is the live deferred queue, not a separate file:
+```
+grep -nE '\[DEFERRED-' docs/design/LOG.md docs/design/LOG-archive.md
+```
+Every `[DEFERRED-]` entry must be triaged (promoted / kept / retired) before v0 is declared shipped — that's the VISION ship-gate. Non-goals for v0 are listed in `VISION.md` ("What v0 is explicitly not"); check there before proposing anything that smells deferred.
 
 If a question is already answered in those files, defer to them. If you're about to contradict them, that's a decision worth logging, not a silent drift.
 

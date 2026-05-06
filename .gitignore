@@ -145,14 +145,17 @@ vite.config.ts.timestamp-*
 # References (studied, not shipped)
 references/
 
-# Design/planning docs are personal drafts, not source —
-# except VISION and ARCHITECTURE, which are the canonical anchor
-# (auto-imported by AGENTS.md into every session).
+# Design/planning docs are personal drafts, not source — except the
+# canonical four: VISION (auto-imported), ARCHITECTURE (auto-imported),
+# LOG (the reasoning trail), and LOG-archive* (older shipped milestones,
+# possibly split by quarter as the archive grows).
 docs/plan/
 docs/plans/
 docs/design/*
 !docs/design/VISION.md
 !docs/design/ARCHITECTURE.md
+!docs/design/LOG.md
+!docs/design/LOG-archive*.md
 
 # Build output and local state
 .artifacts/
