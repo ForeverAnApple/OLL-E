@@ -1799,8 +1799,27 @@ export function createChatUI(opts: ChatUIOpts) {
         ? color(ANSI.muted, sessionStats.model)
         : "";
       if (!left && !right) return null;
-      const w = termWidth();
-      const padNeeded = Math.max(1, w - visibleLen(left) - visibleLen(right));
+      // Cap at termWidth - 1, never termWidth itself — a line that
+      // exactly fills the row parks the cursor at col=w, and on
+      // terminals that wrap-on-park instead of staying parked the
+      // \n at the end of the line then advances *two* rows instead
+      // of one. The editor's renderedRow accounts for one row of
+      // aboveLine, eraseRender misses the wrap-row on the next
+      // refresh, and the leftover row stays in scrollback as a
+      // ghost status line. (Bug surfaced after queueing 2+ tray
+      // messages: each successive refresh stranded another wrap
+      // row.)
+      const w = Math.max(1, termWidth() - 1);
+      const lvis = visibleLen(left);
+      const rvis = visibleLen(right);
+      // Both halves don't fit alongside each other — keep the
+      // totals (left), drop the model. Status is glanceable, not
+      // mission-critical; a future hover/inspect can carry the
+      // full strings.
+      if (lvis + rvis + 1 > w) {
+        return left;
+      }
+      const padNeeded = Math.max(1, w - lvis - rvis);
       return `${left}${" ".repeat(padNeeded)}${right}`;
     },
 

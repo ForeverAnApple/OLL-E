@@ -68,6 +68,35 @@ function visibleLen(s: string): number {
   return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").length;
 }
 
+/** Clip a styled string so its visible width (ANSI escapes excluded)
+ *  stays within `maxCols`. Pass-through for CSI escape sequences (no
+ *  width cost). When the content already fits, returns it verbatim.
+ *  When it doesn't, walks to `maxCols - 1` printable chars and
+ *  appends `…` (which itself takes the last column). */
+function clipVisible(s: string, maxCols: number): string {
+  if (maxCols <= 0) return "";
+  if (visibleLen(s) <= maxCols) return s;
+  let visible = 0;
+  let out = "";
+  let i = 0;
+  const budget = maxCols - 1;
+  while (i < s.length) {
+    const ch = s[i]!;
+    if (ch === "\x1b" && s[i + 1] === "[") {
+      const j = s.slice(i + 2).search(/[A-Za-z]/);
+      const end = j === -1 ? s.length : i + 2 + j + 1;
+      out += s.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (visible >= budget) break;
+    out += ch;
+    visible += 1;
+    i += 1;
+  }
+  return out + "…";
+}
+
 /** Strip non-printable control bytes from pasted content, keeping only
  *  newline and tab. A clipboard snippet that includes BEL, BS, FF, raw
  *  ESC etc. would otherwise either ring the terminal bell, repaint the
@@ -175,11 +204,24 @@ export class LineEditor {
 
   /** Set (or clear) the single ephemeral line painted directly above the
    *  prompt — status during idle, slash suggestions while typing `/…`.
-   *  Cleared automatically on submit by eraseRender(). */
+   *  Cleared automatically on submit by eraseRender().
+   *
+   *  Defensively clipped to `out.columns - 1` visible characters so a
+   *  producer that miscalculates its target width can't soft-wrap the
+   *  slot into a second row. The editor's renderedRow accounts for
+   *  exactly one above-line row; a wrap that the editor doesn't see
+   *  leaves the stranded row in scrollback as a ghost on the next
+   *  eraseRender. */
   setAboveLine(content: string | null): void {
-    if (this.aboveLine === content) return;
-    this.aboveLine = content;
+    const clipped = content !== null ? clipVisible(content, this.out1Cols()) : null;
+    if (this.aboveLine === clipped) return;
+    this.aboveLine = clipped;
     if (this.listening && !this.suspended) this.render();
+  }
+
+  private out1Cols(): number {
+    const w = this.opts.out.columns ?? 80;
+    return Math.max(1, w - 1);
   }
 
   /** Get the current buffer (e.g. for completer logic). */
