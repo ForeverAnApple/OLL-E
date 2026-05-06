@@ -205,29 +205,45 @@ export class LineEditor {
     const lines = this.buffer.split("\n");
     const promptLen = visibleLen(this.opts.prompt);
     const contLen = visibleLen(this.opts.promptCont);
-    // Snapshot terminal width once per render. Cursor + erase math both
-    // need to agree on how many visual rows each buffer line occupies;
-    // ignoring wraps was the bug that printed the status line on every
-    // keystroke past the right margin (each render erased only logical
-    // rows so the wrapped portion above the cursor was never cleared).
     const w = Math.max(1, this.opts.out.columns ?? 80);
+
+    // Visual rows per logical line, accounting for soft-wrap *and* for
+    // cursor parking. When `promptVis + lineLen` is exactly a multiple
+    // of width the terminal parks the cursor at col=w of the current
+    // row; whether it actually advances to col 0 of the next row is
+    // terminal-dependent (xterm/iTerm/kitty/alacritty park; some
+    // others advance immediately). We sidestep that ambiguity by
+    // emitting an explicit `\n` after any parked line below, and
+    // counting that phantom row here. Without this, `renderedRow`
+    // drifts +1 on backspace-across-wrap, eraseRender moves up too
+    // far, and \x1b[J chews into the visible scrollback above the
+    // chat area.
+    const visualRows = lines.map((line, i) => {
+      const promptVis = i === 0 ? promptLen : contLen;
+      const totalVis = promptVis + line.length;
+      if (totalVis === 0) return 1;
+      return Math.floor(totalVis / w) + 1;
+    });
+    const totalInputRows = visualRows.reduce((a, b) => a + b, 0);
 
     for (let i = 0; i < lines.length; i++) {
       out.write(i === 0 ? this.opts.prompt : this.opts.promptCont);
       out.write(lines[i]!);
-      if (i < lines.length - 1) out.write("\n");
+      const promptVis = i === 0 ? promptLen : contLen;
+      const totalVis = promptVis + lines[i]!.length;
+      const isLast = i === lines.length - 1;
+      const parked = totalVis > 0 && totalVis % w === 0;
+      // Emit `\n` between logical lines normally. For the trailing
+      // line, emit `\n` *only* if it parked at the wrap column — that
+      // forces the terminal off the parking position so our cursor
+      // bookkeeping has a stable anchor.
+      if (!isLast || parked) out.write("\n");
     }
 
-    // Visual rows per buffer line, including soft-wraps. An empty line
-    // still occupies 1 row (the prompt is visible). promptVis + content
-    // length / width, ceiled, with min 1.
-    const visualRows = lines.map((line, i) => {
-      const promptVis = i === 0 ? promptLen : contLen;
-      return Math.max(1, Math.ceil((promptVis + line.length) / w));
-    });
-    const totalInputRows = visualRows.reduce((a, b) => a + b, 0);
-
-    // Cursor's visual position within the input frame.
+    // Cursor's visual position within the input frame. For visualCol
+    // exactly at a multiple of width (parking on the line containing
+    // the cursor), this lands on `row=N, col=0` of the phantom row —
+    // exactly where the explicit `\n` above leaves the terminal.
     let inputVisualRow = 0;
     let inputVisualCol = 0;
     let abs = 0;
@@ -245,12 +261,6 @@ export class LineEditor {
       priorRows += visualRows[i]!;
     }
 
-    // Cursor parking: after writing a line whose visible length is a
-    // non-zero multiple of the width, the terminal parks the cursor at
-    // col=width on the same row. The next visible char would advance.
-    // For positioning math we treat that as "row N, col w" — moving up
-    // (visualRows-1 - inputRow) and then carriage-return + right-N lands
-    // correctly.
     const upFromEnd = totalInputRows - 1 - inputVisualRow;
     if (upFromEnd > 0) out.write(`\x1b[${upFromEnd}A`);
     out.write("\r");
@@ -355,12 +365,20 @@ export class LineEditor {
     this.render();
   }
 
-  /** Ctrl+L — wipe the screen and re-anchor the prompt at the top. */
+  /** Ctrl+L — wipe the screen and re-anchor the prompt at the top. Also
+   *  drop any in-flight paste state: a Ctrl+L mid-bracketed-paste would
+   *  otherwise leave `pasting=true` and a stray `\x1b[201~` later in the
+   *  same chunk would commit the half-captured `pasteBuf` as if the
+   *  user had pasted it, which is exactly the kind of phantom edit
+   *  that's hard to debug. Wipe-the-canvas should mean wipe-the-state. */
   private clearScreen(): void {
     if (!this.opts.out.isTTY) return;
     this.opts.out.write("\x1b[H\x1b[2J\x1b[3J");
     this.renderedRow = 0;
     this.renderedRows = 0;
+    this.pasting = false;
+    this.pasteBuf = "";
+    this.pendingEsc = "";
     this.render();
   }
 

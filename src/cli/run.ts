@@ -422,6 +422,15 @@ async function cmdChat(): Promise<void> {
 
   let turnBusy = false;
   let stopping = false;
+  // Tool-result dedup: id of every tool result we've already rendered
+  // for this thread. Both `chat.tool-result-live` (UX, fires immediately
+  // after each tool finishes) and `chat.tool-result` (canonical,
+  // durable, fires post aggregate-budget truncation) carry the same
+  // tool_use id. We render whichever lands first — usually live; the
+  // canonical one renders only on reconnect-mid-turn where the live
+  // event flowed past the disconnected subscription. The set is bounded
+  // by clear-on-turn-end since tool ids are unique within a turn.
+  const renderedToolResults = new Set<string>();
   // Two-tap quit on idle: first Ctrl-C arms a hint, second within the
   // window exits. Streaming Ctrl-C cancels the turn and is independent.
   const QUIT_ARM_MS = 2_000;
@@ -608,8 +617,23 @@ async function cmdChat(): Promise<void> {
           ui.assistantText(String(p.text ?? ""));
         } else if (ev.type === "chat.tool-call") {
           ui.toolCall(String(p.name ?? "?"), p.input);
-        } else if (ev.type === "chat.tool-result") {
+        } else if (ev.type === "chat.tool-result-live") {
+          // Live UX feed — fires the moment a tool finishes. This is
+          // what the user normally sees; the canonical chat.tool-result
+          // below is the durable record.
+          const id = String(p.id ?? "");
           ui.toolResult(String(p.content ?? ""), Boolean(p.isError));
+          if (id) renderedToolResults.add(id);
+        } else if (ev.type === "chat.tool-result") {
+          // Canonical post-truncation event. Render only if we missed
+          // the live one (reconnect mid-turn); otherwise the live emit
+          // has already painted this id and re-rendering would
+          // duplicate the block in scrollback.
+          const id = String(p.id ?? "");
+          if (!id || !renderedToolResults.has(id)) {
+            ui.toolResult(String(p.content ?? ""), Boolean(p.isError));
+            if (id) renderedToolResults.add(id);
+          }
         } else if (ev.type === "chat.api-retry") {
           ui.retry({
             attempt: numFrom(p.attempt),
@@ -627,14 +651,17 @@ async function cmdChat(): Promise<void> {
             stopReason: String(p.stopReason ?? ""),
             model: typeof p.model === "string" ? p.model : "",
           });
+          renderedToolResults.clear();
           turnBusy = false;
           reprompt();
         } else if (ev.type === "chat.error") {
           ui.error(String(p.error ?? ""));
+          renderedToolResults.clear();
           turnBusy = false;
           reprompt();
         } else if (ev.type === "chat.cancelled") {
           ui.cancelled();
+          renderedToolResults.clear();
           turnBusy = false;
           reprompt();
         }
@@ -741,14 +768,22 @@ function clipString(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, Math.max(1, max - 1))}…` : s;
 }
 
-function summarizeScalar(v: unknown, budget: number): string {
+// Recursion budget for summarizeScalar. Tool inputs from JSON-parsed
+// model output are tree-shaped and shallow, but we get called with
+// arbitrary JS objects in tests and in any future ad-hoc caller; a
+// circular structure would otherwise stack-overflow the chat UI on a
+// single bad payload.
+const SUMMARIZE_MAX_DEPTH = 4;
+
+function summarizeScalar(v: unknown, budget: number, depth: number): string {
+  if (depth > SUMMARIZE_MAX_DEPTH) return "…";
   if (v === null || v === undefined) return "";
   if (typeof v === "string") return JSON.stringify(clipString(v, Math.max(8, budget - 2)));
   if (typeof v === "number" || typeof v === "boolean") return String(v);
   if (Array.isArray(v)) {
     if (v.length === 0) return "[]";
     if (v.length > 4) return `[${v.length} items]`;
-    const inner = v.map((x) => summarizeScalar(x, 24)).join(", ");
+    const inner = v.map((x) => summarizeScalar(x, 24, depth + 1)).join(", ");
     return inner.length <= budget ? `[${inner}]` : `[${v.length} items]`;
   }
   if (typeof v === "object") {
@@ -756,7 +791,7 @@ function summarizeScalar(v: unknown, budget: number): string {
     if (keys.length === 0) return "{}";
     if (keys.length === 1) {
       const k = keys[0]!;
-      return `{${k}: ${summarizeScalar((v as Record<string, unknown>)[k], 24)}}`;
+      return `{${k}: ${summarizeScalar((v as Record<string, unknown>)[k], 24, depth + 1)}}`;
     }
     return `{${keys.length} keys}`;
   }
@@ -764,46 +799,57 @@ function summarizeScalar(v: unknown, budget: number): string {
 }
 
 function summarizeInput(input: unknown): string {
-  if (input === null || input === undefined) return "";
-  const max = Math.max(20, termWidth() - 16);
-  if (typeof input !== "object") return clipString(String(input), max);
-  if (Array.isArray(input)) return clipString(summarizeScalar(input, max), max);
+  try {
+    if (input === null || input === undefined) return "";
+    const max = Math.max(20, termWidth() - 16);
+    if (typeof input !== "object") return clipString(String(input), max);
+    if (Array.isArray(input)) return clipString(summarizeScalar(input, max, 0), max);
 
-  const obj = input as Record<string, unknown>;
-  const keys = Object.keys(obj);
-  if (keys.length === 0) return "";
+    const obj = input as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.length === 0) return "";
 
-  // Find the primary key, if any. Surfaces the "what specifically" of
-  // the call as a bare value while everything else stays as key=value
-  // for clarity.
-  let primary: string | null = null;
-  for (const k of PRIMARY_INPUT_KEYS) {
-    if (k in obj) {
-      primary = k;
-      break;
+    // Find the primary key, if any. Surfaces the "what specifically" of
+    // the call as a bare value while everything else stays as key=value
+    // for clarity.
+    let primary: string | null = null;
+    for (const k of PRIMARY_INPUT_KEYS) {
+      if (k in obj) {
+        primary = k;
+        break;
+      }
+    }
+
+    const parts: string[] = [];
+    if (primary !== null) {
+      parts.push(summarizeScalar(obj[primary], 80, 0));
+      for (const k of keys) {
+        if (k === primary) continue;
+        const v = obj[k];
+        if (v === null || v === undefined) continue;
+        parts.push(`${k}=${summarizeScalar(v, 24, 0)}`);
+      }
+    } else {
+      for (const k of keys) {
+        const v = obj[k];
+        if (v === null || v === undefined) continue;
+        parts.push(`${k}=${summarizeScalar(v, 24, 0)}`);
+      }
+    }
+
+    let out = parts.join(", ");
+    if (out.length > max) out = `${out.slice(0, Math.max(1, max - 1))}…`;
+    return out;
+  } catch {
+    // Pathological input (non-enumerable getters that throw, exotic
+    // proxies, etc). The chat UI should never go down because of bad
+    // tool arguments — a string fallback always renders.
+    try {
+      return clipString(String(input), Math.max(20, termWidth() - 16));
+    } catch {
+      return "(unrenderable)";
     }
   }
-
-  const parts: string[] = [];
-  if (primary !== null) {
-    parts.push(summarizeScalar(obj[primary], 80));
-    for (const k of keys) {
-      if (k === primary) continue;
-      const v = obj[k];
-      if (v === null || v === undefined) continue;
-      parts.push(`${k}=${summarizeScalar(v, 24)}`);
-    }
-  } else {
-    for (const k of keys) {
-      const v = obj[k];
-      if (v === null || v === undefined) continue;
-      parts.push(`${k}=${summarizeScalar(v, 24)}`);
-    }
-  }
-
-  let out = parts.join(", ");
-  if (out.length > max) out = `${out.slice(0, Math.max(1, max - 1))}…`;
-  return out;
 }
 
 function summarizeResult(content: string): string {
