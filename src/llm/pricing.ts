@@ -29,16 +29,19 @@ export interface PricedUsage {
   cacheCreationInputTokens?: number;
 }
 
-// Posted prices as of 2026-04. Edit this map when Anthropic updates rates.
+// Posted prices as of 2026-05. Edit this map when Anthropic updates rates.
+// Source: https://platform.claude.com/docs/en/docs/about-claude/pricing
 // Conservative fallback below for unknown models so pricing never throws —
 // agents see a number, possibly wrong, never crash.
 const PRICES: Record<string, Record<string, ModelPrice>> = {
   anthropic: {
+    // Opus 4.5+ priced 3x cheaper than the original Opus 4 / 4.1 tier.
+    // (Opus 4.0/4.1 were $15/$75; Opus 4.5/4.6/4.7 are $5/$25.)
     "claude-opus-4-7": {
-      inMicros: 15_000_000,
-      outMicros: 75_000_000,
-      cacheReadMicros: 1_500_000,
-      cacheCreationMicros: 18_750_000,
+      inMicros: 5_000_000,
+      outMicros: 25_000_000,
+      cacheReadMicros: 500_000,
+      cacheCreationMicros: 6_250_000,
     },
     "claude-sonnet-4-6": {
       inMicros: 3_000_000,
@@ -47,10 +50,10 @@ const PRICES: Record<string, Record<string, ModelPrice>> = {
       cacheCreationMicros: 3_750_000,
     },
     "claude-haiku-4-5-20251001": {
-      inMicros: 800_000,
-      outMicros: 4_000_000,
-      cacheReadMicros: 80_000,
-      cacheCreationMicros: 1_000_000,
+      inMicros: 1_000_000,
+      outMicros: 5_000_000,
+      cacheReadMicros: 100_000,
+      cacheCreationMicros: 1_250_000,
     },
   },
 };
