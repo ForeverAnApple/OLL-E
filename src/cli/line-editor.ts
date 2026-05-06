@@ -44,6 +44,13 @@ export interface LineEditorOpts {
   /** Continuation prompt for line 2+. Pad to the same visible width as
    *  `prompt` so the cursor column is visually consistent across lines. */
   promptCont: string;
+  /** Optional top frame line drawn directly above the input area. Called
+   *  fresh per render so the caller can recompute against current
+   *  `out.columns`. Returning null/undefined elides the row. */
+  frameTop?: () => string | null | undefined;
+  /** Optional bottom frame line drawn directly below the input area. Same
+   *  contract as `frameTop`. */
+  frameBottom?: () => string | null | undefined;
   callbacks: LineEditorCallbacks;
 }
 
@@ -202,6 +209,9 @@ export class LineEditor {
 
     if (this.aboveLine !== null) out.write(this.aboveLine + "\n");
 
+    const frameTop = this.opts.frameTop?.() ?? null;
+    if (frameTop) out.write(frameTop + "\n");
+
     const lines = this.buffer.split("\n");
     const promptLen = visibleLen(this.opts.prompt);
     const contLen = visibleLen(this.opts.promptCont);
@@ -240,6 +250,18 @@ export class LineEditor {
       if (!isLast || parked) out.write("\n");
     }
 
+    const frameBottom = this.opts.frameBottom?.() ?? null;
+    if (frameBottom) {
+      // Always advance to a fresh row for the border, regardless of
+      // parking. After the input loop the cursor sits either at the
+      // end of the last content row (not parked) or at col 0 of the
+      // phantom parking row. A single `\n` lands us on a clean row
+      // beneath all input either way; the border then occupies that
+      // row and the cursor reposition logic below moves up past it
+      // back into the editing area.
+      out.write("\n" + frameBottom);
+    }
+
     // Cursor's visual position within the input frame. For visualCol
     // exactly at a multiple of width (parking on the line containing
     // the cursor), this lands on `row=N, col=0` of the phantom row —
@@ -261,14 +283,20 @@ export class LineEditor {
       priorRows += visualRows[i]!;
     }
 
-    const upFromEnd = totalInputRows - 1 - inputVisualRow;
+    // Where the cursor sits right now (in input-area row coords) after
+    // all rendering: end of last input row when there's no bottom
+    // border, or one row below all input when there is.
+    const cursorAtEnd = totalInputRows - (frameBottom ? 0 : 1);
+    const upFromEnd = cursorAtEnd - inputVisualRow;
     if (upFromEnd > 0) out.write(`\x1b[${upFromEnd}A`);
     out.write("\r");
     if (inputVisualCol > 0) out.write(`\x1b[${inputVisualCol}C`);
 
     const aboveRows = this.aboveLine !== null ? 1 : 0;
-    this.renderedRow = aboveRows + inputVisualRow;
-    this.renderedRows = aboveRows + totalInputRows;
+    const topRows = frameTop ? 1 : 0;
+    const bottomRows = frameBottom ? 1 : 0;
+    this.renderedRow = aboveRows + topRows + inputVisualRow;
+    this.renderedRows = aboveRows + topRows + totalInputRows + bottomRows;
 
     this.opts.callbacks.onChange?.(this.buffer);
   }
@@ -519,7 +547,17 @@ export class LineEditor {
         continue;
       }
       if (ch === "\x03") {
-        // Ctrl+C
+        // Ctrl+C: standard line-editor convention. A non-empty buffer
+        // is dropped (the in-flight line goes away); only an
+        // already-empty buffer escalates to onAbort, which is where
+        // callers wire two-tap quit / cancel-stream semantics. This
+        // means the first Ctrl+C is always "scrap what I'm typing,"
+        // never an unintended exit-arm.
+        if (this.buffer.length > 0) {
+          this.killLine();
+          i++;
+          continue;
+        }
         this.opts.callbacks.onAbort();
         return;
       }

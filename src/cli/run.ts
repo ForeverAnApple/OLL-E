@@ -442,8 +442,6 @@ async function cmdChat(): Promise<void> {
     { name: "/help", description: "show available commands" },
     { name: "/clear", description: "clear scrollback" },
     { name: "/cancel", description: "cancel the current agent turn" },
-    { name: "/inbox", description: "open the decision inbox in a new window (run `olle inbox`)" },
-    { name: "/cost", description: "show running session cost (token + USD totals)" },
     { name: "/exit", description: "exit chat" },
     { name: "/quit", description: "exit chat" },
   ];
@@ -465,6 +463,8 @@ async function cmdChat(): Promise<void> {
     out: process.stdout,
     prompt: ui.promptString(),
     promptCont: ui.promptContString(),
+    frameTop: () => ui.frameTop(),
+    frameBottom: () => ui.frameBottom(),
     callbacks: {
       onSubmit: handleSubmit,
       onAbort: () => idleCtrlC(),
@@ -548,9 +548,7 @@ async function cmdChat(): Promise<void> {
       else if (slash.name === "/cancel") {
         if (turnBusy) await cancelTurn();
         else ui.note("no agent turn in progress");
-      } else if (slash.name === "/cost") ui.printCost();
-      else if (slash.name === "/inbox")
-        ui.note("inbox is its own command — run `olle inbox` in another shell");
+      }
       if (!stopping) {
         editor.setAboveLine(ui.formatStatus());
         editor.refresh();
@@ -1137,12 +1135,37 @@ export function createChatUI(opts: ChatUIOpts) {
     },
 
     promptString(): string {
-      return color(`${ANSI.bold}${ANSI.primary}`, "❯ ");
+      // `▎` in the accent tone leads every input row so the eye binds
+      // the multi-line composition together as one block (and its
+      // height visibly grows as you keep typing). The orange `❯`
+      // sits past the bar to mark the *first* row specifically —
+      // continuation rows omit it so the cursor lands consistently
+      // at the same content column.
+      const bar = color(ANSI.accent, "▎");
+      const arrow = color(`${ANSI.bold}${ANSI.primary}`, "❯");
+      return `${bar} ${arrow} `;
     },
     promptContString(): string {
-      // Two visible spaces — same width as `❯ `, no glyph. Aligns
-      // continuation-line text with the first line's content column.
-      return "  ";
+      // Same accent bar; three trailing spaces line up with `❯ ` so
+      // continuation text shares the first-line content column.
+      const bar = color(ANSI.accent, "▎");
+      return `${bar}   `;
+    },
+
+    /** Top frame line drawn directly above the input area. Recomputed
+     *  on every editor render so a terminal resize between turns is
+     *  picked up the next time the prompt repaints. We use width-1 so
+     *  the line never lands a glyph in the last column — that would
+     *  trigger a soft-wrap on terminals that don't park, and the
+     *  resulting phantom row throws off the editor's row bookkeeping. */
+    frameTop(): string {
+      const w = Math.max(1, termWidth() - 1);
+      return color(ANSI.border, "─".repeat(w));
+    },
+    /** Bottom frame line. Same contract as `frameTop`. */
+    frameBottom(): string {
+      const w = Math.max(1, termWidth() - 1);
+      return color(ANSI.border, "─".repeat(w));
     },
 
     /** Write the user's submitted message into scrollback as a styled
