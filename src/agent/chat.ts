@@ -9,8 +9,13 @@
 // from the discord bridge, and later child-agent replies all route through
 // the same mechanism: addressed-to-me + tagged-with-a-thread.
 //
-// Replies (chat.assistant-text, chat.tool-call, chat.tool-result,
-// chat.turn-end) carry the same threadId so bridges route them back.
+// Replies (chat.assistant-text, chat.tool-call, chat.tool-result-live,
+// chat.tool-result, chat.turn-end) carry the same threadId so bridges
+// route them back. The two-tier tool-result events mirror the
+// assistant-delta / assistant-text split: `*-live` is the UX surface
+// that fires the moment a tool finishes (non-durable, may differ from
+// canonical when aggregate-budget truncation kicks in); the bare
+// `chat.tool-result` is the canonical, durable, post-truncation form.
 //
 // Durability: per-thread message history snapshotted to
 // `<threadsDir>/<agentId-sanitized>/<threadId-sanitized>.json` after
@@ -939,7 +944,30 @@ function emitStep(
       durable: true,
       payload: { id: step.id, name: step.name, input },
     });
+  } else if (step.kind === "tool_result_live") {
+    // Live UX-only event. Non-durable: not persisted, not federated,
+    // not part of the replayable record. Subscribers that drive a
+    // visible surface (CLI, bridges) consume this; observability /
+    // history reconstruction don't see it at all.
+    opts.bus.publish({
+      type: "chat.tool-result-live",
+      hostId: opts.hostId,
+      actorId: opts.agentId,
+      parentEventId: origin.id,
+      threadId,
+      durable: false,
+      payload: {
+        id: step.id,
+        name: step.name,
+        isError: step.isError,
+        content: step.content,
+      },
+    });
   } else if (step.kind === "tool_result") {
+    // Canonical, durable. Carries exactly what the model received in
+    // its tool_result message — diverges from chat.tool-result-live
+    // only when aggregate-budget truncation rewrote the content into
+    // a `<persisted-output>` recovery marker.
     opts.bus.publish({
       type: "chat.tool-result",
       hostId: opts.hostId,

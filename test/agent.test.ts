@@ -112,6 +112,69 @@ describe("runAgent", () => {
     expect((toolResult as { content: string }).content).toBe("echoed:ping");
   });
 
+  it("emits tool_result_live mid-loop and tool_result post-batch with matching content", async () => {
+    // Two parallel tool uses in one assistant turn. The live emit must
+    // fire between the two tool_use steps (interleaved), while the
+    // canonical tool_result for both fires after the whole batch
+    // finished. In the no-truncation path the contents are identical.
+    const llm = mockLlm([
+      {
+        content: [
+          { type: "tool_use", id: "t1", name: "echo", input: { msg: "a" } },
+          { type: "tool_use", id: "t2", name: "echo", input: { msg: "b" } },
+        ],
+        stopReason: "tool_use",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          totalTokens: 2,
+        },
+      },
+      endTurn("done."),
+    ]);
+    const echo: ToolDef<{ msg: string }, string> = {
+      name: "echo",
+      description: "echo",
+      inputSchema: { type: "object", properties: { msg: { type: "string" } } },
+      execute: (args) => `echoed:${args.msg}`,
+    };
+    const trace: Array<{ kind: string; id?: string; content?: string }> = [];
+    await runAgent({
+      llm,
+      toolCtx: ctx,
+      tools: [echo],
+      messages: [{ role: "user", content: "go" }],
+      onStep: (s) => {
+        if (s.kind === "tool_use" || s.kind === "tool_result_live" || s.kind === "tool_result") {
+          trace.push({
+            kind: s.kind,
+            id: s.id,
+            content: "content" in s ? s.content : undefined,
+          });
+        }
+      },
+    });
+    // Ordering: tool_use t1, tool_result_live t1, tool_use t2,
+    // tool_result_live t2, then canonical tool_result t1, tool_result t2.
+    const kinds = trace.map((t) => `${t.kind}:${t.id}`);
+    expect(kinds).toEqual([
+      "tool_use:t1",
+      "tool_result_live:t1",
+      "tool_use:t2",
+      "tool_result_live:t2",
+      "tool_result:t1",
+      "tool_result:t2",
+    ]);
+    // Content matches between live and canonical when no aggregate
+    // truncation rewrites it.
+    const live1 = trace.find((t) => t.kind === "tool_result_live" && t.id === "t1");
+    const final1 = trace.find((t) => t.kind === "tool_result" && t.id === "t1");
+    expect(live1?.content).toBe("echoed:a");
+    expect(final1?.content).toBe("echoed:a");
+  });
+
   it("redacts sensitive tool outputs before tracing or feeding back to the model", async () => {
     const llm = mockLlm([
       toolUse("t1", "token_fetch", {}),

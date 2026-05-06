@@ -244,6 +244,52 @@ describe("tool-result truncation", () => {
     expect(total).toBeLessThanOrEqual(80_000);
   });
 
+  it("emits live tool_result with raw content but canonical with the recovery marker when aggregate cap rewrites", async () => {
+    // Parallel tool batch where the aggregate cap forces a spill on at
+    // least one block. The live emit captures what the tool produced;
+    // the canonical emit (post-truncation) captures what the model sees.
+    // For the rewritten id the two diverge by design — UX surface saw
+    // the raw output, audit log records the recovery marker.
+    const persisted: Array<{ id: string; content: string }> = [];
+    const llm = mockLlm([
+      parallelToolUse([
+        { id: "a", name: "med", input: {} },
+        { id: "b", name: "med", input: {} },
+        { id: "c", name: "huge", input: {} },
+      ]),
+      endTurn("ok"),
+    ]);
+    const tools: ToolDef[] = [bigTool("med", 30_000), bigTool("huge", 45_000)];
+    const live = new Map<string, string>();
+    const canonical = new Map<string, string>();
+    await runAgent({
+      llm,
+      toolCtx: ctx,
+      messages: [{ role: "user", content: "go" }],
+      tools,
+      onStep: (s) => {
+        if (s.kind === "tool_result_live") live.set(s.id, s.content);
+        else if (s.kind === "tool_result") canonical.set(s.id, s.content);
+      },
+      truncate: {
+        state: createTruncationState(),
+        maxBytesPerCall: 50_000,
+        maxBytesPerMessage: 80_000,
+        persist: (input) => persisted.push({ id: input.id, content: input.content }),
+      },
+    });
+    // Every id has both a live and a canonical emit.
+    for (const id of ["a", "b", "c"]) {
+      expect(live.has(id)).toBe(true);
+      expect(canonical.has(id)).toBe(true);
+    }
+    // The spilled id ("c") has a recovery marker in canonical but raw
+    // bytes in live — that's the divergence the two-tier design exists
+    // to express truthfully.
+    expect(live.get("c")).toBe("X".repeat(45_000));
+    expect(canonical.get("c")).toContain("<persisted-output>");
+  });
+
   it("never spills sensitive-output tools", async () => {
     const persisted: Array<{ id: string }> = [];
     const tool: ToolDef<unknown, string> = {

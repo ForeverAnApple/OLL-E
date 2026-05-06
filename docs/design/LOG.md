@@ -873,6 +873,27 @@ Fresh-install flow surfaced the bug: `olle secret set ANTHROPIC_API_KEY <val>` w
 
 **Why subscribe rather than re-read.** Considered making `readSecret` lazy at chat-bringup time and re-checking on every chat.input. Rejected: that's polling-flavored work on every event, and conflates the "secret available" question with the "agent alive" question. An event is the right unit — secrets are written deliberately, the write moment is observable, and other future subscribers (e.g., extensions that need to react to a token landing) get the same hook for free. The `secret.set` event is durable so it lands in the audit log alongside other state changes.
 
+---
+
+## 2026-05-05 — Tool-result events split into live (UX) and canonical (durable, post-truncation)
+
+The chat UI wants tool results to land the moment each tool finishes — a slow first tool used to leave the turn looking frozen between the call line and an eventual dump-of-everything. That argued for emitting `chat.tool-result` immediately after each `tool.execute()`. But aggregate-budget truncation runs **after** the per-tool loop finishes; if the durable `chat.tool-result` carried what-the-user-saw rather than what-the-model-saw, the event log and the model's actual messages would diverge. The architecture's implicit invariant — "what observers see equals what the model received" — would break, and federation (event-log merge across peers) would inherit that lie.
+
+**The shape we landed on.** Two events, mirroring the existing `chat.assistant-delta` / `chat.assistant-text` split:
+
+- `chat.tool-result-live` — non-durable, fires inside the per-tool loop the instant a tool finishes (post per-tool cap, pre aggregate-budget cap). UX surfaces (`olle chat`, future bridges) consume it. Not persisted, not federated, not part of the replayable record.
+- `chat.tool-result` — durable, fires once per tool **after** the aggregate-budget pass with the exact content the model sees in its messages array. Canonical for observability, replay, federation.
+
+For the 99% case the two are byte-identical; the live emit drives UX, the canonical emit pins the record. For the 1% case where aggregate truncation rewrites a result into a `<persisted-output>` recovery marker, the events diverge by design — UX showed what the tool produced, the log records what the model actually received.
+
+**CLI dedup.** `olle chat` subscribes to both types. A `Set<string>` of rendered tool_use ids tracks "already painted." The live event renders + adds; the canonical event renders only when the id is absent (covers reconnect-mid-turn, where the live event flowed past the disconnected subscription). Set clears on `chat.turn-end` / error / cancel. Tool ids are unique within a turn, so the set is bounded.
+
+**Why two event types instead of one with a flag.** The bus mixes durable and non-durable events on the same subscription stream — subscribers filter by `type`, not by the durable flag. A single event type with a "this is the live preview" payload field forces every subscriber (CLI, observability dashboards, future federation bridges) to know about the flag. Two types lets each surface subscribe to what it actually wants — UX surfaces drop the live one in scrollback and ignore the canonical (or use it as a reconnect fallback); audit/replay surfaces ignore live entirely and read canonical as truth. Naming the difference also tells the story at the type level.
+
+**Why not delay the live UX until truncation finishes.** Briefly considered keeping a single durable `chat.tool-result` and just emitting it after aggregate-cap: that's the original behavior, and it's exactly what motivated this whole change. A 60KB tool result blocks UX paint for as long as truncation logic takes; with parallel slow tools the user sees a blank stretch followed by a batch dump. The whole point of the fix is responsiveness.
+
+**Bus-ordering note.** The per-tool loop now interleaves `tool_use` / `tool_result_live` step-by-step instead of emitting all `tool_use` first and all `tool_result` second. Searched current subscribers — only `src/cli/run.ts` (the chat REPL) and `src/starters/templates.ts` (Discord template) listen for these. Neither relied on the batched ordering. Future subscribers shouldn't either; the canonical `tool_result` still arrives in a single post-loop block if anyone needs that.
+
 These are deliberately un-landed as of the vision-lock date. Drafting-phase decisions only.
 
 - **Exact service-manager lifecycle.** `olle daemon install` shape on mac (launchd) vs linux (systemd). Whether auto-start-on-login is opt-in during install or always prompted.
