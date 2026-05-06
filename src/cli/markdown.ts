@@ -9,21 +9,7 @@
 
 import { marked, type Token, type Tokens } from "marked";
 import { highlightCodeLine, normalizeLang } from "./highlight.ts";
-
-const ANSI = {
-  reset: "\x1b[0m",
-  bold: "\x1b[1m",
-  dim: "\x1b[2m",
-  italic: "\x1b[3m",
-  underline: "\x1b[4m",
-  strike: "\x1b[9m",
-  cyan: "\x1b[36m",
-  magenta: "\x1b[35m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  blue: "\x1b[34m",
-  gray: "\x1b[90m",
-};
+import { ANSI } from "./theme.ts";
 
 export interface Theme {
   heading(text: string, level: number): string;
@@ -42,23 +28,23 @@ export interface Theme {
 
 const defaultTheme: Theme = {
   heading: (text, level) => {
-    const hash = `${ANSI.dim}${"#".repeat(level)}${ANSI.reset} `;
-    return `${hash}${ANSI.bold}${ANSI.cyan}${text}${ANSI.reset}`;
+    const hash = `${ANSI.muted}${"#".repeat(level)}${ANSI.reset} `;
+    return `${hash}${ANSI.bold}${ANSI.accent}${text}${ANSI.reset}`;
   },
   bold: (t) => `${ANSI.bold}${t}${ANSI.reset}`,
   italic: (t) => `${ANSI.italic}${t}${ANSI.reset}`,
   strike: (t) => `${ANSI.strike}${t}${ANSI.reset}`,
-  code: (t) => `${ANSI.magenta}${t}${ANSI.reset}`,
-  codeBlock: (t) => `${ANSI.green}${t}${ANSI.reset}`,
-  codeFence: (t) => `${ANSI.dim}${t}${ANSI.reset}`,
+  code: (t) => `${ANSI.primary}${t}${ANSI.reset}`,
+  codeBlock: (t) => `${ANSI.text}${t}${ANSI.reset}`,
+  codeFence: (t) => `${ANSI.muted}${t}${ANSI.reset}`,
   codeHighlight: (text, lang) => highlightCodeLine(text, lang),
   link: (text, href) =>
     text === href
-      ? `${ANSI.cyan}${ANSI.underline}${text}${ANSI.reset}`
-      : `${ANSI.cyan}${ANSI.underline}${text}${ANSI.reset}${ANSI.dim} (${href})${ANSI.reset}`,
-  bullet: (t) => `${ANSI.cyan}${t}${ANSI.reset}`,
-  quoteBar: `${ANSI.dim}│${ANSI.reset} `,
-  hr: (w) => `${ANSI.dim}${"─".repeat(Math.min(w, 60))}${ANSI.reset}`,
+      ? `${ANSI.secondary}${ANSI.underline}${text}${ANSI.reset}`
+      : `${ANSI.secondary}${ANSI.underline}${text}${ANSI.reset}${ANSI.muted} (${href})${ANSI.reset}`,
+  bullet: (t) => `${ANSI.primary}${t}${ANSI.reset}`,
+  quoteBar: `${ANSI.muted}│${ANSI.reset} `,
+  hr: (w) => `${ANSI.muted}${"─".repeat(Math.min(w, 60))}${ANSI.reset}`,
 };
 
 export const plainTheme: Theme = {

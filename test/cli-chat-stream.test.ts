@@ -306,6 +306,53 @@ describe("chat UI progressive streaming", () => {
     expect(flat).toContain("Line 18 of");
   });
 
+  it("renders tool input with primary-key first, key=value tail", () => {
+    const term = makeTerm(80, 24);
+    const ui = createChatUI({
+      agentId: "a",
+      agentName: "olle",
+      threadId: "t",
+      out: term,
+    });
+    // memory_search → primary `query` renders as a bare string.
+    ui.toolCall("memory_search", { query: "discord auth", limit: 5 });
+    // query_events → no primary in the priority list, so all keys
+    // fold into key=value pairs.
+    ui.toolCall("query_events", { type: "chat.input", limit: 5 });
+    // load_tools → array primary, rendered inline.
+    ui.toolCall("load_tools", { names: ["a", "b", "c"] });
+
+    const flat = visibleLines(term).join("\n");
+    expect(flat).toContain('memory_search("discord auth", limit=5)');
+    expect(flat).toContain('query_events(type="chat.input", limit=5)');
+    expect(flat).toContain("load_tools([");
+    expect(flat).toContain("a");
+    // No raw JSON-stringified shape with curly braces around the args.
+    expect(flat).not.toContain('memory_search({"query');
+    expect(flat).not.toContain('query_events({"type');
+  });
+
+  it("renders tool results inside a left-bar block, single- or multi-line", () => {
+    const term = makeTerm(80, 24);
+    const ui = createChatUI({
+      agentId: "a",
+      agentName: "olle",
+      threadId: "t",
+      out: term,
+    });
+    ui.toolCall("memory_search", { query: "x" });
+    ui.toolResult("one matched line.", false);
+    ui.toolCall("query_events", { type: "x" });
+    ui.toolResult("hit a\nhit b\nhit c", false);
+
+    const flat = visibleLines(term).join("\n");
+    // Both results carry the bar so call/result are visually bound.
+    expect(flat).toMatch(/│ one matched line\./);
+    expect(flat).toMatch(/│ hit a/);
+    expect(flat).toMatch(/│ hit b/);
+    expect(flat).toMatch(/│ hit c/);
+  });
+
   it("non-TTY output skips streaming and writes the final markdown once", () => {
     const term = makeTerm(80, 24, false);
     const ui = createChatUI({

@@ -481,7 +481,7 @@ async function cmdChat(): Promise<void> {
     }
     quitArmedUntil = now + QUIT_ARM_MS;
     editor.setAboveLine(
-      color(ANSI.dim, "press Ctrl-C again within 2s to exit"),
+      color(ANSI.muted, "press Ctrl-C again within 2s to exit"),
     );
     setTimeout(() => {
       if (Date.now() > quitArmedUntil) return; // already exited or rearmed
@@ -507,7 +507,7 @@ async function cmdChat(): Promise<void> {
     if (stopping) return;
     stopping = true;
     editor.close();
-    process.stdout.write(color(ANSI.dim, "bye.") + "\n");
+    process.stdout.write(color(ANSI.muted, "bye.") + "\n");
     try {
       current.close();
     } catch {
@@ -654,18 +654,18 @@ async function cmdChat(): Promise<void> {
   async function reconnect(): Promise<void> {
     editor.suspend();
     process.stdout.write(
-      color(ANSI.yellow, "  ⟳ daemon disconnected — reconnecting…") + "\n",
+      color(ANSI.warning, "  ⟳ daemon disconnected — reconnecting…") + "\n",
     );
     let attempt = 1;
     while (!stopping) {
       try {
         current = await connectIpc(paths.socketFile);
-        process.stdout.write(color(ANSI.yellow, "  ⟳ reconnected") + "\n");
+        process.stdout.write(color(ANSI.success, "  ⟳ reconnected") + "\n");
         return;
       } catch {
         process.stdout.write(
           color(
-            ANSI.dim,
+            ANSI.muted,
             `  ⟳ retry in ${(backoff / 1000).toFixed(1)}s (attempt ${attempt})`,
           ) + "\n",
         );
@@ -684,21 +684,11 @@ function numFrom(v: unknown): number {
 // ───────────────────────────────────────────────────────────────────────
 // Chat UI — light ANSI dressing for `olle chat`. No TUI framework, no
 // alternate screen; just a vocabulary of styled lines so the agent's
-// turn structure is legible.
+// turn structure is legible. Palette lives in `./theme.ts` so the
+// markdown renderer paints from the same swatches.
 // ───────────────────────────────────────────────────────────────────────
 
-const ANSI = {
-  reset: "\x1b[0m",
-  bold: "\x1b[1m",
-  dim: "\x1b[2m",
-  red: "\x1b[31m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  blue: "\x1b[34m",
-  magenta: "\x1b[35m",
-  cyan: "\x1b[36m",
-  gray: "\x1b[90m",
-};
+import { ANSI } from "./theme.ts";
 
 function color(code: string, s: string): string {
   // Skip styling when stdout is piped — keeps `olle chat | tee` clean.
@@ -725,15 +715,95 @@ function formatUsd(usdMicros: number): string {
   return `$${usd.toFixed(2)}`;
 }
 
-function summarizeInput(input: unknown): string {
-  let s: string;
-  try {
-    s = typeof input === "string" ? input : JSON.stringify(input);
-  } catch {
-    s = String(input);
+// Keys that, when present, carry the most important "what specifically"
+// information for a tool call. Tried in order; the first match wins and
+// the matching field renders bare (e.g. memory_search("discord auth"))
+// while the rest fold into key=value pairs after it. The list is
+// deliberately broad — the same name shape repeats across primitives
+// (id, path, name, query, etc.) so a single cross-tool table works.
+const PRIMARY_INPUT_KEYS = [
+  "query",
+  "q",
+  "path",
+  "title",
+  "name",
+  "id",
+  "agentId",
+  "threadId",
+  "memoryId",
+  "handle",
+  "names",
+  "text",
+  "to",
+];
+
+function clipString(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, Math.max(1, max - 1))}…` : s;
+}
+
+function summarizeScalar(v: unknown, budget: number): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return JSON.stringify(clipString(v, Math.max(8, budget - 2)));
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) {
+    if (v.length === 0) return "[]";
+    if (v.length > 4) return `[${v.length} items]`;
+    const inner = v.map((x) => summarizeScalar(x, 24)).join(", ");
+    return inner.length <= budget ? `[${inner}]` : `[${v.length} items]`;
   }
+  if (typeof v === "object") {
+    const keys = Object.keys(v as Record<string, unknown>);
+    if (keys.length === 0) return "{}";
+    if (keys.length === 1) {
+      const k = keys[0]!;
+      return `{${k}: ${summarizeScalar((v as Record<string, unknown>)[k], 24)}}`;
+    }
+    return `{${keys.length} keys}`;
+  }
+  return String(v);
+}
+
+function summarizeInput(input: unknown): string {
+  if (input === null || input === undefined) return "";
   const max = Math.max(20, termWidth() - 16);
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  if (typeof input !== "object") return clipString(String(input), max);
+  if (Array.isArray(input)) return clipString(summarizeScalar(input, max), max);
+
+  const obj = input as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return "";
+
+  // Find the primary key, if any. Surfaces the "what specifically" of
+  // the call as a bare value while everything else stays as key=value
+  // for clarity.
+  let primary: string | null = null;
+  for (const k of PRIMARY_INPUT_KEYS) {
+    if (k in obj) {
+      primary = k;
+      break;
+    }
+  }
+
+  const parts: string[] = [];
+  if (primary !== null) {
+    parts.push(summarizeScalar(obj[primary], 80));
+    for (const k of keys) {
+      if (k === primary) continue;
+      const v = obj[k];
+      if (v === null || v === undefined) continue;
+      parts.push(`${k}=${summarizeScalar(v, 24)}`);
+    }
+  } else {
+    for (const k of keys) {
+      const v = obj[k];
+      if (v === null || v === undefined) continue;
+      parts.push(`${k}=${summarizeScalar(v, 24)}`);
+    }
+  }
+
+  let out = parts.join(", ");
+  if (out.length > max) out = `${out.slice(0, Math.max(1, max - 1))}…`;
+  return out;
 }
 
 function summarizeResult(content: string): string {
@@ -819,7 +889,7 @@ export function createChatUI(opts: ChatUIOpts) {
 
   function ensureHeader(): void {
     if (headerWritten) return;
-    out.write(color(`${ANSI.bold}${ANSI.cyan}`, headerLabel) + "\n");
+    out.write(color(`${ANSI.bold}${ANSI.primary}`, headerLabel) + "\n");
     headerWritten = true;
   }
 
@@ -992,40 +1062,36 @@ export function createChatUI(opts: ChatUIOpts) {
     if (pendingRows > maxPendingRows()) forceFlushPending();
   }
 
-  function padLine(s: string, w: number): string {
-    return s + " ".repeat(Math.max(0, w - visibleLen(s)));
-  }
-
   return {
     banner(): void {
-      const w = Math.min(72, termWidth());
-      const inner = w - 2;
-      const top = color(ANSI.cyan, `╭${"─".repeat(inner)}╮`);
-      const bot = color(ANSI.cyan, `╰${"─".repeat(inner)}╯`);
-      const side = color(ANSI.cyan, "│");
-      const title = `${ANSI.bold}${opts.agentName}${ANSI.reset}`;
-      const hint1 = color(
-        ANSI.dim,
-        "Alt+Enter newline · Ctrl+C cancel turn / quit · /help",
-      );
-      const row = (s: string) => `${side} ${padLine(s, inner - 2)} ${side}\n`;
-      out.write(`${top}\n`);
-      out.write(row(title));
-      out.write(row(hint1));
+      // Lean two-line intro — diamond + name on the first row, hint
+      // strip below in muted text. The previous heavy box-drawing
+      // didn't carry information that earned its visual weight, and
+      // flush-left lets the welcome ◆ sit on the same column the
+      // assistant header lands on for every subsequent turn.
+      const diamond = color(`${ANSI.bold}${ANSI.primary}`, "◆");
+      const name = color(ANSI.bold, opts.agentName);
+      out.write(`${diamond} ${name}\n`);
+      const sep = color(ANSI.muted, " · ");
+      const hints = ["alt+enter newline", "ctrl+c cancel/quit", "/help"]
+        .map((h) => color(ANSI.muted, h))
+        .join(sep);
+      out.write(`${hints}\n`);
       const n = opts.inboxOpen ?? 0;
       if (n > 0) {
         const word = n === 1 ? "item" : "items";
-        const inbox = color(
-          ANSI.yellow,
+        const bullet = color(`${ANSI.bold}${ANSI.warning}`, "!");
+        const text = color(
+          ANSI.warning,
           `${n} ${word} in your inbox — \`olle inbox\` to review`,
         );
-        out.write(row(inbox));
+        out.write(`\n${bullet} ${text}\n`);
       }
-      out.write(`${bot}\n\n`);
+      out.write("\n");
     },
 
     promptString(): string {
-      return color(`${ANSI.bold}${ANSI.cyan}`, "❯ ");
+      return color(`${ANSI.bold}${ANSI.primary}`, "❯ ");
     },
     promptContString(): string {
       // Two visible spaces — same width as `❯ `, no glyph. Aligns
@@ -1044,20 +1110,21 @@ export function createChatUI(opts: ChatUIOpts) {
         return;
       }
       const lines = text.split("\n");
-      const gutter = color(`${ANSI.bold}${ANSI.green}`, "▎");
+      const gutter = color(`${ANSI.bold}${ANSI.secondary}`, "▎");
       for (let i = 0; i < lines.length; i++) {
-        out.write(i === 0 ? `${gutter} ${lines[i]}\n` : `  ${lines[i]}\n`);
+        const body = color(ANSI.text, lines[i] ?? "");
+        out.write(i === 0 ? `${gutter} ${body}\n` : `  ${body}\n`);
       }
       out.write("\n");
     },
 
     /** Print the slash command list as a small agent-style help block. */
     printSlashHelp(cmds: Array<{ name: string; description: string }>): void {
-      out.write(color(`${ANSI.bold}${ANSI.cyan}`, "◆ commands") + "\n");
+      out.write(color(`${ANSI.bold}${ANSI.primary}`, "◆ commands") + "\n");
       const w = Math.max(...cmds.map((c) => c.name.length));
       for (const c of cmds) {
         out.write(
-          `  ${color(ANSI.cyan, c.name.padEnd(w))}  ${color(ANSI.dim, c.description)}\n`,
+          `  ${color(ANSI.primary, c.name.padEnd(w))}  ${color(ANSI.muted, c.description)}\n`,
         );
       }
       out.write("\n");
@@ -1101,18 +1168,44 @@ export function createChatUI(opts: ChatUIOpts) {
 
     toolCall(name: string, input: unknown): void {
       flushAssistant();
-      const head = color(ANSI.gray, "  ⏵ ");
-      const body = color(ANSI.dim, `${name}(${summarizeInput(input)})`);
+      const icon = toolIcon(name);
+      const head = color(ANSI.muted, `  ${icon} `);
+      const body = `${color(ANSI.text, name)}${color(ANSI.muted, `(${summarizeInput(input)})`)}`;
       out.write(`${head}${body}\n`);
     },
 
     toolResult(content: string, isError: boolean): void {
       flushAssistant();
-      const c = isError ? ANSI.red : ANSI.gray;
-      const bodyColor = isError ? ANSI.red : ANSI.dim;
-      const head = color(c, "  ⏷ ");
-      const body = color(bodyColor, summarizeResult(content) || "(empty)");
-      out.write(`${head}${body}\n`);
+      const text = (content ?? "").replace(/\s+$/, "");
+      const barColor = isError ? ANSI.error : ANSI.border;
+      const bodyColor = isError ? ANSI.error : ANSI.muted;
+      const bar = color(barColor, "│");
+      // Always render results inside a left-bar block so the eye binds
+      // them to the call line above. Single-line collapses to one bar
+      // row; multi-line stacks. Border picks up the error tone when
+      // the call failed so colour is the cue, not a tag.
+      if (!text) {
+        out.write(`    ${bar} ${color(bodyColor, "(empty)")}\n`);
+        return;
+      }
+      const lines = text.split("\n");
+      if (lines.length === 1) {
+        const oneLine = summarizeResult(text);
+        out.write(`    ${bar} ${color(bodyColor, oneLine)}\n`);
+        return;
+      }
+      const w = termWidth();
+      const inner = Math.max(20, w - 6); // 4 lead spaces + "│ "
+      const MAX_LINES = 12;
+      const shown = lines.slice(0, MAX_LINES);
+      for (const ln of shown) {
+        const trimmed = ln.length > inner ? `${ln.slice(0, inner - 1)}…` : ln;
+        out.write(`    ${bar} ${color(bodyColor, trimmed)}\n`);
+      }
+      if (lines.length > MAX_LINES) {
+        const more = `… ${lines.length - MAX_LINES} more line${lines.length - MAX_LINES === 1 ? "" : "s"}`;
+        out.write(`    ${bar} ${color(ANSI.muted, more)}\n`);
+      }
     },
 
     retry(info: { attempt: number; status?: number; waitMs: number; message?: string }): void {
@@ -1126,28 +1219,28 @@ export function createChatUI(opts: ChatUIOpts) {
             ? "rate limited"
             : "API hiccup";
       const line = `  ⟳ ${reason}${statusStr} — retrying in ${waitS}s (attempt ${info.attempt + 1})`;
-      out.write(color(ANSI.yellow, line) + "\n");
+      out.write(color(ANSI.warning, line) + "\n");
     },
 
     error(msg: string): void {
       flushAssistant();
-      out.write(color(ANSI.red, `  ⚠ ${msg}`) + "\n\n");
+      out.write(color(ANSI.error, `  ⚠ ${msg}`) + "\n\n");
     },
 
     /** "we asked the daemon to cancel; waiting on the abort to land". */
     cancelling(): void {
-      out.write(color(ANSI.yellow, "  ⏹ cancelling…") + "\n");
+      out.write(color(ANSI.warning, "  ⏹ cancelling…") + "\n");
     },
 
     /** Daemon confirmed the turn was aborted. */
     cancelled(): void {
       flushAssistant();
-      out.write(color(ANSI.yellow, "  ⏹ turn cancelled") + "\n\n");
+      out.write(color(ANSI.warning, "  ⏹ turn cancelled") + "\n\n");
     },
 
     /** Plain dim status note (no agent attribution). */
     note(msg: string): void {
-      out.write(color(ANSI.dim, `  ${msg}`) + "\n\n");
+      out.write(color(ANSI.muted, `  ${msg}`) + "\n\n");
     },
 
     /** Spell out the cumulative session cost in a multi-line block. The
@@ -1158,19 +1251,21 @@ export function createChatUI(opts: ChatUIOpts) {
       const total =
         s.inputTokens + s.outputTokens + s.cacheReadTokens + s.cacheCreationTokens;
       if (total === 0 && s.usdMicros === 0) {
-        out.write(color(ANSI.dim, "  no turns this session yet.") + "\n\n");
+        out.write(color(ANSI.muted, "  no turns this session yet.") + "\n\n");
         return;
       }
+      const label = (s: string) => color(ANSI.muted, s.padEnd(13));
+      const value = (s: string) => color(ANSI.text, s);
       const lines = [
-        color(`${ANSI.bold}${ANSI.cyan}`, "◆ session cost"),
-        `  input:        ${formatTokens(s.inputTokens)}`,
-        `  output:       ${formatTokens(s.outputTokens)}`,
-        `  cache read:   ${formatTokens(s.cacheReadTokens)}`,
-        `  cache create: ${formatTokens(s.cacheCreationTokens)}`,
-        `  total tokens: ${formatTokens(total)}`,
-        `  total cost:   ${formatUsd(s.usdMicros)}`,
+        color(`${ANSI.bold}${ANSI.primary}`, "◆ session cost"),
+        `  ${label("input")}${value(formatTokens(s.inputTokens))}`,
+        `  ${label("output")}${value(formatTokens(s.outputTokens))}`,
+        `  ${label("cache read")}${value(formatTokens(s.cacheReadTokens))}`,
+        `  ${label("cache create")}${value(formatTokens(s.cacheCreationTokens))}`,
+        `  ${label("total tokens")}${value(formatTokens(total))}`,
+        `  ${label("total cost")}${value(formatUsd(s.usdMicros))}`,
       ];
-      if (s.model) lines.push(color(ANSI.dim, `  model: ${s.model}`));
+      if (s.model) lines.push(`  ${label("model")}${color(ANSI.muted, s.model)}`);
       out.write(lines.join("\n") + "\n\n");
     },
 
@@ -1198,7 +1293,7 @@ export function createChatUI(opts: ChatUIOpts) {
       // Surface non-normal stop reasons immediately — user shouldn't
       // wait for the next prompt to learn the turn cut off early.
       if (stats.stopReason && stats.stopReason !== "end_turn") {
-        out.write(color(ANSI.dim, `  ⌁ stop: ${stats.stopReason}`) + "\n");
+        out.write(color(ANSI.muted, `  ⌁ stop: ${stats.stopReason}`) + "\n");
       }
     },
 
@@ -1213,24 +1308,29 @@ export function createChatUI(opts: ChatUIOpts) {
       if (sessionStats.cacheReadTokens) parts.push(`R${formatTokens(sessionStats.cacheReadTokens)}`);
       if (sessionStats.cacheCreationTokens) parts.push(`W${formatTokens(sessionStats.cacheCreationTokens)}`);
       if (sessionStats.usdMicros) parts.push(formatUsd(sessionStats.usdMicros));
-      const left = parts.join(" ");
-      const right = sessionStats.model;
+      // Use a styled ` · ` separator so the eye groups paired numbers
+      // instead of reading the run together. Both halves dim so the
+      // line stays a footer, never competing with assistant content.
+      const sep = color(ANSI.border, " · ");
+      const left = parts.map((p) => color(ANSI.muted, p)).join(sep);
+      const right = sessionStats.model
+        ? color(ANSI.muted, sessionStats.model)
+        : "";
       if (!left && !right) return null;
       const w = termWidth();
       const padNeeded = Math.max(1, w - visibleLen(left) - visibleLen(right));
-      const line = `${left}${" ".repeat(padNeeded)}${right}`;
-      return color(ANSI.dim, line);
+      return `${left}${" ".repeat(padNeeded)}${right}`;
     },
 
     /** Format matching slash-command suggestions for the above-prompt
      *  slot. Returns a single-line styled string. */
     formatSuggestions(matches: Array<{ name: string; description: string }>): string {
-      if (matches.length === 0) return color(ANSI.dim, "no matches");
+      if (matches.length === 0) return color(ANSI.muted, "no matches");
       const w = Math.max(20, termWidth());
       const items = matches
         .slice(0, 5)
-        .map((c) => `${color(ANSI.cyan, c.name)}${color(ANSI.dim, ` ${c.description}`)}`);
-      const sep = color(ANSI.dim, "  ·  ");
+        .map((c) => `${color(ANSI.primary, c.name)}${color(ANSI.muted, ` ${c.description}`)}`);
+      const sep = color(ANSI.border, " · ");
       let acc = "";
       for (const it of items) {
         const next = acc ? acc + sep + it : it;
@@ -1240,6 +1340,69 @@ export function createChatUI(opts: ChatUIOpts) {
       return acc || items[0]!;
     },
   };
+}
+
+/** Map a tool name to a small visual icon so the eye sorts the
+ *  assistant's tool calls by shape, not by reading. Mirrors the
+ *  vocabulary common in modern chat-style coding agents:
+ *
+ *    →  read-shaped (read_*, mail_list, query_self memory_read, …)
+ *    ←  write-shaped (write_*, set_secret, memory_write, mail_respond, …)
+ *    ✱  search (memory_search, query_events with filters)
+ *    ◇  query / list (query_*, list_*, extension_history)
+ *    │  delegation (spawn_agent, kill_agent, retarget_thread)
+ *    +  load_tools         −  unload_tools
+ *    ▶  run_smoke_test
+ *    ⏵  fallback
+ */
+function toolIcon(name: string): string {
+  if (name === "load_tools") return "+";
+  if (name === "unload_tools") return "−";
+  if (name === "memory_search") return "✱";
+  if (name === "run_smoke_test") return "▶";
+  if (
+    name === "spawn_agent" ||
+    name === "kill_agent" ||
+    name === "retarget_thread"
+  ) {
+    return "│";
+  }
+  if (
+    name.startsWith("read_") ||
+    name === "mail_list" ||
+    name === "scratch_read" ||
+    name === "scratch_list" ||
+    name === "memory_read" ||
+    name === "memory_lineage"
+  ) {
+    return "→";
+  }
+  if (
+    name.startsWith("write_") ||
+    name === "set_secret" ||
+    name === "remove_secret" ||
+    name === "scratch_write" ||
+    name === "scratch_delete" ||
+    name === "install_starter" ||
+    name === "register_extension" ||
+    name === "revert_extension" ||
+    name === "memory_write" ||
+    name === "memory_promote" ||
+    name === "memory_forget" ||
+    name === "mail_respond" ||
+    name === "mail_reply" ||
+    name === "mail_propose"
+  ) {
+    return "←";
+  }
+  if (
+    name.startsWith("query_") ||
+    name.startsWith("list_") ||
+    name === "extension_history"
+  ) {
+    return "◇";
+  }
+  return "⏵";
 }
 
 // --- Observability subcommands. All wrap the same observability.* IPC
