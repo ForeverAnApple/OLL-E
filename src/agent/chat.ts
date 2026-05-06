@@ -495,13 +495,19 @@ async function runTurn(
         grantProposed.add(tool.name);
         // Resolve agent name for the summary so the principal sees a
         // human label, not a ULID. The store is authoritative; if the
-        // row is gone we fall back to the id.
+        // row is gone we fall back to the id. Self-chosen handle wins
+        // over the formal `name` so the principal reads the social
+        // label the agent itself uses.
         const agentRow = opts.store
-          .select({ name: tables.agents.name })
+          .select({
+            name: tables.agents.name,
+            displayName: tables.agents.displayName,
+          })
           .from(tables.agents)
           .where(eq(tables.agents.id, opts.agentId))
           .all()[0];
-        const agentLabel = agentRow?.name ?? opts.agentId;
+        const agentLabel =
+          agentRow?.displayName?.trim() || agentRow?.name || opts.agentId;
         askUp(
           { bus: opts.bus, store: opts.store, hostId: opts.hostId, inbox: opts.inbox },
           {

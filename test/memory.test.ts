@@ -2,6 +2,7 @@
 // injection.
 
 import { describe, expect, it } from "bun:test";
+import { eq } from "drizzle-orm";
 import { createBus, persistToStore } from "../src/bus/index.ts";
 import { openStore, tables } from "../src/store/index.ts";
 import { ulid, encodeStamp } from "../src/id/index.ts";
@@ -317,6 +318,103 @@ describe("memory projector", () => {
     });
     const reads = r.store.raw.query("SELECT * FROM memory_reads WHERE memory_id = ?").all(id);
     expect(reads.length).toBe(1);
+    proj.stop();
+  });
+
+  it("role=display-name memory caches body into agents.display_name", () => {
+    const r = rig();
+    // Need an agents row for the cache update to land. The rig only
+    // installs a host; spawn a minimal agent here.
+    const agentId = ulid();
+    r.store
+      .insert(tables.agents)
+      .values({
+        id: agentId,
+        name: "scout-7",
+        hostId: r.hostId,
+        scope: {},
+        createdAt: Date.now(),
+      })
+      .run();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    r.bus.publish({
+      type: MEMORY_WROTE,
+      hostId: r.hostId,
+      actorId: agentId,
+      durable: true,
+      payload: {
+        id: ulid(),
+        actorId: agentId,
+        scope: "private",
+        scopeRef: agentId,
+        role: "display-name",
+        title: "what I call myself",
+        // Includes a control char + extra whitespace that the
+        // sanitiser should strip.
+        bodyMd: "  Aria\tof  the\nGreenhouse  ",
+        tags: [],
+        depth: 1,
+      },
+    });
+    const a = r.store.select().from(tables.agents).where(eq(tables.agents.id, agentId)).all()[0];
+    expect(a?.displayName).toBe("Aria of the Greenhouse");
+    proj.stop();
+  });
+
+  it("a fresh display-name memory replaces the previous one in the cache", async () => {
+    const r = rig();
+    const agentId = ulid();
+    r.store
+      .insert(tables.agents)
+      .values({
+        id: agentId,
+        name: "scout-7",
+        hostId: r.hostId,
+        scope: {},
+        createdAt: Date.now(),
+      })
+      .run();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    r.bus.publish({
+      type: MEMORY_WROTE,
+      hostId: r.hostId,
+      actorId: agentId,
+      durable: true,
+      payload: {
+        id: ulid(),
+        actorId: agentId,
+        scope: "private",
+        scopeRef: agentId,
+        role: "display-name",
+        title: "first",
+        bodyMd: "Aria",
+        tags: [],
+        depth: 1,
+      },
+    });
+    // updatedAt is set from event.createdAt; force a strictly-greater
+    // wall clock tick so the second row sorts after the first under
+    // ORDER BY updated_at DESC.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    r.bus.publish({
+      type: MEMORY_WROTE,
+      hostId: r.hostId,
+      actorId: agentId,
+      durable: true,
+      payload: {
+        id: ulid(),
+        actorId: agentId,
+        scope: "private",
+        scopeRef: agentId,
+        role: "display-name",
+        title: "renamed",
+        bodyMd: "Briar",
+        tags: [],
+        depth: 1,
+      },
+    });
+    const a = r.store.select().from(tables.agents).where(eq(tables.agents.id, agentId)).all()[0];
+    expect(a?.displayName).toBe("Briar");
     proj.stop();
   });
 });

@@ -38,6 +38,11 @@ export const agents = sqliteTable(
   {
     id: text("id").primaryKey(),
     name: text("name").notNull(),
+    /** Self-chosen handle the agent uses when introducing itself; nullable
+     *  cache of the most recent `role=display-name` memory body, kept
+     *  current by the memory projector. CLI/event renders that want a
+     *  social label fall back to `name` when this is null. */
+    displayName: text("display_name"),
     hostId: text("host_id")
       .notNull()
       .references(() => hosts.id),

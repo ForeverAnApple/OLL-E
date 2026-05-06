@@ -180,7 +180,7 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
     // turn alone (LOG 2026-04-28).
     alwaysLoaded: true,
     description:
-      "Write or update a memory. Memory is your persistent self across time — preferences, principles, goals, skills, knowledge. Role tags the posture: `principle` memories are your strict commitments (they're injected into every turn and passed to any child you spawn), `goal` is an in-flight intention, `skill`/`knowledge` is how-you-do-things. Default depth weights the belief under the resistance model: principles default to 10 (strict), other roles to 1 (lived). Scope: `private` (yours only) / `team` (shared with a team) / `scratch` (task-ephemeral). Pass `updates: <id>` to edit an existing memory you own.",
+      "Write or update a memory. Memory is your persistent self across time — preferences, principles, goals, skills, knowledge. Role tags the posture: `principle` memories are your strict commitments (they're injected into every turn and passed to any child you spawn), `goal` is an in-flight intention, `skill`/`knowledge` is how-you-do-things, `display-name` is the handle you'd like to be called by (the body becomes your social label in chat headers and event renders — sanitised to a single line, capped at 30 chars). Default depth weights the belief under the resistance model: principles default to 10 (strict), other roles to 1 (lived). Scope: `private` (yours only) / `team` (shared with a team) / `scratch` (task-ephemeral). Pass `updates: <id>` to edit an existing memory you own.",
     inputSchema: {
       type: "object",
       properties: {

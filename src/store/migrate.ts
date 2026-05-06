@@ -8,6 +8,7 @@ import type { Database } from "bun:sqlite";
 // 2026-04-28: 0001-0008 collapsed into a single `0001_init.sql` (LOG entry
 // for that date). Pre-v1 had no installed-user upgrade path to preserve.
 import migration0001 from "./migrations/0001_init.sql" with { type: "text" };
+import migration0002 from "./migrations/0002_agent_display_name.sql" with { type: "text" };
 
 export interface MigrationFile {
   readonly index: number;
@@ -17,6 +18,7 @@ export interface MigrationFile {
 
 const MIGRATIONS: readonly MigrationFile[] = [
   { index: 1, name: "init", sql: migration0001 },
+  { index: 2, name: "agent_display_name", sql: migration0002 },
 ];
 
 export function listMigrations(): readonly MigrationFile[] {

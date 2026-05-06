@@ -20,7 +20,7 @@
 // per host. When cross-host mesh lands we need a tombstone records table
 // or equivalent. See LOG entry on memory surface for the full trade.
 
-import { eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import type { EventBus } from "../bus/index.ts";
 import type { Event, Unsubscribe } from "../bus/types.ts";
 import type { Store } from "../store/db.ts";
@@ -98,6 +98,7 @@ export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
           updatedAt: now,
         })
         .run();
+      maybeRefreshDisplayName(p.actorId, role);
       return;
     }
     // LWW by HLC (strings are lex-sortable by encodeStamp design).
@@ -120,19 +121,66 @@ export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
       })
       .where(eq(tables.memories.id, p.id))
       .run();
+    maybeRefreshDisplayName(p.actorId, role);
+  }
+
+  /** Side-effect cache: when an agent writes a `role=display-name` memory
+   *  the agent's row gets its `display_name` column updated to the
+   *  freshest such body. Memory is the source of truth (federation
+   *  syncs events, peers reproject locally); the column is just a fast
+   *  read path the CLI / event renderers use without paying a memory
+   *  query per render.
+   *
+   *  We always re-derive from the latest `role=display-name` row owned
+   *  by this actor rather than copying the just-projected body — this
+   *  way an out-of-order LWW update (older HLC arrives later, gets
+   *  rejected above) doesn't poison the cache, and a `memory_forget`
+   *  on the active row falls back to whatever's still on disk for
+   *  that role. The body is sanitised at read time too (one-line
+   *  label, no control bytes, capped length).
+   */
+  function maybeRefreshDisplayName(actorId: string, role: string): void {
+    if (role !== "display-name") return;
+    const latest = store
+      .select({ bodyMd: tables.memories.bodyMd })
+      .from(tables.memories)
+      .where(
+        and(
+          eq(tables.memories.actorId, actorId),
+          eq(tables.memories.role, "display-name"),
+        ),
+      )
+      .orderBy(desc(tables.memories.updatedAt))
+      .limit(1)
+      .all()[0];
+    const sanitized = latest ? sanitizeDisplayName(latest.bodyMd) : null;
+    store
+      .update(tables.agents)
+      .set({ displayName: sanitized })
+      .where(eq(tables.agents.id, actorId))
+      .run();
   }
 
   function applyForgotten(event: Event<MemoryForgottenPayload>): void {
     const p = event.payload;
     if (!p || typeof p.id !== "string") return;
     const existing = store
-      .select({ hlc: tables.memories.hlc })
+      .select({
+        hlc: tables.memories.hlc,
+        actorId: tables.memories.actorId,
+        role: tables.memories.role,
+      })
       .from(tables.memories)
       .where(eq(tables.memories.id, p.id))
       .all()[0];
     if (!existing) return;
     if (event.hlc <= existing.hlc) return;
     store.delete(tables.memories).where(eq(tables.memories.id, p.id)).run();
+    // If the forgotten memory was the display-name source, recompute
+    // the cache against whatever's still on disk for the actor.
+    if (existing.role === "display-name") {
+      maybeRefreshDisplayName(existing.actorId, "display-name");
+    }
   }
 
   function applyRead(event: Event<MemoryReadPayload>): void {
@@ -156,4 +204,23 @@ export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
       for (const u of subs) u();
     },
   };
+}
+
+/** Coerce a `role=display-name` memory body into a renderable single-line
+ *  handle. Strips control characters, collapses internal whitespace,
+ *  trims, and caps at 30 visible characters — long enough for "Aria of
+ *  the Greenhouse" but short enough to fit in a CLI header column. An
+ *  empty result returns null so the cache reflects "no display name."
+ */
+const DISPLAY_NAME_MAX = 30;
+function sanitizeDisplayName(body: string): string | null {
+  if (typeof body !== "string") return null;
+  // Strip C0/C1 controls + DEL. Keep regular printable Unicode.
+  // eslint-disable-next-line no-control-regex
+  const stripped = body.replace(/[\x00-\x1F\x7F-\x9F]/g, " ");
+  const collapsed = stripped.replace(/\s+/g, " ").trim();
+  if (collapsed.length === 0) return null;
+  return collapsed.length > DISPLAY_NAME_MAX
+    ? collapsed.slice(0, DISPLAY_NAME_MAX)
+    : collapsed;
 }

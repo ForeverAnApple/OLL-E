@@ -37,7 +37,11 @@ export function enrichDecisions(store: Store, ds: Decision[]): EnrichedDecision[
   const agentIds = Array.from(new Set(ds.map((d) => d.proposingAgentId)));
   const principalIds = Array.from(new Set(ds.map((d) => d.principalId)));
   const agentRows = store
-    .select({ id: tables.agents.id, name: tables.agents.name })
+    .select({
+      id: tables.agents.id,
+      name: tables.agents.name,
+      displayName: tables.agents.displayName,
+    })
     .from(tables.agents)
     .where(inArray(tables.agents.id, agentIds))
     .all();
@@ -46,7 +50,11 @@ export function enrichDecisions(store: Store, ds: Decision[]): EnrichedDecision[
     .from(tables.principals)
     .where(inArray(tables.principals.id, principalIds))
     .all();
-  const agentMap = new Map(agentRows.map((r) => [r.id, r.name]));
+  // Self-chosen handle wins when present — that's the social label the
+  // agent actually goes by; falls back to the formal `agents.name`.
+  const agentMap = new Map(
+    agentRows.map((r) => [r.id, r.displayName?.trim() || r.name] as const),
+  );
   const principalMap = new Map(principalRows.map((r) => [r.id, r.display]));
   return ds.map((d) => ({
     ...d,
@@ -65,7 +73,11 @@ export function enrichDecisionMessages<T extends DecisionMessage>(
   if (msgs.length === 0) return [];
   const ids = Array.from(new Set(msgs.map((m) => m.actorId)));
   const agentRows = store
-    .select({ id: tables.agents.id, name: tables.agents.name })
+    .select({
+      id: tables.agents.id,
+      name: tables.agents.name,
+      displayName: tables.agents.displayName,
+    })
     .from(tables.agents)
     .where(inArray(tables.agents.id, ids))
     .all();
@@ -78,6 +90,7 @@ export function enrichDecisionMessages<T extends DecisionMessage>(
   for (const p of principalRows) nameMap.set(p.id, p.display);
   // Agent name wins on conflict — agents are the more common authors and
   // `principals` is collapsing into `agents` long-term anyway (LOG 2026-04-23).
-  for (const a of agentRows) nameMap.set(a.id, a.name);
+  // Within agents, self-chosen handle wins over formal name.
+  for (const a of agentRows) nameMap.set(a.id, a.displayName?.trim() || a.name);
   return msgs.map((m) => ({ ...m, actorName: nameMap.get(m.actorId) ?? m.actorId }));
 }

@@ -404,10 +404,15 @@ async function cmdChat(): Promise<void> {
   }
   // Resolve the agent's actual name so the banner says "olle" or whatever
   // the principal named their agent — the ULID id is for logs, not eyes.
+  // Self-chosen `displayName` wins when set (the social handle the agent
+  // picked for itself via a `role=display-name` memory); otherwise the
+  // formal `agents.name` set at spawn. Both fall back to "agent" so a
+  // missing-row case still produces a render.
   const self = await current
     .call<AgentSelf | null>("observability.self", { agentId: rootAgentId })
     .catch(() => null);
-  const agentName = self?.name?.trim() || "agent";
+  const agentName =
+    self?.displayName?.trim() || self?.name?.trim() || "agent";
   // Inbox count is the channel-of-first-contact's nudge: if proposals are
   // waiting, surface them before the user types anything. Failing this
   // call shouldn't block chat — older daemons don't expose inbox.count.
@@ -1832,6 +1837,7 @@ async function cmdInspect(args: string[]): Promise<void> {
     }
     console.log(`id:     ${self.agentId}`);
     console.log(`name:   ${self.name}`);
+    if (self.displayName) console.log(`called: ${self.displayName}`);
     console.log(`host:   ${self.hostId}`);
     console.log(`parent: ${self.parentAgentId ?? "(none)"}`);
     console.log(`principles: ${self.principleCount}`);
