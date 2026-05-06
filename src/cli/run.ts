@@ -31,7 +31,7 @@ export async function runCli(args: string[]): Promise<void> {
       await cmdRun();
       return;
     case "status":
-      await cmdStatus();
+      await cmdStatus(rest);
       return;
     case "daemon":
       await cmdDaemon(rest);
@@ -99,13 +99,213 @@ async function cmdRun(): Promise<void> {
   await new Promise<void>(() => {});
 }
 
-async function cmdStatus(): Promise<void> {
+async function cmdStatus(args: string[]): Promise<void> {
+  // Dashboard: composes the same observability/inbox/extension IPC calls
+  // an agent reaches through its tool surface — no privileged human read
+  // path (AGENTS.md vision-check). Default window is 24h; --since lets a
+  // human ask the same question over a different slice.
+  const sinceArg = parseFlagValue(args, "--since");
+  const sinceMs = sinceArg ? parseSinceArg(sinceArg) : Date.now() - 24 * 3_600_000;
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
-    const value = await client.call<{ hostId: string; pid: number; uptimeMs: number }>("status");
-    console.log(
-      `host: ${value.hostId}\npid:  ${value.pid}\nup:   ${Math.round(value.uptimeMs / 1000)}s`,
-    );
+    // All independent reads in flight at once. Each tolerates failure so
+    // an older daemon (or one mid-startup) still produces a partial view
+    // rather than crashing the dashboard.
+    const [host, chat, rootAgent, exts, usage, runs, threads, inbox] =
+      await Promise.all([
+        client
+          .call<{ hostId: string; pid: number; uptimeMs: number }>("status")
+          .catch(() => null),
+        client
+          .call<{ enabled: boolean; reason: string | null }>("status.chat")
+          .catch(() => null),
+        client
+          .call<{ rootAgentId: string }>("status.rootAgent")
+          .catch(() => null),
+        client
+          .call<
+            Array<{
+              name: string;
+              status: "registered" | "unregistered" | "broken";
+              error?: string;
+            }>
+          >("extensions.list")
+          .catch(() => [] as Array<{ name: string; status: string; error?: string }>),
+        client
+          .call<UsageStats>("observability.usage", { since: sinceMs })
+          .catch(() => null),
+        client
+          .call<RunHistoryRow[]>("observability.runs", { since: sinceMs, limit: 200 })
+          .catch(() => [] as RunHistoryRow[]),
+        client
+          .call<ThreadInventoryRow[]>("observability.threads", { limit: 10 })
+          .catch(() => [] as ThreadInventoryRow[]),
+        client
+          .call<InboxRow[]>("inbox.list")
+          .catch(() => [] as InboxRow[]),
+      ]);
+
+    const self = rootAgent
+      ? await client
+          .call<AgentSelf | null>("observability.self", { agentId: rootAgent.rootAgentId })
+          .catch(() => null)
+      : null;
+
+    const sinceLabel = fmtAge(Date.now() - sinceMs);
+    const heading = (s: string) => color(ANSI.accent, s);
+    const label = (s: string) => color(ANSI.muted, s);
+    const ok = (s: string) => color(ANSI.success, s);
+    const warn = (s: string) => color(ANSI.warning, s);
+    const err = (s: string) => color(ANSI.error, s);
+
+    // ─── daemon ────────────────────────────────────────────────────────
+    console.log(heading("daemon"));
+    if (host) {
+      console.log(`  ${label("host")}    ${host.hostId}`);
+      console.log(`  ${label("pid")}     ${host.pid}`);
+      console.log(`  ${label("uptime")}  ${fmtAge(host.uptimeMs)}`);
+    } else {
+      console.log(`  ${err("daemon unreachable")}`);
+    }
+    if (chat) {
+      const chatLabel = chat.enabled
+        ? ok("enabled")
+        : `${err("disabled")}${chat.reason ? ` (${chat.reason})` : ""}`;
+      console.log(`  ${label("chat")}    ${chatLabel}`);
+    }
+    if (self) {
+      const named = self.displayName ? ` / ${self.displayName}` : "";
+      console.log(`  ${label("agent")}   ${self.name}${named}  ${color(ANSI.muted, self.agentId)}`);
+      // `tools` here is extension-registered tools only — core tools live in
+      // memory and aren't in the agents row. Label it explicitly so the
+      // count isn't read as "the agent has only N tools available".
+      const principles = `${self.principleCount} ${self.principleCount === 1 ? "principle" : "principles"}`;
+      const tools = `${self.tools.length} ext ${self.tools.length === 1 ? "tool" : "tools"}`;
+      console.log(`  ${label("        ")}${principles}  ${tools}`);
+    }
+
+    // ─── inbox ─────────────────────────────────────────────────────────
+    const open = inbox.filter((d) => d.status === "open").length;
+    const unreadReplies = inbox.reduce((n, d) => n + (d.unreadReplyCount ?? 0), 0);
+    const now = Date.now();
+    const stale = inbox.filter(
+      (d) => d.status === "open" && d.staleness != null && d.staleness < now,
+    ).length;
+    console.log("");
+    console.log(heading("inbox"));
+    if (inbox.length === 0) {
+      console.log(`  ${label("(empty)")}`);
+    } else {
+      const openTxt = open > 0 ? warn(`${open}`) : `${open}`;
+      console.log(`  ${label("open")}        ${openTxt} actionable`);
+      if (unreadReplies > 0) {
+        console.log(`  ${label("replies")}     ${warn(`${unreadReplies}`)} unread`);
+      }
+      if (stale > 0) {
+        console.log(`  ${label("stale")}       ${err(`${stale}`)} past deadline`);
+      }
+      // Show the top 3 actionable items as a peek.
+      const actionable = inbox
+        .filter((d) => d.status === "open" || (d.unreadReplyCount ?? 0) > 0)
+        .slice(0, 3);
+      if (actionable.length > 0) {
+        console.log(`  ${label("recent:")}`);
+        for (const d of actionable) {
+          const age = fmtAge(now - d.createdAt);
+          const summary = d.summary.length > 60 ? `${d.summary.slice(0, 57)}...` : d.summary;
+          console.log(
+            `    ${color(ANSI.muted, d.id.slice(0, 10))}  ${d.tier.padEnd(10)}  ${summary}  ${color(ANSI.muted, age)}`,
+          );
+        }
+      }
+    }
+
+    // ─── usage ─────────────────────────────────────────────────────────
+    console.log("");
+    console.log(`${heading("usage")}  ${color(ANSI.muted, `(last ${sinceLabel})`)}`);
+    if (!usage || usage.rows === 0) {
+      console.log(`  ${label("(no ledger activity)")}`);
+    } else {
+      const t = usage.totals;
+      const calls = usage.byModel.reduce((n, m) => n + m.calls, 0);
+      console.log(
+        `  ${label("tokens")}      in=${formatTokens(t.inputTokens)} out=${formatTokens(t.outputTokens)} cache_r=${formatTokens(t.cacheReadTokens)} cache_w=${formatTokens(t.cacheCreationTokens)}`,
+      );
+      const callsTxt = `${calls} ${calls === 1 ? "call" : "calls"}`;
+      console.log(
+        `  ${label("cost")}        ${fmtUsd(t.usdMicros)}  ${color(ANSI.muted, `(${callsTxt}, cache hit ${fmtPct(t.cacheHitRatio)})`)}`,
+      );
+      if (usage.byModel.length > 0) {
+        const top = usage.byModel[0]!;
+        const tag = top.pricePosted ? "" : color(ANSI.warning, " (fallback price)");
+        const topCalls = `${top.calls} ${top.calls === 1 ? "call" : "calls"}`;
+        console.log(
+          `  ${label("top model")}   ${top.provider}/${top.model}  ${fmtUsd(top.usdMicros)}  ${color(ANSI.muted, `(${topCalls})`)}${tag}`,
+        );
+      }
+    }
+
+    // ─── runs ──────────────────────────────────────────────────────────
+    console.log("");
+    console.log(`${heading("runs")}  ${color(ANSI.muted, `(last ${sinceLabel})`)}`);
+    if (runs.length === 0) {
+      console.log(`  ${label("(no task runs)")}`);
+    } else {
+      const counts: Record<string, number> = {};
+      for (const r of runs) counts[r.status] = (counts[r.status] ?? 0) + 1;
+      const succeeded = counts.succeeded ?? 0;
+      const failed = counts.failed ?? 0;
+      const running = counts.running ?? 0;
+      const lost = counts.lost ?? 0;
+      const queued = counts.queued ?? 0;
+      const parts: string[] = [];
+      parts.push(`${ok(`✓${succeeded}`)}`);
+      if (failed > 0) parts.push(err(`✗${failed}`));
+      if (running > 0) parts.push(color(ANSI.info, `⏵${running}`));
+      if (queued > 0) parts.push(color(ANSI.muted, `⏸${queued}`));
+      if (lost > 0) parts.push(warn(`?${lost}`));
+      console.log(`  ${parts.join("  ")}  ${color(ANSI.muted, `(${runs.length} total)`)}`);
+    }
+
+    // ─── threads ───────────────────────────────────────────────────────
+    console.log("");
+    console.log(heading("threads"));
+    if (threads.length === 0) {
+      console.log(`  ${label("(no threads)")}`);
+    } else {
+      const oneHourAgo = now - 3_600_000;
+      const recentlyActive = threads.filter((t) => t.lastEventAt >= oneHourAgo).length;
+      console.log(
+        `  ${label("active")}      ${recentlyActive} ${color(ANSI.muted, `in last hour (of ${threads.length} recent)`)}`,
+      );
+      for (const t of threads.slice(0, 5)) {
+        const age = fmtAge(now - t.lastEventAt);
+        const tid = t.threadId.length > 22 ? `${t.threadId.slice(0, 19)}...` : t.threadId;
+        console.log(
+          `    ${color(ANSI.muted, tid.padEnd(22))} ${t.lastType.padEnd(20)} ${color(ANSI.muted, `${t.events} ev`)}  ${color(ANSI.muted, age)}`,
+        );
+      }
+    }
+
+    // ─── extensions ────────────────────────────────────────────────────
+    console.log("");
+    console.log(heading("extensions"));
+    if (exts.length === 0) {
+      console.log(`  ${label("(none on disk)")}`);
+    } else {
+      const registered = exts.filter((e) => e.status === "registered").length;
+      const broken = exts.filter((e) => e.status === "broken");
+      const unregistered = exts.filter((e) => e.status === "unregistered").length;
+      const parts: string[] = [];
+      parts.push(`${ok(`${registered}`)} registered`);
+      if (broken.length > 0) parts.push(`${err(`${broken.length}`)} broken`);
+      if (unregistered > 0) parts.push(`${warn(`${unregistered}`)} unregistered`);
+      console.log(`  ${parts.join("  ")}`);
+      for (const b of broken) {
+        const why = b.error ? `  ${color(ANSI.muted, b.error)}` : "";
+        console.log(`    ${err("✗")} ${b.name}${why}`);
+      }
+    }
   });
 }
 
@@ -2243,7 +2443,7 @@ function printHelp(): void {
       "",
       "Commands:",
       "  run                         start foreground daemon",
-      "  status                      show daemon status",
+      "  status [--since 24h]        dashboard: daemon, agent, inbox, usage, runs, extensions",
       "  daemon restart              SIGTERM the daemon and wait for the supervisor to bring it back",
       "  chat                        REPL connected to the default agent",
       "  tail [type]                 stream events (default: all)",
