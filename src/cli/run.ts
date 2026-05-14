@@ -620,7 +620,11 @@ async function cmdChat(): Promise<void> {
     .call<{ open: number }>("inbox.count")
     .then((r) => r.open)
     .catch(() => 0);
-  const threadId = `cli:${Math.random().toString(36).slice(2, 10)}`;
+  const mintThreadId = () => `cli:${Math.random().toString(36).slice(2, 10)}`;
+  // `let` because /clear and /new rotate the threadId mid-session to
+  // reset conversation context. Every closure below reads it lazily so
+  // the rotated value is picked up on the next publish/cancel/filter.
+  let threadId = mintThreadId();
 
   const ui = createChatUI({ agentId: rootAgentId, agentName, threadId, inboxOpen });
   ui.banner();
@@ -645,7 +649,8 @@ async function cmdChat(): Promise<void> {
   // commands are not v0 — those would be tools, not chat shortcuts.
   const slashCommands: Array<{ name: string; description: string }> = [
     { name: "/help", description: "show available commands" },
-    { name: "/clear", description: "clear scrollback" },
+    { name: "/clear", description: "clear scrollback and start a fresh thread" },
+    { name: "/new", description: "alias of /clear — fresh thread, fresh scrollback" },
     { name: "/cancel", description: "cancel the current agent turn" },
     { name: "/exit", description: "exit chat" },
     { name: "/quit", description: "exit chat" },
@@ -760,7 +765,23 @@ async function cmdChat(): Promise<void> {
         return;
       }
       if (slash.name === "/help") ui.printSlashHelp(slashCommands);
-      else if (slash.name === "/clear") ui.clearScrollback();
+      else if (slash.name === "/clear" || slash.name === "/new") {
+        // Cancel any in-flight turn first — the user is wiping
+        // context, no reason to leave a doomed turn running on the
+        // daemon. Subsequent chat.* events on the old threadId get
+        // filtered out by the tail loop because threadId has rotated.
+        if (turnBusy) {
+          try { await current.call("chat.cancel", { threadId }); } catch { /* daemon may already be unreachable */ }
+          turnBusy = false;
+        }
+        ui.clearScrollback();
+        threadId = mintThreadId();
+        // Tool-result ids are per-tool-use and thus per-turn; rotating
+        // the thread guarantees no collision, but reset anyway so the
+        // set doesn't grow unbounded across many /clears.
+        renderedToolResults.clear();
+        ui.note(`context cleared — new thread ${threadId}`);
+      }
       else if (slash.name === "/cancel") {
         if (turnBusy) await cancelTurn();
         else ui.note("no agent turn in progress");
