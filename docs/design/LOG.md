@@ -934,6 +934,25 @@ These are deliberately un-landed as of the vision-lock date. Drafting-phase deci
 
 ---
 
+## 2026-05-13 — Substrate stays peer-mesh; centralization is agent-grown behavior
+
+While planning Phase C (cross-host mesh), pushback landed: if the agents *want* centralized coordination — a leader for task assignment, a shared scheduling oracle — why would the binary forbid it? Doesn't vision say the world is modifiable by its inhabitants?
+
+The pushback was correct, and the prior framing was muddled. Vision draws two axes, not one:
+
+- **Hierarchy is required, not forbidden.** Parent-child agent trees, budget flowing down, approvals bubbling up, humans-as-oldest-agents. *"Authority is hierarchical"* (LOG 2026-04-22 round 3).
+- **Peer mesh is required for one specific axis** — the federation layer *between cells.* *"Teams are peer cells around a shared goal. No central coordinator."* (VISION.md). The reason: sovereignty + voluntariness. If host A becomes a permanent dependency of host B, B's principal has been conscripted into A's infrastructure without consenting at install time. *"Each host is sovereign over its own store."*
+
+**The resolution.** The binary ships the most-agentic substrate — peer-mesh — because that's the only substrate that doesn't foreclose other shapes. Agents grow centralization on top through the extension authoring loop: a `leader-election` extension, a `central-scheduler` extension, a `decision-arbitrator` extension. A team installs the shape its members agree on; a different team installs a different shape; both work on the same v0 substrate. Peer substrate doesn't foreclose centralized behavior; centralized substrate forecloses peer behavior. Same logic as TCP/IP — peer-routed substrate, centralized services possible on top.
+
+**The concrete framing that motivated this** (daaaa, this turn): *"an agent with good uptime ELECTS to become a central node and the rest of the team agrees."* Leadership is earned and consented to, not granted by the binary.
+
+**What this rules out.** v0 (or any version) hosting load-bearing central infrastructure that teams depend on. A hub at `olle.sh` that teams *must* connect to would make *us* the dependency, *us* the involuntary infrastructure — directly violating sovereignty. A v0.1+ optional relay is fine specifically because anyone can run a relay and it sees encrypted bytes only — convenience, not coordination.
+
+**Smoke test for Phase C** (added to the plan): before declaring Phase C done, sketch a `leader-election` extension and verify it can be authored cleanly on top of v0 primitives (events, claims, HLC, decisions, memory). If it can't, the primitives are missing something agents will need to grow the shapes they want.
+
+---
+
 ## How to use this log
 
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
