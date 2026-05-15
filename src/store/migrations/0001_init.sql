@@ -17,13 +17,6 @@ CREATE TABLE hosts (
   config_ref  TEXT
 );
 
-CREATE TABLE principals (
-  id          TEXT PRIMARY KEY,
-  display     TEXT NOT NULL,
-  channels    TEXT NOT NULL DEFAULT '[]',
-  created_at  INTEGER NOT NULL
-);
-
 CREATE TABLE agents (
   id                TEXT PRIMARY KEY,
   name              TEXT NOT NULL,
@@ -32,10 +25,13 @@ CREATE TABLE agents (
   system_prompt     TEXT,
   budget_ref        TEXT,
   scope             TEXT NOT NULL DEFAULT '{}',
+  channels          TEXT NOT NULL DEFAULT '[]',
+  owns_money        INTEGER NOT NULL DEFAULT 0,
   created_at        INTEGER NOT NULL
 );
 CREATE INDEX agents_name ON agents(name);
 CREATE INDEX agents_parent ON agents(parent_agent_id);
+CREATE INDEX agents_owns_money ON agents(owns_money);
 
 CREATE TABLE teams (
   id           TEXT PRIMARY KEY,
@@ -172,7 +168,7 @@ CREATE INDEX tool_calls_task ON tool_calls(task_id);
 
 CREATE TABLE decisions (
   id                  TEXT PRIMARY KEY,
-  principal_id        TEXT NOT NULL REFERENCES principals(id),
+  owner_agent_id      TEXT NOT NULL REFERENCES agents(id),
   proposing_agent_id  TEXT NOT NULL REFERENCES agents(id),
   tier                TEXT NOT NULL,
   summary             TEXT NOT NULL,
@@ -184,7 +180,7 @@ CREATE TABLE decisions (
   resolved_at         INTEGER
 );
 CREATE INDEX decisions_status    ON decisions(status);
-CREATE INDEX decisions_principal ON decisions(principal_id);
+CREATE INDEX decisions_owner     ON decisions(owner_agent_id);
 
 CREATE TABLE approvals (
   decision_id  TEXT NOT NULL REFERENCES decisions(id),
@@ -222,17 +218,18 @@ CREATE INDEX decision_message_reads_reader ON decision_message_reads(reader_acto
 -- budgets.spent_usd at decrement time, never into ledger rows.
 
 CREATE TABLE budgets (
-  id            TEXT PRIMARY KEY,
-  principal_id  TEXT NOT NULL REFERENCES principals(id),
-  agent_id      TEXT REFERENCES agents(id),
-  period        TEXT NOT NULL,
-  cap_tokens    INTEGER,
-  cap_usd       INTEGER,
-  spent_tokens  INTEGER NOT NULL DEFAULT 0,
-  spent_usd     INTEGER NOT NULL DEFAULT 0,
-  updated_at    INTEGER NOT NULL
+  id              TEXT PRIMARY KEY,
+  owner_agent_id  TEXT NOT NULL REFERENCES agents(id),
+  agent_id        TEXT REFERENCES agents(id),
+  period          TEXT NOT NULL,
+  cap_tokens      INTEGER,
+  cap_usd         INTEGER,
+  spent_tokens    INTEGER NOT NULL DEFAULT 0,
+  spent_usd       INTEGER NOT NULL DEFAULT 0,
+  updated_at      INTEGER NOT NULL
 );
 CREATE INDEX budgets_agent_period ON budgets(agent_id, period);
+CREATE INDEX budgets_owner        ON budgets(owner_agent_id, period);
 
 CREATE TABLE ledger (
   id                     TEXT PRIMARY KEY,
