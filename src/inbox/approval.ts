@@ -3,8 +3,9 @@
 // Walks the parent_agent_id chain from the proposing agent up. At each
 // level, if the agent has declared delegated_authority covering the tier
 // (and the action, by tag), it may auto-approve; otherwise it forwards
-// up. When we reach a root agent (no parent), we post to that root's
-// principal's decision inbox.
+// up. When we reach an agent with no parent (the human, by collapse —
+// LOG 2026-04-23), we post to that agent's decision inbox: one
+// recursion end-to-end, no terminal "now we hit a principal" branch.
 //
 // v0 simplification:
 //  - delegated_authority is read from agents.scope.allowTiers[]. If the
@@ -25,7 +26,7 @@ import type { Inbox, Proposal } from "./inbox.ts";
 
 export interface AskUpInput {
   proposingAgentId: string;
-  principalId: string;
+  ownerAgentId: string;
   tier: Tier;
   summary: string;
   payload: Record<string, unknown>;
@@ -56,6 +57,12 @@ export function askUp(opts: AskUpOptions, input: AskUpInput): AskUpResult {
   while (currentAgentId) {
     const a = fetchAgent(opts.store, currentAgentId);
     if (!a) break;
+    // owns_money agents are inbox endpoints, not delegates. Reaching one
+    // means the chain ran out of intermediate authority; queue to their
+    // inbox instead of treating their allowTiers as auto-approval scope.
+    // Their tiers list says "I am authorized to do this myself," not
+    // "I delegate this tier to descendants."
+    if (a.ownsMoney) break;
     const allowed: Tier[] = (a.scope as AgentScope).allowTiers ?? [];
     if (allowed.includes(input.tier)) {
       opts.bus.publish({
@@ -76,9 +83,10 @@ export function askUp(opts: AskUpOptions, input: AskUpInput): AskUpResult {
     currentAgentId = a.parentAgentId ?? null;
   }
 
-  // Reached a root agent without a hit. Post to principal's inbox.
+  // Reached the top of the chain without a delegation hit. Post to the
+  // owning agent's inbox (typically the human — owns_money=1, parent=null).
   const proposal: Proposal = {
-    principalId: input.principalId,
+    ownerAgentId: input.ownerAgentId,
     proposingAgentId: input.proposingAgentId,
     tier: input.tier,
     summary: input.summary,

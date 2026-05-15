@@ -62,8 +62,9 @@ export interface AgentLoopOptions {
   coreTools?: ToolDef[];
   /** Optional ledger for spend accounting. */
   ledger?: Ledger;
-  /** Principal id for budget enforcement + inbox routing on denied calls. */
-  principalId?: string;
+  /** Owner-agent id (typically the human) for budget enforcement and
+   *  inbox routing on denied calls. Post-LOG 2026-04-23 collapse. */
+  ownerAgentId?: string;
   /** Inbox used when a tool call is denied by scope — we auto-propose a
    *  grant_scope via askUp. */
   inbox?: Inbox;
@@ -482,9 +483,9 @@ async function runTurn(
             input: safeInput,
           },
         });
-        if (!opts.inbox || !opts.principalId) {
+        if (!opts.inbox || !opts.ownerAgentId) {
           // Misconfig: scope check denied a call but there's no inbox /
-          // principal wired, so the agent can't ask-up for a grant.
+          // owner-agent wired, so the agent can't ask-up for a grant.
           // Distinct event type so chat-health doesn't count it as a
           // chat outage and the CLI doesn't treat it as turn-terminal.
           opts.bus.publish({
@@ -496,12 +497,12 @@ async function runTurn(
             durable: true,
             payload: {
               error:
-                "tool denied and ask-up unavailable — no inbox/principal configured for this agent",
+                "tool denied and ask-up unavailable — no inbox/owner-agent configured for this agent",
               tool: tool.name,
               tier: tool.tier ?? "operational",
               reason,
               hasInbox: Boolean(opts.inbox),
-              hasPrincipal: Boolean(opts.principalId),
+              hasOwnerAgent: Boolean(opts.ownerAgentId),
             },
           });
           return;
@@ -527,7 +528,7 @@ async function runTurn(
           { bus: opts.bus, store: opts.store, hostId: opts.hostId, inbox: opts.inbox },
           {
             proposingAgentId: opts.agentId,
-            principalId: opts.principalId,
+            ownerAgentId: opts.ownerAgentId,
             tier: "strategic",
             summary: `grant ${agentLabel} permission to call ${tool.name}(${summarizeInputArgs(safeInput)})`,
             payload: {
@@ -554,7 +555,7 @@ async function runTurn(
       recorded = opts.ledger.record({
         actorId: opts.agentId,
         threadId: thread.id,
-        principalId: opts.principalId,
+        ownerAgentId: opts.ownerAgentId,
         provider: opts.llm.provider,
         model: opts.model ?? opts.llm.defaultModel,
         inputTokens: result.totalUsage.inputTokens,
@@ -639,13 +640,13 @@ async function runTurn(
 }
 
 function paidBudgetBlock(opts: AgentLoopOptions, threadId: string, origin: Event): boolean {
-  if (!opts.principalId) return false;
+  if (!opts.ownerAgentId) return false;
   const rows = opts.store
     .select()
     .from(tables.budgets)
     .where(
       and(
-        eq(tables.budgets.principalId, opts.principalId),
+        eq(tables.budgets.ownerAgentId, opts.ownerAgentId),
         eq(tables.budgets.agentId, opts.agentId),
       ),
     )
@@ -678,7 +679,7 @@ function paidBudgetBlock(opts: AgentLoopOptions, threadId: string, origin: Event
     threadId,
     durable: true,
     payload: {
-      principalId: opts.principalId,
+      ownerAgentId: opts.ownerAgentId,
       agentId: opts.agentId,
       period: blocked.period,
       capUsd: blocked.capUsd,
@@ -693,7 +694,7 @@ function paidBudgetBlock(opts: AgentLoopOptions, threadId: string, origin: Event
         { bus: opts.bus, store: opts.store, hostId: opts.hostId, inbox: opts.inbox },
         {
           proposingAgentId: opts.agentId,
-          principalId: opts.principalId,
+          ownerAgentId: opts.ownerAgentId,
           tier: "strategic",
           summary: `raise budget for agent ${opts.agentId}`,
           payload: {

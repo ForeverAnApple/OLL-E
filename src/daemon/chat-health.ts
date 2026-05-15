@@ -23,7 +23,7 @@ export interface ChatHealthOptions {
   bus: EventBus;
   inbox: Inbox;
   hostId: string;
-  principalId: string;
+  ownerAgentId: string;
   agentId: string;
   /** Failure count within the window that triggers a proposal. Default 2. */
   threshold?: number;
@@ -59,7 +59,7 @@ export function startChatHealthMonitor(opts: ChatHealthOptions): ChatHealthMonit
     const errPayload = ev.payload as { error?: string };
     try {
       opts.inbox.propose({
-        principalId: opts.principalId,
+        ownerAgentId: opts.ownerAgentId,
         // The chat agent observed itself failing. `decisions.proposing_agent_id`
         // is FK'd to `agents`, so we can't use hostId here even though
         // the watcher lives in daemon code.

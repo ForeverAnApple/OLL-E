@@ -9,19 +9,27 @@ function rig() {
   const store = openStore({ path: ":memory:" });
   const hostId = ulid();
   store.insert(tables.hosts).values({ id: hostId, hostname: "t", createdAt: Date.now() }).run();
-  const principalId = ulid();
+  const ownerAgentId = ulid();
   store
-    .insert(tables.principals)
-    .values({ id: principalId, display: "p", channels: [], createdAt: Date.now() })
+    .insert(tables.agents)
+    .values({
+      id: ownerAgentId,
+      name: "p",
+      hostId,
+      scope: { allowTiers: ["operational", "strategic", "vision"] },
+      channels: [],
+      ownsMoney: true,
+      createdAt: Date.now(),
+    })
     .run();
   const agentId = "root";
   store
     .insert(tables.agents)
-    .values({ id: agentId, name: "root", hostId, createdAt: Date.now() })
+    .values({ id: agentId, name: "root", hostId, parentAgentId: ownerAgentId, createdAt: Date.now() })
     .run();
   const bus = createBus({ hostId, persist: persistToStore(store) });
   const inbox = createInbox({ bus, store, hostId });
-  return { store, bus, hostId, principalId, agentId, inbox };
+  return { store, bus, hostId, ownerAgentId, agentId, inbox };
 }
 
 function chatError(r: ReturnType<typeof rig>, threadId: string, error: string) {
@@ -42,16 +50,16 @@ describe("daemon/chat-health", () => {
       bus: r.bus,
       inbox: r.inbox,
       hostId: r.hostId,
-      principalId: r.principalId,
+      ownerAgentId: r.ownerAgentId,
       agentId: r.agentId,
       threshold: 2,
     });
 
-    expect(r.inbox.listOpen(r.principalId)).toHaveLength(0);
+    expect(r.inbox.listOpen(r.ownerAgentId)).toHaveLength(0);
     chatError(r, "t1", "first");
-    expect(r.inbox.listOpen(r.principalId)).toHaveLength(0);
+    expect(r.inbox.listOpen(r.ownerAgentId)).toHaveLength(0);
     chatError(r, "t1", "second");
-    const open = r.inbox.listOpen(r.principalId);
+    const open = r.inbox.listOpen(r.ownerAgentId);
     expect(open).toHaveLength(1);
     const payload = open[0]!.payload as { kind: string; lastError: string };
     expect(payload.kind).toBe("chat-failure");
@@ -65,7 +73,7 @@ describe("daemon/chat-health", () => {
       bus: r.bus,
       inbox: r.inbox,
       hostId: r.hostId,
-      principalId: r.principalId,
+      ownerAgentId: r.ownerAgentId,
       agentId: r.agentId,
       threshold: 2,
     });
@@ -73,7 +81,7 @@ describe("daemon/chat-health", () => {
     chatError(r, "t1", "b");
     chatError(r, "t1", "c");
     chatError(r, "t1", "d");
-    expect(r.inbox.listOpen(r.principalId)).toHaveLength(1);
+    expect(r.inbox.listOpen(r.ownerAgentId)).toHaveLength(1);
     monitor.stop();
   });
 
@@ -83,13 +91,13 @@ describe("daemon/chat-health", () => {
       bus: r.bus,
       inbox: r.inbox,
       hostId: r.hostId,
-      principalId: r.principalId,
+      ownerAgentId: r.ownerAgentId,
       agentId: r.agentId,
       threshold: 2,
     });
     chatError(r, "t1", "a");
     chatError(r, "t1", "b");
-    expect(r.inbox.listOpen(r.principalId)).toHaveLength(1);
+    expect(r.inbox.listOpen(r.ownerAgentId)).toHaveLength(1);
 
     r.bus.publish({
       type: "chat.turn-end",
@@ -101,7 +109,7 @@ describe("daemon/chat-health", () => {
     });
     chatError(r, "t1", "c");
     chatError(r, "t1", "d");
-    expect(r.inbox.listOpen(r.principalId)).toHaveLength(2);
+    expect(r.inbox.listOpen(r.ownerAgentId)).toHaveLength(2);
     monitor.stop();
   });
 
@@ -111,7 +119,7 @@ describe("daemon/chat-health", () => {
       bus: r.bus,
       inbox: r.inbox,
       hostId: r.hostId,
-      principalId: r.principalId,
+      ownerAgentId: r.ownerAgentId,
       agentId: r.agentId,
       threshold: 2,
     });
@@ -125,7 +133,7 @@ describe("daemon/chat-health", () => {
         payload: { error: "n/a" },
       });
     }
-    expect(r.inbox.listOpen(r.principalId)).toHaveLength(0);
+    expect(r.inbox.listOpen(r.ownerAgentId)).toHaveLength(0);
     monitor.stop();
   });
 });

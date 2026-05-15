@@ -1,7 +1,11 @@
-// Decision inbox — per-principal queue of items requiring a human decision.
+// Decision inbox — per-owner-agent queue of items requiring a decision.
+// The owner is typically the human (an `owns_money` agent at the top of
+// the ask-up chain), but the surface is symmetric: any agent with an
+// inbox can be the recipient. LOG 2026-04-23 collapsed principals into
+// agents; "principal" survives as the `owns_money` property.
 //
-// Agents never block on the inbox; they propose() and continue. When a
-// principal responds via respond(), we emit decision.resolved events that
+// Agents never block on the inbox; they propose() and continue. When the
+// owner responds via respond(), we emit decision.resolved events that
 // the original task can match against to resume.
 //
 // Staleness: each proposal carries a wall-clock deadline. sweepStale()
@@ -25,7 +29,7 @@ export type UserVote = "approve" | "deny" | "modify";
 export type Vote = UserVote | "stale";
 
 export interface Proposal {
-  principalId: string;
+  ownerAgentId: string;
   proposingAgentId: string;
   tier: Tier;
   summary: string;
@@ -53,10 +57,10 @@ export interface ReplyInput {
 
 export interface Inbox {
   propose(p: Proposal): { id: string; deadlineAt?: number };
-  listOpen(principalId: string): Decision[];
+  listOpen(ownerAgentId: string): Decision[];
   /** All decisions for a principal, regardless of status, newest first.
    *  Backs `olle inbox --all` and audit reads. */
-  listAll(principalId: string, limit?: number): Decision[];
+  listAll(ownerAgentId: string, limit?: number): Decision[];
   /** Decisions proposed by this actor, newest first. Backs `mail_list`'s
    *  outgoing direction so a proposer can see "did my asks get answered?"
    *  Default skips resolved rows (status='open' only) so the agent's
@@ -71,7 +75,7 @@ export interface Inbox {
    *  this method also accounts for reader state so a resolved decision
    *  with a new "done — see commit X" reply still surfaces in the
    *  default view. */
-  listActionable(principalId: string, readerActorId: string, limit?: number): Decision[];
+  listActionable(ownerAgentId: string, readerActorId: string, limit?: number): Decision[];
   get(id: string): Decision | undefined;
   /** Resolve a full id or unique prefix to a Decision. Returns undefined
    *  when nothing matches; throws when the prefix is ambiguous. The CLI
@@ -121,7 +125,7 @@ export function createInbox(opts: InboxOptions): Inbox {
       .insert(tables.decisions)
       .values({
         id,
-        principalId: p.principalId,
+        ownerAgentId: p.ownerAgentId,
         proposingAgentId: p.proposingAgentId,
         tier: p.tier,
         summary: p.summary,
@@ -140,7 +144,7 @@ export function createInbox(opts: InboxOptions): Inbox {
       durable: true,
       payload: {
         decisionId: id,
-        principalId: p.principalId,
+        ownerAgentId: p.ownerAgentId,
         proposingAgentId: p.proposingAgentId,
         tier: p.tier,
         summary: p.summary,
@@ -151,28 +155,28 @@ export function createInbox(opts: InboxOptions): Inbox {
     return { id, deadlineAt };
   }
 
-  function listOpen(principalId: string): Decision[] {
+  function listOpen(ownerAgentId: string): Decision[] {
     return store
       .select()
       .from(tables.decisions)
       .where(
-        and(eq(tables.decisions.principalId, principalId), eq(tables.decisions.status, "open")),
+        and(eq(tables.decisions.ownerAgentId, ownerAgentId), eq(tables.decisions.status, "open")),
       )
       .all();
   }
 
-  function listAll(principalId: string, limit = 100): Decision[] {
+  function listAll(ownerAgentId: string, limit = 100): Decision[] {
     return store
       .select()
       .from(tables.decisions)
-      .where(eq(tables.decisions.principalId, principalId))
+      .where(eq(tables.decisions.ownerAgentId, ownerAgentId))
       .orderBy(desc(tables.decisions.createdAt))
       .limit(limit)
       .all();
   }
 
   function listActionable(
-    principalId: string,
+    ownerAgentId: string,
     readerActorId: string,
     limit = 100,
   ): Decision[] {
@@ -182,7 +186,7 @@ export function createInbox(opts: InboxOptions): Inbox {
     const rows = store
       .select()
       .from(tables.decisions)
-      .where(eq(tables.decisions.principalId, principalId))
+      .where(eq(tables.decisions.ownerAgentId, ownerAgentId))
       .orderBy(desc(tables.decisions.createdAt))
       .limit(limit)
       .all();
@@ -278,7 +282,7 @@ export function createInbox(opts: InboxOptions): Inbox {
       durable: true,
       payload: {
         decisionId: d.id,
-        principalId: d.principalId,
+        ownerAgentId: d.ownerAgentId,
         proposingAgentId: d.proposingAgentId,
         status: nextStatus,
         vote: input.vote,
@@ -315,7 +319,7 @@ export function createInbox(opts: InboxOptions): Inbox {
       payload: {
         decisionId: d.id,
         replyId: id,
-        principalId: d.principalId,
+        ownerAgentId: d.ownerAgentId,
         proposingAgentId: d.proposingAgentId,
         // Truncate in the event payload — full text lives in the row.
         // Bridges that want display content should query the row.
@@ -442,7 +446,7 @@ export function createInbox(opts: InboxOptions): Inbox {
         durable: true,
         payload: {
           decisionId: d.id,
-          principalId: d.principalId,
+          ownerAgentId: d.ownerAgentId,
           proposingAgentId: d.proposingAgentId,
           status: "stale",
           vote: "stale",

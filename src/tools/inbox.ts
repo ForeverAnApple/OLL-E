@@ -7,11 +7,10 @@
 // `mail_propose` is also deferred — agents reach for it only when they
 // intend to open an ask up the chain (LOG 2026-04-26).
 //
-// All three resolve the addressee to the host's single principal in v0
-// (LOG 2026-04-25). When the principals→agents collapse from 2026-04-23
-// lands, the lookup becomes "decisions addressed to me as agent" without
-// changing the surface. The CLI (`olle inbox`) reads the same Inbox and
-// returns the same rows — parallel-tool-surface rule.
+// All three resolve the addressee to the host's owner agent — the human
+// (an `owns_money` agent post-LOG 2026-04-23 collapse). The CLI (`olle
+// inbox`) reads the same Inbox and returns the same rows — parallel-
+// tool-surface rule.
 
 import type { ToolDef } from "../extensions/types.ts";
 import {
@@ -29,9 +28,10 @@ import type { Tier } from "../scheduler/index.ts";
 
 export interface InboxToolsOptions {
   inbox: Inbox;
-  /** The host's principal id. v0 is single-principal so every agent on
-   *  this host reads/responds against the same inbox. */
-  principalId: string;
+  /** The owner agent (human) whose inbox `mail_list direction:in` reads
+   *  from. v0 is single-human so every agent on this host shares one
+   *  inbox surface. */
+  ownerAgentId: string;
   /** Event bus — required for `mail_propose` to run askUp (emits
    *  decision.proposed / decision.auto-approved). Omit to skip
    *  registering `mail_propose`. */
@@ -39,9 +39,9 @@ export interface InboxToolsOptions {
   /** Host id, stamped on inbox events emitted by `mail_propose`. Same
    *  registration rule as `bus`. */
   hostId?: string;
-  /** Store handle for resolving agent/principal display names on read,
-   *  walking the ancestor chain for askUp, and writing decision rows.
-   *  Optional so existing tests that pass `{ inbox, principalId }` still
+  /** Store handle for resolving agent display names on read, walking
+   *  the ancestor chain for askUp, and writing decision rows. Optional
+   *  so existing tests that pass `{ inbox, ownerAgentId }` still
    *  compile; the agent surface degrades to raw ids when omitted, and
    *  `mail_propose` is omitted entirely (it requires the trio). */
   store?: Store;
@@ -50,7 +50,7 @@ export interface InboxToolsOptions {
 export type MailDirection = "in" | "out" | "both";
 
 export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
-  const { inbox, principalId, bus, hostId, store } = opts;
+  const { inbox, ownerAgentId, bus, hostId, store } = opts;
 
   const list: ToolDef<
     { direction?: MailDirection; includeResolved?: boolean; limit?: number },
@@ -60,9 +60,9 @@ export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
     tier: "operational",
     category: "mailbox",
     alwaysLoaded: true,
-    shortClause: "open decisions awaiting your principal's response",
+    shortClause: "open decisions awaiting the human's response",
     description:
-      "List decisions on the inbox. direction='in' (default) returns proposals addressed to your principal — what you would vote on. direction='out' returns proposals YOU made that haven't been resolved yet — use this between turns to check whether your asks got an answer. direction='both' returns the union, deduped by id. Default scope is open-only; pass includeResolved=true for audit / catching missed replies. Use this between strategic turns: a delayed reply may have landed since you last looked.",
+      "List decisions on the inbox. direction='in' (default) returns proposals addressed to the human (owner agent) — what you would vote on. direction='out' returns proposals YOU made that haven't been resolved yet — use this between turns to check whether your asks got an answer. direction='both' returns the union, deduped by id. Default scope is open-only; pass includeResolved=true for audit / catching missed replies. Use this between strategic turns: a delayed reply may have landed since you last looked.",
     inputSchema: {
       type: "object",
       properties: {
@@ -70,7 +70,7 @@ export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
           type: "string",
           enum: ["in", "out", "both"],
           description:
-            "'in' = decisions addressed to my principal (default); 'out' = decisions I proposed; 'both' = union deduped.",
+            "'in' = decisions addressed to the owner agent / human (default); 'out' = decisions I proposed; 'both' = union deduped.",
         },
         includeResolved: {
           type: "boolean",
@@ -86,14 +86,14 @@ export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
     execute: (args, ctx) => {
       const direction: MailDirection = args.direction ?? "in";
       const includeResolved = args.includeResolved ?? false;
-      // 'in' resolves against the host's single principal in v0; the
-      // tool's view of "my inbox" is whoever's inbox the daemon hooked
-      // this build to. Post-collapse this resolves to ctx.actorId.
+      // 'in' resolves against the host's owner agent (the human, post-
+      // LOG 2026-04-23 collapse). Single-human in v0, so the daemon
+      // wires every agent's mail_list against the same inbox surface.
       const incoming =
         direction === "in" || direction === "both"
           ? includeResolved
-            ? inbox.listAll(principalId, args.limit ?? 50)
-            : inbox.listOpen(principalId)
+            ? inbox.listAll(ownerAgentId, args.limit ?? 50)
+            : inbox.listOpen(ownerAgentId)
           : [];
       const outgoing =
         direction === "out" || direction === "both"
@@ -256,7 +256,7 @@ export function buildInboxTools(opts: InboxToolsOptions): ToolDef[] {
           { bus, store, hostId, inbox },
           {
             proposingAgentId: ctx.actorId,
-            principalId,
+            ownerAgentId,
             tier: args.tier ?? "strategic",
             summary: args.summary,
             payload: args.payload ?? {},

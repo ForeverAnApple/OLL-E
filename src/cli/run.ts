@@ -2174,10 +2174,10 @@ async function cmdInspect(args: string[]): Promise<void> {
 
 interface InboxRow {
   id: string;
-  principalId: string;
+  ownerAgentId: string;
   proposingAgentId: string;
   proposingAgentName?: string;
-  principalDisplay?: string;
+  ownerDisplay?: string;
   tier: string;
   summary: string;
   payload: Record<string, unknown>;
@@ -2383,9 +2383,9 @@ function renderInboxShow(r: InboxRowWithMessages): void {
   );
   kv(
     "to",
-    r.principalDisplay
-      ? `${r.principalDisplay} ${color(ANSI.dim, `(${r.principalId.slice(0, 10)})`)}`
-      : r.principalId,
+    r.ownerDisplay
+      ? `${r.ownerDisplay} ${color(ANSI.dim, `(${r.ownerAgentId.slice(0, 10)})`)}`
+      : r.ownerAgentId,
   );
   kv("age", fmtAge(now - r.createdAt));
   if (r.staleness != null) {

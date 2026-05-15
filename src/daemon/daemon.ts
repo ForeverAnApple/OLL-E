@@ -52,7 +52,7 @@ export interface Daemon {
   readonly scheduler: Scheduler;
   readonly inbox: Inbox;
   readonly rootAgentId: string;
-  readonly rootPrincipalId: string;
+  readonly humanAgentId: string;
   readonly chat?: AgentLoop;
   readonly chatAgentId?: string;
   readonly agentManager?: AgentManager;
@@ -69,11 +69,13 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   const hostId = ensureHostRow(store);
   const bus = createBus({ hostId, persist: persistToStore(store) });
 
-  // Root principal + agent always exist — the root agent is the human's
-  // first-contact delegate, and extensions register tasks against it even
-  // when the chat agent (which requires an API key) isn't running.
-  const rootPrincipalId = ensurePrincipalRow(store, "root");
-  const rootAgentId = ensureAgentRow(store, hostId, "root");
+  // Human agent + AI delegate always exist. The human agent is the
+  // owns-money root (LOG 2026-04-23 collapse of principals into agents);
+  // the AI root agent is its first-contact delegate, parented under it,
+  // and extensions register tasks against the AI root even when the chat
+  // loop (which needs an API key) isn't running.
+  const humanAgentId = ensureHumanAgent(store, hostId, "root-human");
+  const rootAgentId = ensureAiRootAgent(store, hostId, "root", humanAgentId);
 
   const scheduler = createScheduler({ bus, store, hostId });
   scheduler.recoverLost();
@@ -150,7 +152,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     paths,
     store,
     rootAgentId,
-    rootPrincipalId,
+    humanAgentId,
     inbox,
     chatStatus: () => ({
       enabled: chat !== undefined,
@@ -244,7 +246,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         extensions,
         ledger,
         inbox,
-        principalId: rootPrincipalId,
+        ownerAgentId: humanAgentId,
         threadsDir: paths.threadsDir,
         hostContext: buildHostContextPrompt(paths, hostId),
         toolTruncate,
@@ -268,7 +270,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         // the CLI (`olle inbox`) reads from. mail_list is always-loaded
         // (orientation tool); mail_respond is deferred (only needed when
         // voting on a proposal).
-        ...buildInboxTools({ inbox, principalId: rootPrincipalId, bus, hostId, store }),
+        ...buildInboxTools({ inbox, ownerAgentId: humanAgentId, bus, hostId, store }),
         // Recovery surface for spilled tool output. Always-loaded — when an
         // oversize result lands, the agent needs this in the same turn or
         // it'd burn an extra round-trip just to learn the recovery path.
@@ -293,7 +295,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         });
         try {
           inbox.propose({
-            principalId: rootPrincipalId,
+            ownerAgentId: humanAgentId,
             // FK on decisions.proposing_agent_id → agents; hostId would
             // violate it. Root agent is the closest legitimate proposer
             // for environment-level diagnostics.
@@ -330,7 +332,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         coreTools,
         ledger,
         inbox,
-        principalId: rootPrincipalId,
+        ownerAgentId: humanAgentId,
         threadsDir: paths.threadsDir,
         toolTruncate,
         // Boot prompt branches on whether identity has been seeded yet
@@ -349,7 +351,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         bus,
         inbox,
         hostId,
-        principalId: rootPrincipalId,
+        ownerAgentId: humanAgentId,
         agentId: rootLoopAgentId,
       });
     } catch (err) {
@@ -523,7 +525,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     scheduler,
     inbox,
     rootAgentId,
-    rootPrincipalId,
+    humanAgentId,
     chat,
     chatAgentId,
     agentManager: managerHolder.ref,
@@ -621,34 +623,63 @@ function ensureHostRow(store: Store): string {
   return id;
 }
 
-function ensureAgentRow(store: Store, hostId: string, name: string): string {
-  const existing = store.select().from(tables.agents).where(eq(tables.agents.name, name)).all();
+function ensureHumanAgent(store: Store, hostId: string, name: string): string {
+  // v0 is single-human: pick the first owns_money agent if any, otherwise
+  // seed one. The human is an `agents` row with `owns_money = 1`, every
+  // tier allowed (they ARE the authority), and `parent_agent_id = NULL`
+  // (they're at the top of the ask-up chain).
+  const existing = store
+    .select()
+    .from(tables.agents)
+    .where(eq(tables.agents.ownsMoney, true))
+    .limit(1)
+    .all();
   if (existing.length > 0) return existing[0]!.id;
   const id = ulid();
-  // Root is the human's first-contact delegate; it may take operational and
-  // strategic actions without blocking. Vision-tier actions still escalate
-  // to the principal's inbox per the ask-up chain.
   store
     .insert(tables.agents)
     .values({
       id,
       name,
       hostId,
-      scope: { allowTiers: ["operational", "strategic"] },
+      scope: { allowTiers: ["operational", "strategic", "vision"] },
+      channels: [],
+      ownsMoney: true,
       createdAt: Date.now(),
     })
     .run();
   return id;
 }
 
-function ensurePrincipalRow(store: Store, display: string): string {
-  // v0 is single-principal: pick the first row if any, otherwise seed one.
-  const existing = store.select().from(tables.principals).limit(1).all();
+function ensureAiRootAgent(
+  store: Store,
+  hostId: string,
+  name: string,
+  humanAgentId: string,
+): string {
+  // The AI delegate the human's first contact reaches. It carries operational
+  // and strategic tiers — escalation hits the human only for vision tier or
+  // when policy isn't covered. Parented under the human so ask-up walks one
+  // recursion end-to-end (LOG 2026-04-23: humans are the oldest agents).
+  const existing = store
+    .select()
+    .from(tables.agents)
+    .where(eq(tables.agents.name, name))
+    .all();
   if (existing.length > 0) return existing[0]!.id;
   const id = ulid();
   store
-    .insert(tables.principals)
-    .values({ id, display, channels: [], createdAt: Date.now() })
+    .insert(tables.agents)
+    .values({
+      id,
+      name,
+      hostId,
+      parentAgentId: humanAgentId,
+      scope: { allowTiers: ["operational", "strategic"] },
+      channels: [],
+      ownsMoney: false,
+      createdAt: Date.now(),
+    })
     .run();
   return id;
 }

@@ -89,12 +89,15 @@ describe("observability.usageStats", () => {
 describe("observability.budgetStatus", () => {
   it("returns rows + percent computations", () => {
     const { store, hostId } = rig();
-    const principalId = ulid();
+    const ownerAgentId = ulid();
     const agentId = ulid();
-    store.insert(tables.principals).values({
-      id: principalId,
-      display: "p",
+    store.insert(tables.agents).values({
+      id: ownerAgentId,
+      name: "p",
+      hostId,
+      scope: { allowTiers: ["operational", "strategic", "vision"] },
       channels: [],
+      ownsMoney: true,
       createdAt: Date.now(),
     }).run();
     store.insert(tables.agents).values({
@@ -106,7 +109,7 @@ describe("observability.budgetStatus", () => {
     }).run();
     store.insert(tables.budgets).values({
       id: ulid(),
-      principalId,
+      ownerAgentId,
       agentId,
       period: "all-time",
       capUsd: 10_000_000, // $10

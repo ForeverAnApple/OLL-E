@@ -254,12 +254,15 @@ describe("ledger", () => {
 
   it("emits budget.threshold and budget.exceeded at 80% and 100%", () => {
     const { store, bus, hostId } = rig();
-    const principalId = ulid();
+    const ownerAgentId = ulid();
     const agentId = "a";
-    store.insert(tables.principals).values({
-      id: principalId,
-      display: "me",
+    store.insert(tables.agents).values({
+      id: ownerAgentId,
+      name: "me",
+      hostId,
+      scope: { allowTiers: ["operational", "strategic", "vision"] },
       channels: [],
+      ownsMoney: true,
       createdAt: Date.now(),
     }).run();
     store.insert(tables.agents).values({
@@ -271,7 +274,7 @@ describe("ledger", () => {
     }).run();
     store.insert(tables.budgets).values({
       id: ulid(),
-      principalId,
+      ownerAgentId,
       agentId,
       period: "all-time",
       capUsd: 1_000_000, // $1.00
@@ -292,7 +295,7 @@ describe("ledger", () => {
     // 50% — 500_000 micros — no event
     ledger.record({
       actorId: agentId,
-      principalId,
+      ownerAgentId,
       provider: "anthropic",
       model: "x",
       inputTokens: 100_000,
@@ -302,7 +305,7 @@ describe("ledger", () => {
     // 85% — cross 80% (350_000 micros = 70_000 input tokens)
     ledger.record({
       actorId: agentId,
-      principalId,
+      ownerAgentId,
       provider: "anthropic",
       model: "x",
       inputTokens: 70_000,
@@ -313,7 +316,7 @@ describe("ledger", () => {
     // 110% — cross 100% (250_000 micros = 50_000 input tokens)
     const { overBudget } = ledger.record({
       actorId: agentId,
-      principalId,
+      ownerAgentId,
       provider: "anthropic",
       model: "x",
       inputTokens: 50_000,

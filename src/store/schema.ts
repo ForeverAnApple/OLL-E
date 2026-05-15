@@ -7,8 +7,10 @@
 //    strings when causal ordering matters.
 //  - JSON columns are typed via drizzle's `text({mode:"json"})` so payloads
 //    remain structured without forcing a schema migration per field.
-//  - actor_id is a weak reference: it may point at an agent OR a principal.
-//    We check on read, not via FK.
+//  - actor_id is a weak reference to an agent id. (LOG 2026-04-23 collapsed
+//    principals into agents — every actor is an agent now, including the
+//    human, who carries `owns_money = 1`.) We don't FK because mesh events
+//    can arrive carrying actor ids that aren't local.
 
 import { sql } from "drizzle-orm";
 import {
@@ -24,13 +26,6 @@ export const hosts = sqliteTable("hosts", {
   hostname: text("hostname").notNull(),
   createdAt: integer("created_at").notNull(),
   configRef: text("config_ref"),
-});
-
-export const principals = sqliteTable("principals", {
-  id: text("id").primaryKey(),
-  display: text("display").notNull(),
-  channels: text("channels", { mode: "json" }).$type<string[]>().notNull().default(sql`'[]'`),
-  createdAt: integer("created_at").notNull(),
 });
 
 export const agents = sqliteTable(
@@ -50,11 +45,23 @@ export const agents = sqliteTable(
     systemPrompt: text("system_prompt"),
     budgetRef: text("budget_ref"),
     scope: text("scope", { mode: "json" }).$type<AgentScope>().notNull().default(sql`'{}'`),
+    /** Inbox-delivery channels for this agent. Mostly populated for
+     *  `owns_money` (human) agents — the addresses the decision inbox
+     *  routes through (CLI, Discord, etc.). Spawned AI agents typically
+     *  carry `[]` until/unless they grow their own channels. */
+    channels: text("channels", { mode: "json" }).$type<string[]>().notNull().default(sql`'[]'`),
+    /** "This agent is backed by real-world money." Survives the LOG
+     *  2026-04-23 collapse as a property, not a separate primitive: a
+     *  human is an agent with `owns_money = 1` (and typically
+     *  `parent_agent_id = NULL`). Drives ask-up termination and budget
+     *  ownership. SQLite booleans are integers (0/1). */
+    ownsMoney: integer("owns_money", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_at").notNull(),
   },
   (t) => ({
     nameIdx: index("agents_name").on(t.name),
     parentIdx: index("agents_parent").on(t.parentAgentId),
+    ownsMoneyIdx: index("agents_owns_money").on(t.ownsMoney),
   }),
 );
 
@@ -252,9 +259,13 @@ export const decisions = sqliteTable(
   "decisions",
   {
     id: text("id").primaryKey(),
-    principalId: text("principal_id")
+    /** The agent who owns this decision — its inbox sees it, its
+     *  channels deliver it, and (when `owns_money = 1`) its real-world
+     *  authority is what gets exercised. Pre-2026-04-23 this was
+     *  `principal_id`; the collapse made principals into agents. */
+    ownerAgentId: text("owner_agent_id")
       .notNull()
-      .references(() => principals.id),
+      .references(() => agents.id),
     proposingAgentId: text("proposing_agent_id")
       .notNull()
       .references(() => agents.id),
@@ -269,7 +280,7 @@ export const decisions = sqliteTable(
   },
   (t) => ({
     byStatus: index("decisions_status").on(t.status),
-    byPrincipal: index("decisions_principal").on(t.principalId),
+    byOwner: index("decisions_owner").on(t.ownerAgentId),
   }),
 );
 
@@ -336,9 +347,14 @@ export const budgets = sqliteTable(
   "budgets",
   {
     id: text("id").primaryKey(),
-    principalId: text("principal_id")
+    /** The agent who owns this budget envelope — the real-money source.
+     *  Typically an `owns_money = 1` agent (a human). Pre-2026-04-23
+     *  this was `principal_id`. */
+    ownerAgentId: text("owner_agent_id")
       .notNull()
-      .references(() => principals.id),
+      .references(() => agents.id),
+    /** Sub-allocation: when set, this row caps spending for a specific
+     *  descendant agent rather than the owner directly. */
     agentId: text("agent_id").references(() => agents.id),
     period: text("period").notNull(), // e.g. 2026-04 or all-time
     capTokens: integer("cap_tokens"),
@@ -349,6 +365,7 @@ export const budgets = sqliteTable(
   },
   (t) => ({
     byAgentPeriod: index("budgets_agent_period").on(t.agentId, t.period),
+    byOwner: index("budgets_owner").on(t.ownerAgentId, t.period),
   }),
 );
 
@@ -474,8 +491,6 @@ export type Host = typeof hosts.$inferSelect;
 export type NewHost = typeof hosts.$inferInsert;
 export type Agent = typeof agents.$inferSelect;
 export type NewAgent = typeof agents.$inferInsert;
-export type Principal = typeof principals.$inferSelect;
-export type NewPrincipal = typeof principals.$inferInsert;
 export type EventRow = typeof events.$inferSelect;
 export type NewEventRow = typeof events.$inferInsert;
 export type Decision = typeof decisions.$inferSelect;

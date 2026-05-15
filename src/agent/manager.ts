@@ -35,8 +35,9 @@ export interface AgentManagerDeps {
   coreTools?: ToolDef[];
   ledger?: Ledger;
   inbox?: Inbox;
-  /** Principal id used for budget + askUp routing on denials. */
-  principalId?: string;
+  /** Owner-agent id (typically the human) used for budget enforcement
+   *  and askUp routing on denials. Post-LOG 2026-04-23 collapse. */
+  ownerAgentId?: string;
   /** Where per-thread snapshots live. */
   threadsDir?: string;
   /** Default model the manager starts children with. Omit to use the
@@ -202,7 +203,7 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
       coreTools,
       ledger: deps.ledger,
       inbox: deps.inbox,
-      principalId: deps.principalId,
+      ownerAgentId: deps.ownerAgentId,
       threadsDir: deps.threadsDir,
       model: deps.model,
       toolTruncate: deps.toolTruncate,

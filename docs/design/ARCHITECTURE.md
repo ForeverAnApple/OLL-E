@@ -73,7 +73,7 @@ A deployment unit: one daemon process, one data directory, one SQLite store. Own
 
 A named logical identity. Has its own memory, tasks, tool access, budget allocation, and permission scope. One host can run N agents; an agent does **not** span hosts in v0. Parent-child relationships (from sub-agent spawning) form an authority delegation tree.
 
-**Humans are agents too** (per LOG 2026-04-23). The principal is represented as an `agents` row at the top of the tree: `host_id=null` (no executing host), real-money-backed, longest-lived, with its own memory and principles. The ask-up chain is one recursion end-to-end — no terminal "now we hit a principal" special case. `principals` collapses into `agents` via a future migration; v0 retains `principals` as a compatibility row until the collapse lands. "Principal" becomes a property ("this agent owns real-world money"), not a separate primitive.
+**Humans are agents too** (LOG 2026-04-23 design; landed as code in LOG 2026-05-14). The human is an `agents` row with `owns_money = 1` at the top of the tree: longest-lived, with its own memory and principles, all tiers allowed in `scope.allowTiers`. Its `host_id` records the install host (a v0 compromise — the LOG sketched `host_id = null`, but the human-agent owns no triggers/tasks/tools so it never shows up in "executable on this host" queries and the wider nullable change wasn't worth its blast radius). The ask-up chain is one recursion end-to-end — `askUp` walks parents until either an intermediate agent's `allowTiers` covers the tier (auto-approve) or it reaches an `owns_money` agent (queue to its inbox). "Principal" survives as the `owns_money` property, not a separate primitive.
 
 ### Trigger
 
@@ -116,8 +116,7 @@ All IDs are ULID (time-sortable, globally unique without coordination). All user
 
 ```
 hosts         (id, hostname, created_at, config_ref)
-principals    (id, display, channels, created_at)
-agents        (id, name, host_id, parent_agent_id, system_prompt, budget_ref, scope, created_at)
+agents        (id, name, host_id, parent_agent_id, system_prompt, budget_ref, scope, channels, owns_money, created_at)
 teams         (id, name, mission_ref, goal_dir, created_at)
 team_members  (team_id, actor_id, role, joined_at)
 
@@ -133,11 +132,11 @@ tool_calls    (id, task_id, tool_id, args_json, result_json, tokens_used, starte
 tool_results  (id, hlc, host_id, actor_id, thread_id, tool_name, content, bytes, created_at)
               -- spilled over-cap tool output, recovered via read_tool_result
 
-decisions          (id, principal_id, proposing_agent_id, tier, summary, payload, status, staleness, created_at, resolved_at)
+decisions          (id, owner_agent_id, proposing_agent_id, tier, summary, payload, status, staleness, created_at, resolved_at)
 approvals          (decision_id, actor_id, vote, message, at)             -- vote rows on a decision
 decision_messages  (id, decision_id, host_id, actor_id, text, at)         -- agent follow-up replies (mail_reply)
 
-budgets       (id, principal_id, agent_id, period, cap_tokens, cap_usd, spent, updated_at)
+budgets       (id, owner_agent_id, agent_id, period, cap_tokens, cap_usd, spent, updated_at)
 ledger        (id, hlc, host_id, actor_id, thread_id, provider, model,
                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tool_call_id)
               -- tokens-only by design (LOG 2026-04-24); USD is computed from current prices
@@ -214,7 +213,7 @@ Budget allocation (raising cap, creating new allocation) is always an inbox deci
 
 Budgets stay USD-denominated because principals back them with real money. The asymmetry resolves at decrement time: the ledger module computes USD via `priceTokens(model, usage)` and accumulates into `budgets.spent_usd`, snapshotting USD into the *budget* (one number per agent×period) instead of every ledger row. The cap-comparison stays meaningful even when prices later shift; agents see cost as physics; nobody is lying to anybody.
 
-Ledger is keyed `(principal_id, agent_id, provider, model, period)` so team-level or mesh-level rollups in v1+ are schema-free; the new `(actor_id, at)` and `(thread_id, at)` indexes serve the observability layer.
+Ledger is keyed `(owner_agent_id, agent_id, provider, model, period)` so team-level or mesh-level rollups in v1+ are schema-free; the new `(actor_id, at)` and `(thread_id, at)` indexes serve the observability layer.
 
 ## Caching
 

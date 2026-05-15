@@ -48,13 +48,13 @@ const HOME = `${CSI}H`;
 
 interface InboxRow {
   id: string;
-  principalId: string;
+  ownerAgentId: string;
   proposingAgentId: string;
   /** Display name for `proposingAgentId`, resolved server-side. Falls
    *  back to the id when the agent row is missing. */
   proposingAgentName?: string;
-  /** Display name for `principalId`. */
-  principalDisplay?: string;
+  /** Display name for the owner agent (typically the human). */
+  ownerDisplay?: string;
   tier: string;
   summary: string;
   payload: Record<string, unknown>;
@@ -62,7 +62,7 @@ interface InboxRow {
   staleness: number | null;
   createdAt: number;
   resolvedAt: number | null;
-  /** Per-decision unread reply count for the principal — emitted by
+  /** Per-decision unread reply count for the owner — emitted by
    *  `inbox.list`. Drives the "(N new)" badge in the row. */
   unreadReplyCount?: number;
 }
@@ -494,7 +494,7 @@ export async function runInboxTui(opts: InboxTuiOptions): Promise<void> {
     out.push(`${ANSI.dim}·${ANSI.reset} ${metaParts.join(`  ${ANSI.dim}·${ANSI.reset}  `)}`);
 
     const fromName = r.proposingAgentName ?? r.proposingAgentId;
-    const toName = r.principalDisplay ?? r.principalId;
+    const toName = r.ownerDisplay ?? r.ownerAgentId;
     out.push(
       `${ANSI.dim}from${ANSI.reset} ${ANSI.bold}${fromName}${ANSI.reset}  ${ANSI.dim}to${ANSI.reset} ${toName}`,
     );

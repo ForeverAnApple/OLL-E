@@ -934,6 +934,26 @@ These are deliberately un-landed as of the vision-lock date. Drafting-phase deci
 
 ---
 
+## 2026-05-14 — Principals collapse into agents (LOG 2026-04-23 landing)
+
+LOG 2026-04-23 ("the human is the oldest agent") was design text for three weeks; the schema kept lying. `principals` and `agents` were parallel tables with two near-identical surfaces — both had memory, both lived in trees, both received messages, and every code path that crossed the chain ended in a special-case branch checking which side it had landed on. The collapse landed today in migration `0003_principals_collapse.sql`.
+
+**What changed.** `principals` is dropped. Every former-principal becomes an `agents` row with the same ULID, `owns_money = 1`, all tiers allowed in `scope.allowTiers`, and the channels list copied verbatim. `decisions.principal_id` and `budgets.principal_id` retarget to `agents.id` and rename to `owner_agent_id`. The bootstrap AI agent's `parent_agent_id` now points at the human-agent, so the ask-up chain walks one recursion end-to-end without a terminal branch.
+
+**Why now.** The teams plan needed cross-host decision sync; the existing FKs forced any imported decision to either fake a local `principals` row or punt the slice. Either path was infrastructure cosplay around a problem we'd already decided how to solve. The collapse was cheaper than the workaround.
+
+**Ask-up semantics for owns-money agents.** `askUp` now treats an `owns_money` agent as the inbox endpoint, not a delegate: even if its `allowTiers` covers the proposed tier, the chain queues to its inbox rather than auto-approving. The human's tier list says "I am authorized to do this myself" — not "I delegate this tier downward." Without the explicit terminus check, a child proposing a vision-tier action would have been silently auto-approved by walking through the human's row, which would defeat the whole inbox surface.
+
+**Scope of the rename.** Schema columns + indexes; `Daemon.rootPrincipalId` → `Daemon.humanAgentId`; every interface field named `principalId` → `ownerAgentId` (inbox, ledger, agent manager, chat loop, IPC, CLI); every test-rig that seeded a principal now seeds an owns-money agent. The `tables.principals` export and `Principal`/`NewPrincipal` types are gone. Tests + typecheck green.
+
+**Migration hygiene.** Following the 2026-04-28 pattern: the migration runs against any existing daemon on next start, idempotent via `_migrations`. Pre-v1 we have no installed-user upgrade path to preserve, so after soak we'll fold 0003 into `0001_init.sql` directly and delete the migration file — a future fresh install reads a clean schema with no `principals` archeology.
+
+**What's now unblocked.** Cross-host decision-row sync (the teams plan's biggest deferred item). Remote `decisions` and `budgets` rows now FK only to `agents.id`, and that column was already a weak ref across hosts, so bridging them is just events on the wire — no more pretending local rows exist for remote humans.
+
+**What's still property-not-primitive.** "Principal" survives as `owns_money` on an agent row. The vocabulary stays useful ("ask your principal") even though the schema dimension is gone.
+
+---
+
 ## 2026-05-13 — Substrate stays peer-mesh; centralization is agent-grown behavior
 
 While planning Phase C (cross-host mesh), pushback landed: if the agents *want* centralized coordination — a leader for task assignment, a shared scheduling oracle — why would the binary forbid it? Doesn't vision say the world is modifiable by its inhabitants?

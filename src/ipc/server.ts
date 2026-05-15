@@ -48,9 +48,10 @@ export interface IpcServerOptions {
   /** Root agent id, returned by `status.rootAgent` so clients (CLI chat,
    *  bridges) can address their mailbox publishes. */
   rootAgentId?: string;
-  /** Root principal id — addressee for the human's decision inbox. The
-   *  `inbox.*` methods default to this when no principalId is supplied. */
-  rootPrincipalId?: string;
+  /** Owner-agent id (the human, post-LOG 2026-04-23 collapse) —
+   *  addressee for the host's decision inbox. The `inbox.*` methods
+   *  default to this when no ownerAgentId is supplied. */
+  humanAgentId?: string;
   /** Decision-inbox handle. Wired so the CLI surface (`olle inbox`) and the
    *  agent core tools (mail_list/mail_respond) hit the same query layer. */
   inbox?: Inbox;
@@ -382,15 +383,15 @@ async function dispatch(
         // Publish a `secret.set` event (name only — never the value).
         // Lets subscribers react to a fresh secret without polling: the
         // chat-agent bringup, for one, hot-reloads on ANTHROPIC_API_KEY.
-        // The CLI socket is mode 0600 owned by the principal, so callers
-        // here are the principal acting through their CLI — attribute to
-        // their principal id when available so federation provenance is
-        // honest. Falls back to host-as-actor only if the IPC server was
-        // wired without one (tests, headless probes).
+        // The CLI socket is mode 0600 owned by the human, so callers
+        // here are the human acting through their CLI — attribute to
+        // the human-agent id when available so federation provenance
+        // is honest. Falls back to host-as-actor only if the IPC server
+        // was wired without one (tests, headless probes).
         opts.bus.publish({
           type: "secret.set",
           hostId: opts.bus.hostId,
-          actorId: opts.rootPrincipalId ?? opts.bus.hostId,
+          actorId: opts.humanAgentId ?? opts.bus.hostId,
           durable: true,
           payload: { name, bytes },
         });
@@ -475,31 +476,31 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: "inbox unavailable" } });
           return;
         }
-        const principalId =
-          (req.params?.principalId as string | undefined) ?? opts.rootPrincipalId;
-        if (!principalId) {
-          send({ id: req.id, ok: false, error: { message: "principalId required" } });
+        const ownerAgentId =
+          (req.params?.ownerAgentId as string | undefined) ?? opts.humanAgentId;
+        if (!ownerAgentId) {
+          send({ id: req.id, ok: false, error: { message: "ownerAgentId required" } });
           return;
         }
         // Three filter modes:
-        //   "all"        — every decision for this principal
+        //   "all"        — every decision for this owner
         //   "open"       — strict status='open' only (lifecycle filter)
         //   default      — actionable: open OR has unread replies for me
         // The default treats "needs my attention" the way a real inbox
         // does: a resolved decision with a new agent reply ("done — see
         // commit X") still surfaces until I read it.
         const status = req.params?.status as string | undefined;
-        const reader = principalId;
+        const reader = ownerAgentId;
         let rows;
         if (status === "all") {
-          rows = opts.inbox.listAll(principalId);
+          rows = opts.inbox.listAll(ownerAgentId);
         } else if (status === "open") {
-          rows = opts.inbox.listOpen(principalId);
+          rows = opts.inbox.listOpen(ownerAgentId);
         } else {
-          rows = opts.inbox.listActionable(principalId, reader);
+          rows = opts.inbox.listActionable(ownerAgentId, reader);
         }
         const enriched = opts.store ? enrichDecisions(opts.store, rows) : rows;
-        // Per-decision unread reply counts for the principal — backs the
+        // Per-decision unread reply counts for the owner — backs the
         // "(N new)" badge on the listing UI. One pair of queries for the
         // whole batch (no N+1).
         const unread = opts.inbox.unreadCountsByDecision(
@@ -534,7 +535,7 @@ async function dispatch(
         // previously-unread rows in the same view that acks them.
         const reader =
           (req.params?.readerActorId as string | undefined) ??
-          opts.rootPrincipalId ??
+          opts.humanAgentId ??
           "principal";
         const messages = opts.inbox.listMessages(row.id);
         const wasRead = opts.inbox.readMessageIdsFor(row.id, reader);
@@ -572,7 +573,7 @@ async function dispatch(
           message?: string;
           payloadOverride?: Record<string, unknown>;
         };
-        const actorId = p.actorId ?? opts.rootPrincipalId ?? "principal";
+        const actorId = p.actorId ?? opts.humanAgentId ?? "principal";
         if (!p.id || !p.vote) {
           send({ id: req.id, ok: false, error: { message: "id and vote required" } });
           return;
@@ -603,16 +604,16 @@ async function dispatch(
           send({ id: req.id, ok: true, value: { open: 0 } });
           return;
         }
-        const principalId =
-          (req.params?.principalId as string | undefined) ?? opts.rootPrincipalId;
-        if (!principalId) {
+        const ownerAgentId =
+          (req.params?.ownerAgentId as string | undefined) ?? opts.humanAgentId;
+        if (!ownerAgentId) {
           send({ id: req.id, ok: true, value: { open: 0 } });
           return;
         }
         send({
           id: req.id,
           ok: true,
-          value: { open: opts.inbox.listOpen(principalId).length },
+          value: { open: opts.inbox.listOpen(ownerAgentId).length },
         });
         return;
       }

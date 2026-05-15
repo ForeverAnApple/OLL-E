@@ -9,6 +9,7 @@ import type { Database } from "bun:sqlite";
 // for that date). Pre-v1 had no installed-user upgrade path to preserve.
 import migration0001 from "./migrations/0001_init.sql" with { type: "text" };
 import migration0002 from "./migrations/0002_agent_display_name.sql" with { type: "text" };
+import migration0003 from "./migrations/0003_principals_collapse.sql" with { type: "text" };
 
 export interface MigrationFile {
   readonly index: number;
@@ -19,6 +20,7 @@ export interface MigrationFile {
 const MIGRATIONS: readonly MigrationFile[] = [
   { index: 1, name: "init", sql: migration0001 },
   { index: 2, name: "agent_display_name", sql: migration0002 },
+  { index: 3, name: "principals_collapse", sql: migration0003 },
 ];
 
 export function listMigrations(): readonly MigrationFile[] {
@@ -36,19 +38,30 @@ export function runMigrations(db: Database): number {
   const applied = new Set<number>(
     (db.query("SELECT idx FROM _migrations").all() as Array<{ idx: number }>).map((r) => r.idx),
   );
+  // FK enforcement is toggled around the migration set, not inside it.
+  // SQLite silently ignores `PRAGMA foreign_keys` inside a transaction
+  // (https://sqlite.org/foreignkeys.html#fk_enable), and the table-recreate
+  // pattern that migration 0003 uses needs FKs off for the brief window
+  // where a dependent table's FK target doesn't exist. We restore FKs to
+  // ON at the end so the daemon runs with constraints enforced.
+  db.exec("PRAGMA foreign_keys = OFF");
   let count = 0;
-  for (const m of MIGRATIONS) {
-    if (applied.has(m.index)) continue;
-    const tx = db.transaction(() => {
-      db.exec(m.sql);
-      db.prepare("INSERT INTO _migrations (idx, name, applied_at) VALUES (?, ?, ?)").run(
-        m.index,
-        m.name,
-        Date.now(),
-      );
-    });
-    tx();
-    count++;
+  try {
+    for (const m of MIGRATIONS) {
+      if (applied.has(m.index)) continue;
+      const tx = db.transaction(() => {
+        db.exec(m.sql);
+        db.prepare("INSERT INTO _migrations (idx, name, applied_at) VALUES (?, ?, ?)").run(
+          m.index,
+          m.name,
+          Date.now(),
+        );
+      });
+      tx();
+      count++;
+    }
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
   }
   return count;
 }

@@ -13,18 +13,29 @@ function rig() {
   return { store, bus, inbox, hostId };
 }
 
-function seedPrincipalAndAgent(
+function seedOwnerAndAgent(
   rig: ReturnType<typeof createRigHelpers>["rig"],
   opts: {
     agentId: string;
     parentAgentId?: string;
     allowTiers?: Array<"operational" | "strategic" | "vision">;
   },
-): { principalId: string } {
-  const principalId = ulid();
+): { ownerAgentId: string } {
+  // Post-LOG 2026-04-23: humans are agents. Seed an owns_money agent
+  // (the "human") to satisfy decisions.owner_agent_id, plus the named
+  // proposer agent.
+  const ownerAgentId = ulid();
   rig.store
-    .insert(tables.principals)
-    .values({ id: principalId, display: "me", channels: [], createdAt: Date.now() })
+    .insert(tables.agents)
+    .values({
+      id: ownerAgentId,
+      name: "me",
+      hostId: rig.hostId,
+      scope: { allowTiers: ["operational", "strategic", "vision"] },
+      channels: [],
+      ownsMoney: true,
+      createdAt: Date.now(),
+    })
     .run();
   rig.store
     .insert(tables.agents)
@@ -37,7 +48,7 @@ function seedPrincipalAndAgent(
       createdAt: Date.now(),
     })
     .run();
-  return { principalId };
+  return { ownerAgentId };
 }
 
 function createRigHelpers() {
@@ -47,27 +58,27 @@ function createRigHelpers() {
 describe("inbox propose/respond", () => {
   it("propose writes a decision and emits a durable event", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const events: string[] = [];
     r.bus.subscribe("*", (e) => void events.push(e.type));
     const { id } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "strategic",
       summary: "install discord",
       payload: { ext: "discord" },
     });
     expect(id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-    const list = r.inbox.listOpen(principalId);
+    const list = r.inbox.listOpen(ownerAgentId);
     expect(list).toHaveLength(1);
     expect(events).toContain("decision.proposed");
   });
 
   it("respond(approve) resolves and emits decision.resolved", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const { id } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "strategic",
       summary: "do a thing",
@@ -86,9 +97,9 @@ describe("inbox propose/respond", () => {
 
   it("respond(modify) swaps the payload", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const { id } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "x",
@@ -106,9 +117,9 @@ describe("inbox propose/respond", () => {
 
   it("double-respond is rejected", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const { id } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "x",
@@ -120,9 +131,9 @@ describe("inbox propose/respond", () => {
 
   it("sweepStale closes past-deadline decisions", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "strategic",
       summary: "fresh",
@@ -130,7 +141,7 @@ describe("inbox propose/respond", () => {
       stalenessMs: 1_000_000,
     });
     r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "strategic",
       summary: "gone",
@@ -140,14 +151,14 @@ describe("inbox propose/respond", () => {
     // advance virtual "now"
     const n = r.inbox.sweepStale(Date.now() + 1_000);
     expect(n).toBe(1);
-    expect(r.inbox.listOpen(principalId)).toHaveLength(1);
+    expect(r.inbox.listOpen(ownerAgentId)).toHaveLength(1);
   });
 });
 
 describe("askUp chain", () => {
   it("auto-approves when a parent has the tier in delegated authority", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, {
+    const { ownerAgentId } = seedOwnerAndAgent(r, {
       agentId: "root",
       allowTiers: ["strategic", "operational"],
     });
@@ -167,7 +178,7 @@ describe("askUp chain", () => {
       { bus: r.bus, store: r.store, hostId: r.hostId, inbox: r.inbox },
       {
         proposingAgentId: "child",
-        principalId,
+        ownerAgentId,
         tier: "strategic",
         summary: "rename thing",
         payload: { foo: "bar" },
@@ -175,12 +186,12 @@ describe("askUp chain", () => {
     );
     expect(result.kind).toBe("auto-approved");
     expect(result.approverAgentId).toBe("root");
-    expect(r.inbox.listOpen(principalId)).toHaveLength(0);
+    expect(r.inbox.listOpen(ownerAgentId)).toHaveLength(0);
   });
 
   it("queues to principal inbox when no ancestor has authority", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "root", allowTiers: [] });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "root", allowTiers: [] });
     r.store
       .insert(tables.agents)
       .values({
@@ -197,14 +208,14 @@ describe("askUp chain", () => {
       { bus: r.bus, store: r.store, hostId: r.hostId, inbox: r.inbox },
       {
         proposingAgentId: "child",
-        principalId,
+        ownerAgentId,
         tier: "vision",
         summary: "rewrite mission",
         payload: {},
       },
     );
     expect(result.kind).toBe("queued");
-    expect(r.inbox.listOpen(principalId)).toHaveLength(1);
+    expect(r.inbox.listOpen(ownerAgentId)).toHaveLength(1);
   });
 });
 
@@ -215,9 +226,9 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
 
   it("reply appends a row, fires decision.replied, and listMessages returns it", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const { id: did } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "strategic",
       summary: "do x",
@@ -250,7 +261,7 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
 
   it("reply on an unknown decision throws", () => {
     const r = rig();
-    seedPrincipalAndAgent(r, { agentId: "proposer" });
+    seedOwnerAndAgent(r, { agentId: "proposer" });
     expect(() =>
       r.inbox.reply({ decisionId: "no-such-id", actorId: "proposer", text: "hi" }),
     ).toThrow(/not found/);
@@ -258,9 +269,9 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
 
   it("listMessages returns rows in chronological order", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const { id: did } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "x",
@@ -279,9 +290,9 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
 
   it("markDecisionRead is idempotent and per-reader", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const { id: did } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "x",
@@ -309,16 +320,16 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
     // open decisions awaiting their vote, AND resolved decisions where
     // the agent reported back and they haven't read it yet.
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const stillOpen = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "still open",
       payload: {},
     });
     const resolvedWithUnread = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "resolved + new agent reply",
@@ -326,7 +337,7 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
     });
     r.inbox.respond({
       decisionId: resolvedWithUnread.id,
-      actorId: principalId,
+      actorId: ownerAgentId,
       vote: "approve",
     });
     r.inbox.reply({
@@ -335,7 +346,7 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
       text: "shipped abc",
     });
     const resolvedAndRead = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "resolved + reply already read",
@@ -343,7 +354,7 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
     });
     r.inbox.respond({
       decisionId: resolvedAndRead.id,
-      actorId: principalId,
+      actorId: ownerAgentId,
       vote: "approve",
     });
     r.inbox.reply({
@@ -351,39 +362,39 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
       actorId: "proposer",
       text: "shipped def",
     });
-    r.inbox.markDecisionRead(resolvedAndRead.id, principalId);
+    r.inbox.markDecisionRead(resolvedAndRead.id, ownerAgentId);
 
-    const actionable = r.inbox.listActionable(principalId, principalId);
+    const actionable = r.inbox.listActionable(ownerAgentId, ownerAgentId);
     const ids = actionable.map((d) => d.id).sort();
     expect(ids).toEqual([stillOpen.id, resolvedWithUnread.id].sort());
     // Resolved-and-read is filtered out — neither open nor has unread.
     expect(ids).not.toContain(resolvedAndRead.id);
 
     // After viewing resolvedWithUnread, it falls out of actionable.
-    r.inbox.markDecisionRead(resolvedWithUnread.id, principalId);
-    const after = r.inbox.listActionable(principalId, principalId);
+    r.inbox.markDecisionRead(resolvedWithUnread.id, ownerAgentId);
+    const after = r.inbox.listActionable(ownerAgentId, ownerAgentId);
     expect(after.map((d) => d.id)).toEqual([stillOpen.id]);
   });
 
   it("unreadCountsByDecision returns 0 for decisions with no replies and is bulk-correct", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const { id: d1 } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "one",
       payload: {},
     });
     const { id: d2 } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "two",
       payload: {},
     });
     const { id: d3 } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "three",
@@ -407,9 +418,9 @@ describe("inbox reply — agent follow-up messages on a decision", () => {
 
   it("textPreview truncates long bodies in the event payload (full text in row)", () => {
     const r = rig();
-    const { principalId } = seedPrincipalAndAgent(r, { agentId: "proposer" });
+    const { ownerAgentId } = seedOwnerAndAgent(r, { agentId: "proposer" });
     const { id: did } = r.inbox.propose({
-      principalId,
+      ownerAgentId,
       proposingAgentId: "proposer",
       tier: "operational",
       summary: "x",

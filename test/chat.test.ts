@@ -651,16 +651,19 @@ describe("agent loop over the mailbox", () => {
 
   it("blocks paid LLM work when the caller's budget is already exhausted", async () => {
     const r = rig();
-    const principalId = ulid();
-    r.store.insert(tables.principals).values({
-      id: principalId,
-      display: "p",
+    const ownerAgentId = ulid();
+    r.store.insert(tables.agents).values({
+      id: ownerAgentId,
+      name: "p",
+      hostId: r.hostId,
+      scope: { allowTiers: ["operational", "strategic", "vision"] },
       channels: [],
+      ownsMoney: true,
       createdAt: Date.now(),
     }).run();
     r.store.insert(tables.budgets).values({
       id: ulid(),
-      principalId,
+      ownerAgentId,
       agentId: r.agentId,
       period: "all-time",
       capUsd: 1,
@@ -677,7 +680,7 @@ describe("agent loop over the mailbox", () => {
       hostId: r.hostId,
       llm,
       agentId: r.agentId,
-      principalId,
+      ownerAgentId,
       inbox,
     });
     const done = new Promise<string>((resolve) => {
@@ -694,7 +697,7 @@ describe("agent loop over the mailbox", () => {
     });
     const error = await done;
     expect(error).toContain("budget exhausted");
-    expect(inbox.listOpen(principalId)).toHaveLength(1);
+    expect(inbox.listOpen(ownerAgentId)).toHaveLength(1);
   });
 });
 
@@ -719,7 +722,7 @@ describe("mail wake — decision.resolved synthesizes chat.input on mailbox thre
       durable: true,
       payload: {
         decisionId,
-        principalId: "p1",
+        ownerAgentId: "p1",
         proposingAgentId,
         status: "approved",
         vote: "approve",
@@ -855,13 +858,21 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
 
   function rigWithInbox() {
     const base = rig();
-    const principalId = ulid();
+    const ownerAgentId = ulid();
     base.store
-      .insert(tables.principals)
-      .values({ id: principalId, display: "p", channels: [], createdAt: Date.now() })
+      .insert(tables.agents)
+      .values({
+        id: ownerAgentId,
+        name: "p",
+        hostId: base.hostId,
+        scope: { allowTiers: ["operational", "strategic", "vision"] },
+        channels: [],
+        ownsMoney: true,
+        createdAt: Date.now(),
+      })
       .run();
     const inbox = createInbox({ bus: base.bus, store: base.store, hostId: base.hostId });
-    return { ...base, inbox, principalId };
+    return { ...base, inbox, ownerAgentId };
   }
 
   // Capture every system segment the LLM sees, turn-by-turn.
@@ -947,7 +958,7 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
     try {
       // Resolve a proposal AFTER the loop starts (so it lands above the HWM).
       const { id: d1 } = r.inbox.propose({
-        principalId: r.principalId,
+        ownerAgentId: r.ownerAgentId,
         proposingAgentId: r.agentId,
         tier: "strategic",
         summary: "Self-test findings: slim github_list_issues + auto-pick discord guild",
@@ -971,7 +982,7 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
 
       // A second proposal lands and is resolved.
       const { id: d2 } = r.inbox.propose({
-        principalId: r.principalId,
+        ownerAgentId: r.ownerAgentId,
         proposingAgentId: r.agentId,
         tier: "strategic",
         summary: "Add Slack adapter",
@@ -997,7 +1008,7 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
       .insert(tables.budgets)
       .values({
         id: ulid(),
-        principalId: r.principalId,
+        ownerAgentId: r.ownerAgentId,
         agentId: r.agentId,
         period: "all-time",
         capUsd: 1,
@@ -1014,13 +1025,13 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
       hostId: r.hostId,
       llm: capture.llm,
       agentId: r.agentId,
-      principalId: r.principalId,
+      ownerAgentId: r.ownerAgentId,
       inbox: r.inbox,
       mailWakeDebounceMs: 60_000,
     });
     try {
       const { id: d1 } = r.inbox.propose({
-        principalId: r.principalId,
+        ownerAgentId: r.ownerAgentId,
         proposingAgentId: r.agentId,
         tier: "strategic",
         summary: "approved while capped",
@@ -1051,7 +1062,7 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
       r.store
         .update(tables.budgets)
         .set({ capUsd: 2, updatedAt: Date.now() })
-        .where(eq(tables.budgets.principalId, r.principalId))
+        .where(eq(tables.budgets.ownerAgentId, r.ownerAgentId))
         .run();
 
       await sendAndAwait(r, "after cap raise", "T1");
@@ -1070,7 +1081,7 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
     const r = rigWithInbox();
     // Resolve a proposal BEFORE the loop starts.
     const { id: dOld } = r.inbox.propose({
-      principalId: r.principalId,
+      ownerAgentId: r.ownerAgentId,
       proposingAgentId: r.agentId,
       tier: "strategic",
       summary: "old proposal pre-boot",
@@ -1117,7 +1128,7 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
     });
     try {
       const { id: d1 } = r.inbox.propose({
-        principalId: r.principalId,
+        ownerAgentId: r.ownerAgentId,
         proposingAgentId: r.agentId,
         tier: "strategic",
         summary: "the thing",
@@ -1163,7 +1174,7 @@ describe("mailbox sidebar — unread decision resolutions surface on next turn",
     });
     try {
       const { id: dOther } = r.inbox.propose({
-        principalId: r.principalId,
+        ownerAgentId: r.ownerAgentId,
         proposingAgentId: otherAgent,
         tier: "strategic",
         summary: "not my proposal",

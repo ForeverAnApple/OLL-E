@@ -27,9 +27,10 @@ export interface SpendInput {
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
   toolCallId?: string;
-  /** Principal who owns the budget. If omitted, no budget enforcement —
-   *  the spend is still recorded for audit. */
-  principalId?: string;
+  /** Agent who owns the budget envelope (typically the human — an
+   *  `owns_money` agent). If omitted, no budget enforcement — the spend
+   *  is still recorded for audit. */
+  ownerAgentId?: string;
   /** Budget period key. Defaults to "all-time". */
   period?: string;
 }
@@ -85,7 +86,7 @@ export function createLedger(opts: LedgerOptions): Ledger {
     });
 
     let overBudget = false;
-    if (input.principalId) {
+    if (input.ownerAgentId) {
       overBudget = applyToBudget(opts, input, usdMicros, now);
     }
     return { ledgerId, usdMicros, overBudget };
@@ -106,7 +107,7 @@ function applyToBudget(
     .from(tables.budgets)
     .where(
       and(
-        eq(tables.budgets.principalId, input.principalId!),
+        eq(tables.budgets.ownerAgentId, input.ownerAgentId!),
         eq(tables.budgets.agentId, input.actorId),
         eq(tables.budgets.period, period),
       ),
@@ -148,7 +149,7 @@ function applyToBudget(
           actorId: input.actorId,
           durable: true,
           payload: {
-            principalId: input.principalId,
+            ownerAgentId: input.ownerAgentId,
             agentId: input.actorId,
             period,
             threshold: t,

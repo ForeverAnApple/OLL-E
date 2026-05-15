@@ -34,7 +34,7 @@ beforeAll(async () => {
   client = await connectIpc(daemon.paths.socketFile);
   tools = buildInboxTools({
     inbox: daemon.inbox,
-    principalId: daemon.rootPrincipalId,
+    ownerAgentId: daemon.humanAgentId,
     bus: daemon.bus,
     hostId: daemon.hostId,
     store: daemon.store,
@@ -59,7 +59,7 @@ afterAll(async () => {
 
 function seedDecision(d: Daemon, summary = "install discord"): { id: string } {
   return d.inbox.propose({
-    principalId: d.rootPrincipalId,
+    ownerAgentId: d.humanAgentId,
     proposingAgentId: d.rootAgentId,
     tier: "strategic",
     summary,
@@ -76,7 +76,7 @@ describe("inbox.* IPC", () => {
     expect(rows.map((r) => r.summary).sort()).toEqual(["first", "second"]);
     for (const r of rows) {
       expect(r.status).toBe("open");
-      expect(r.principalId).toBe(daemon.rootPrincipalId);
+      expect(r.ownerAgentId).toBe(daemon.humanAgentId);
     }
   });
 
@@ -296,7 +296,7 @@ describe("mail_* core tools", () => {
     const { id } = seedDecision(daemon);
     // Approve first so the agent has something to reply to (semantically
     // typical, though reply works on any decision regardless of status).
-    daemon.inbox.respond({ decisionId: id, actorId: daemon.rootPrincipalId, vote: "approve" });
+    daemon.inbox.respond({ decisionId: id, actorId: daemon.humanAgentId, vote: "approve" });
     const reply = tools.find((t) => t.name === "mail_reply")!;
     const result = (await reply.execute(
       { decisionId: id, text: "done — see commit abc" },
@@ -334,7 +334,7 @@ describe("mail_* core tools", () => {
       })
       .run();
     const { id } = daemon.inbox.propose({
-      principalId: daemon.rootPrincipalId,
+      ownerAgentId: daemon.humanAgentId,
       proposingAgentId: childId,
       tier: "strategic",
       summary: "child ask",
@@ -355,7 +355,7 @@ describe("mail_* core tools", () => {
   });
 
   it("mail_propose is omitted when bus / hostId / store aren't all present", () => {
-    const partial = buildInboxTools({ inbox: daemon.inbox, principalId: daemon.rootPrincipalId });
+    const partial = buildInboxTools({ inbox: daemon.inbox, ownerAgentId: daemon.humanAgentId });
     expect(partial.find((t) => t.name === "mail_propose")).toBeUndefined();
   });
 });
@@ -369,7 +369,7 @@ describe("mail_list direction filter", () => {
 
   function rootSeedDecision(d: Daemon, summary = "in-row"): { id: string } {
     return d.inbox.propose({
-      principalId: d.rootPrincipalId,
+      ownerAgentId: d.humanAgentId,
       proposingAgentId: d.rootAgentId,
       tier: "strategic",
       summary,
@@ -400,14 +400,14 @@ describe("mail_list direction filter", () => {
       })
       .run();
     const open = daemon.inbox.propose({
-      principalId: daemon.rootPrincipalId,
+      ownerAgentId: daemon.humanAgentId,
       proposingAgentId: childId,
       tier: "strategic",
       summary: "child-open",
       payload: {},
     });
     const resolved = daemon.inbox.propose({
-      principalId: daemon.rootPrincipalId,
+      ownerAgentId: daemon.humanAgentId,
       proposingAgentId: childId,
       tier: "strategic",
       summary: "child-resolved",
@@ -472,21 +472,21 @@ describe("mail_propose tool", () => {
     const child = makeChild(daemon);
     const propose = tools.find((t) => t.name === "mail_propose")!;
 
-    const before = daemon.inbox.listOpen(daemon.rootPrincipalId).length;
+    const before = daemon.inbox.listOpen(daemon.humanAgentId).length;
     const result = (await propose.execute(
       { summary: "ranged refactor", payload: { action: "test" } },
       { ...makeCtx(daemon), actorId: child },
     )) as AskUpResult;
     expect(result.kind).toBe("auto-approved");
     expect(result.approverAgentId).toBe(daemon.rootAgentId);
-    expect(daemon.inbox.listOpen(daemon.rootPrincipalId).length).toBe(before);
+    expect(daemon.inbox.listOpen(daemon.humanAgentId).length).toBe(before);
   });
 
   it("queues to the principal when no ancestor has authority", async () => {
     const child = makeChild(daemon, []);
     const propose = tools.find((t) => t.name === "mail_propose")!;
 
-    const before = daemon.inbox.listOpen(daemon.rootPrincipalId).length;
+    const before = daemon.inbox.listOpen(daemon.humanAgentId).length;
     const result = (await propose.execute(
       {
         summary: "rewire mission",
@@ -498,7 +498,7 @@ describe("mail_propose tool", () => {
     )) as AskUpResult;
     expect(result.kind).toBe("queued");
     expect(result.decisionId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-    const after = daemon.inbox.listOpen(daemon.rootPrincipalId);
+    const after = daemon.inbox.listOpen(daemon.humanAgentId);
     expect(after.length).toBe(before + 1);
     const row = after.find((r) => r.id === result.decisionId)!;
     expect(row.summary).toBe("rewire mission");

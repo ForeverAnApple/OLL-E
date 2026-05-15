@@ -25,7 +25,6 @@ describe("store migrations", () => {
       "ledger",
       "memories",
       "memory_reads",
-      "principals",
       "task_runs",
       "tasks",
       "team_members",
