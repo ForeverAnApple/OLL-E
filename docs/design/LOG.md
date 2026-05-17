@@ -973,6 +973,20 @@ The pushback was correct, and the prior framing was muddled. Vision draws two ax
 
 ---
 
+## 2026-05-16 — Migration runner tracks by name, not index
+
+`scripts/install.sh && olle chat` failed on an existing dev DB with `no such table: team_claims`. Root cause: the runner keyed `_migrations` on `idx INTEGER PRIMARY KEY`. When 0003 got renamed from `principals_collapse` (folded into `0001_init.sql` per commit `8d1f420`) to `team_mesh`, every existing DB had idx=3 already applied — under the old name. The runner saw idx=3 present and skipped, so the new content at the same idx never ran. Daemon then crashed on the missing tables.
+
+This is a class of bug, not a one-off. Any migration collapse, rename, or content swap at an existing index silently no-ops on installed DBs. The CLAUDE.md note that "pre-v1 has no installed-user upgrade path to preserve" was being read as license to ignore the breakage, but it actually meant "we won't ship migrations to roll forward from pre-v1 schema" — not "the runner can lie about which migration ran." Those are different statements; conflating them is how silent drift starts.
+
+**Fix.** `_migrations` is now `(name TEXT PRIMARY KEY, applied_at INTEGER)`. Identity is the migration's name; the array position in `MIGRATIONS` is ordering only. The runner detects the legacy `idx`-keyed table on first boot and rebuilds it in a single transaction (preserves `name` + `applied_at`, drops `idx`). The old `principals_collapse` row stays as historical attestation that its content already landed; the new `team_mesh` row gets inserted when its SQL runs. Fresh installs create the new schema directly; never see the migration shim.
+
+**Rule going forward.** Migration *name* = content identity. Once shipped, never rename. Never change content. If content needs to change, add a new migration with a new name. The runner cannot defend against editing a migration in place under the same name — that's the developer discipline the rule preserves.
+
+**What this rejected.** Wiping the dev DB was the lazy fix and matches the "no upgrade path" framing. Rejected because the breakage isn't the user's data, it's the runner's identity model. Patching the model fixes every future rename without the discipline-of-remembering-to-wipe.
+
+---
+
 ## How to use this log
 
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.

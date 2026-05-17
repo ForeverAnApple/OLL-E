@@ -1,5 +1,7 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { openStore, tables } from "../src/store/index.ts";
+import { runMigrations } from "../src/store/migrate.ts";
 import { createClock, encodeStamp, ulid } from "../src/id/index.ts";
 
 function fresh() {
@@ -50,6 +52,45 @@ describe("store migrations", () => {
       .get();
     expect(total?.n).toBeGreaterThan(0);
     expect(total2?.n).toBe(total?.n);
+  });
+
+  it("upgrades legacy idx-keyed _migrations and runs pending content", () => {
+    // Simulate a pre-LOG-2026-05-16 dev DB: _migrations keyed on idx, with
+    // a renamed-and-collapsed entry occupying idx=3. The current MIGRATIONS
+    // array expects name=team_mesh at idx=3 — under the old runner this
+    // never ran. Under the new runner the rebuild preserves the historical
+    // row and applies team_mesh.
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE _migrations (
+        idx INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+      INSERT INTO _migrations (idx, name, applied_at) VALUES
+        (1, 'init', 1),
+        (2, 'agent_display_name', 2),
+        (3, 'principals_collapse', 3);
+    `);
+    runMigrations(db);
+    const cols = db.query("PRAGMA table_info(_migrations)").all() as Array<{ name: string }>;
+    expect(cols.map((c) => c.name)).toEqual(["name", "applied_at"]);
+    const names = (db.query("SELECT name FROM _migrations").all() as Array<{ name: string }>).map(
+      (r) => r.name,
+    );
+    // Old name preserved as audit; new content ran under its current name.
+    expect(names).toContain("principals_collapse");
+    expect(names).toContain("team_mesh");
+    expect(names).toContain("memory_tombstones");
+    // Tables from the 0003_team_mesh migration are present.
+    const tableNames = (
+      db.query("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{
+        name: string;
+      }>
+    ).map((r) => r.name);
+    expect(tableNames).toContain("team_claims");
+    expect(tableNames).toContain("team_peers");
+    expect(tableNames).toContain("team_invites");
   });
 });
 
