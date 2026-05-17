@@ -479,6 +479,79 @@ export const memoryReads = sqliteTable(
   }),
 );
 
+// ─── Team mesh substrate (migration 0003) ─────────────────────────────────
+//
+// Local view of "who else is in this team and how do I reach them right
+// now." One row per (team, peer). Status reflects the local link state,
+// not a consensus view. peer_host_id is a weak ref — peers from other
+// cells aren't present in the local `hosts` table.
+export const teamPeers = sqliteTable(
+  "team_peers",
+  {
+    teamId: text("team_id")
+      .notNull()
+      .references(() => teams.id),
+    peerHostId: text("peer_host_id").notNull(),
+    addr: text("addr").notNull(),
+    status: text("status").notNull(), // connected | disconnected | stale | left | rejected
+    lastHeartbeatAt: integer("last_heartbeat_at"),
+    lastReceivedEventId: text("last_received_event_id"),
+    joinedAt: integer("joined_at").notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.teamId, t.peerHostId] }),
+    byStatus: index("team_peers_status").on(t.status),
+  }),
+);
+
+// Outstanding bearer-code invites the local host has issued. The raw
+// secret never lands in SQLite — only its hash plus a `secret_ref`
+// pointing into `secrets/team/<teamId>` where the canonical bytes live.
+export const teamInvites = sqliteTable("team_invites", {
+  inviteId: text("invite_id").primaryKey(),
+  teamId: text("team_id")
+    .notNull()
+    .references(() => teams.id),
+  codeHash: text("code_hash").notNull(),
+  secretRef: text("secret_ref").notNull(),
+  addr: text("addr").notNull(),
+  createdByActorId: text("created_by_actor_id").notNull(),
+  createdAt: integer("created_at").notNull(),
+  expiresAt: integer("expires_at"),
+  redeemedAt: integer("redeemed_at"),
+  redeemedByHostId: text("redeemed_by_host_id"),
+});
+
+// Leaderless claim-window projection across the mesh. Distinct from the
+// single-host `claims` table — `claims` is the local scheduler's per-
+// event-per-task winner record, `team_claims` is the cross-host
+// arbitration projection. event_id, claiming_host_id, and
+// claiming_agent_id are weak refs (the event/agent may live on a peer
+// host). task_fingerprint is the stable identity used to dedupe when
+// the same logical task is registered on multiple cells.
+export const teamClaims = sqliteTable(
+  "team_claims",
+  {
+    claimId: text("claim_id").primaryKey(),
+    teamId: text("team_id")
+      .notNull()
+      .references(() => teams.id),
+    eventId: text("event_id").notNull(),
+    eventHlc: text("event_hlc").notNull(),
+    claimingHostId: text("claiming_host_id").notNull(),
+    claimingAgentId: text("claiming_agent_id").notNull(),
+    taskId: text("task_id").notNull(),
+    taskFingerprint: text("task_fingerprint").notNull(),
+    claimHlc: text("claim_hlc").notNull(),
+    status: text("status").notNull(), // intent | won | lost | split_brain
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => ({
+    byEvent: index("team_claims_event").on(t.eventId),
+    byTeam: index("team_claims_team").on(t.teamId, t.createdAt),
+  }),
+);
+
 export interface AgentScope {
   allowTools?: string[];
   denyTools?: string[];
@@ -506,3 +579,9 @@ export type TaskRow = typeof tasks.$inferSelect;
 export type NewTaskRow = typeof tasks.$inferInsert;
 export type TaskRun = typeof taskRuns.$inferSelect;
 export type NewTaskRun = typeof taskRuns.$inferInsert;
+export type TeamPeer = typeof teamPeers.$inferSelect;
+export type NewTeamPeer = typeof teamPeers.$inferInsert;
+export type TeamInvite = typeof teamInvites.$inferSelect;
+export type NewTeamInvite = typeof teamInvites.$inferInsert;
+export type TeamClaim = typeof teamClaims.$inferSelect;
+export type NewTeamClaim = typeof teamClaims.$inferInsert;

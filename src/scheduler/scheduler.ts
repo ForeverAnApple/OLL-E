@@ -21,6 +21,7 @@ import type { Event } from "../bus/types.ts";
 import type { Store } from "../store/db.ts";
 import { tables } from "../store/index.ts";
 import { ulid } from "../id/index.ts";
+import { createClaims, type Claims } from "./claims.ts";
 
 export type Tier = "operational" | "strategic" | "vision";
 
@@ -51,6 +52,9 @@ export interface SchedulerOptions {
   store: Store;
   hostId: string;
   onError?: (err: unknown, task: TaskDef, event: Event) => void;
+  /** Override the leaderless claim window (default 100ms). Tests use this
+   *  to drive arbitration deterministically. */
+  claimWindowMs?: number;
 }
 
 export interface Scheduler {
@@ -200,17 +204,24 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
     }
   }
 
-  async function execute(slot: Slot, event: Event): Promise<void> {
+  // Run the task handler — the durable, slot-occupying portion of dispatch.
+  // Owns the runs row, done-event emission, and inflight bookkeeping. Single-
+  // host fast path enters here directly; team-claim path enters here only on
+  // arbitration win.
+  async function runTask(slot: Slot, event: Event): Promise<void> {
     const { task } = slot;
     const claimable = Boolean(
       (event.payload as Record<string, unknown>)?.claimable,
     );
+    const isTeam = typeof (event.payload as Record<string, unknown>)?.teamId === "string";
     try {
       ensureEventPersisted(event);
     } catch (err) {
       logPersistError("ensureEventPersisted", task, err, event);
     }
-    if (claimable) recordClaim(task, event, "winner");
+    // Single-host claim audit row stays on the non-team path; team-claim
+    // arbitration is captured in `team_claims` instead (LOG 2026-05-13).
+    if (claimable && !isTeam) recordClaim(task, event, "winner");
     const runId = startRun(task, event);
     const ctx: TaskContext = {
       event,
@@ -233,7 +244,7 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
       await task.handler(ctx);
     } catch (caught) {
       err = caught;
-      if (claimable) recordClaim(task, event, "failed");
+      if (claimable && !isTeam) recordClaim(task, event, "failed");
       onErr(err, task, event);
     } finally {
       const errMsg = err instanceof Error ? err.message : err != null ? String(err) : undefined;
@@ -253,9 +264,26 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
         parentEventId: event.id,
         durable: false,
       });
-      slot.inflight -= 1;
-      drainQueue(slot);
+      releaseSlot(slot);
     }
+  }
+
+  function releaseSlot(slot: Slot): void {
+    slot.inflight -= 1;
+    drainQueue(slot);
+  }
+
+  // Route an eligible (matched, slotted) event: team-scoped claimable events
+  // enter the leaderless claim window; everything else runs immediately.
+  function route(slot: Slot, event: Event): void {
+    const payload = (event.payload as Record<string, unknown>) ?? {};
+    const claimable = Boolean(payload.claimable);
+    const teamId = typeof payload.teamId === "string" ? payload.teamId : null;
+    if (claimable && teamId) {
+      claims.registerIntent({ task: { id: slot.task.id, agentId: slot.task.agentId }, event });
+      return;
+    }
+    void runTask(slot, event);
   }
 
   function drainQueue(slot: Slot): void {
@@ -263,7 +291,7 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
     while (slot.inflight < limit && slot.queue.length > 0) {
       const ev = slot.queue.shift()!;
       slot.inflight += 1;
-      void execute(slot, ev);
+      route(slot, ev);
     }
   }
 
@@ -275,7 +303,7 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
       return;
     }
     slot.inflight += 1;
-    void execute(slot, event);
+    route(slot, event);
   }
 
   function register(task: TaskDef): () => void {
@@ -329,7 +357,28 @@ export function createScheduler(opts: SchedulerOptions): Scheduler {
   function close(): void {
     for (const slot of slots.values()) slot.unsubscribe();
     slots.clear();
+    claims.stop();
   }
+
+  // Forward declaration: route() reads `claims`; claims' onWin/onLose need
+  // the slot map. Both close over each other via the surrounding scope.
+  const claims: Claims = createClaims({
+    bus: opts.bus,
+    store: opts.store,
+    hostId: opts.hostId,
+    claimWindowMs: opts.claimWindowMs,
+    onWin: ({ task, event }) => {
+      const slot = slots.get(task.id);
+      if (!slot) return; // task was unregistered between intent and win
+      void runTask(slot, event);
+    },
+    onLose: ({ task }) => {
+      const slot = slots.get(task.id);
+      if (!slot) return;
+      releaseSlot(slot);
+    },
+  });
+  claims.start();
 
   return { register, inflight, recoverLost, close };
 }
