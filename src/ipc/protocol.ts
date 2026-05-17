@@ -31,7 +31,12 @@ export type Method =
   | "publish"
   | "tail"
   | "tail.cancel"
-  | "version";
+  | "version"
+  | "team.create"
+  | "team.invite"
+  | "team.join"
+  | "team.leave"
+  | "team.status";
 
 export function isRequest(v: unknown): v is Request {
   if (!v || typeof v !== "object") return false;

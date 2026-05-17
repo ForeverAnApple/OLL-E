@@ -16,6 +16,10 @@ import { buildMetaTools } from "../tools/meta.ts";
 import { buildObservabilityTools } from "../tools/observability.ts";
 import { buildInboxTools } from "../tools/inbox.ts";
 import { buildToolResultTools } from "../tools/tool-results.ts";
+import { buildTeamTools } from "../tools/team.ts";
+import { startRealMeshBridge, type RealMeshBridge } from "../mesh/bridge.ts";
+import { wireBridgeToBus } from "../mesh/wire.ts";
+import type { ToolDef } from "../extensions/types.ts";
 import { createToolResultStore } from "../store/tool-results.ts";
 import { checkCoreInvariants, formatFailures } from "../boot/invariants.ts";
 import { startChatHealthMonitor, type ChatHealthMonitor } from "./chat-health.ts";
@@ -39,6 +43,13 @@ export interface StartDaemonOptions {
   version?: string;
   /** Silent mode for tests. */
   quiet?: boolean;
+  /** Listening port for the mesh WebSocket listener. Defaults to
+   *  $OLLE_MESH_PORT or 0 (OS-assigned). Pick a known port in production
+   *  so peer addrs in bearer codes stay stable across daemon restarts. */
+  meshPort?: number;
+  /** Disable the mesh layer entirely. Useful for tests that never touch
+   *  teams — skips opening a listener port. Defaults to true. */
+  enableMesh?: boolean;
 }
 
 export interface Daemon {
@@ -53,6 +64,8 @@ export interface Daemon {
   readonly inbox: Inbox;
   readonly rootAgentId: string;
   readonly humanAgentId: string;
+  readonly bridge?: RealMeshBridge;
+  readonly teamTools: ToolDef[];
   readonly chat?: AgentLoop;
   readonly chatAgentId?: string;
   readonly agentManager?: AgentManager;
@@ -113,6 +126,48 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // intentionally returns undefined so bridges use rootAgentId.
   const managerHolder: { ref: AgentManager | undefined } = { ref: undefined };
 
+  // ─── Mesh bridge ─────────────────────────────────────────────────────
+  //
+  // Real WebSocket peer mesh for cross-host federation. Wired before
+  // extension loading so events the loaders emit (extension.loaded,
+  // task.registered, etc.) can cross to peer cells if they're team-scoped.
+  // Port defaults to $OLLE_MESH_PORT or 0 (OS-assigned). Set a known port
+  // in production so bearer-code addrs stay stable across restarts.
+  const meshEnabled = opts.enableMesh !== false;
+  const meshPort = resolveMeshPort(opts.meshPort);
+  let bridge: RealMeshBridge | undefined;
+  let wiredBridge: { unwire(): void } | undefined;
+  if (meshEnabled) {
+    bridge = startRealMeshBridge({
+      bus,
+      store,
+      hostId,
+      port: meshPort,
+      loadTeams: () => loadTeamsFromStore(store, paths),
+      onPeerStatus: (params) => persistPeerStatus(store, params),
+      redeemInvite: (params) => redeemInviteInStore(store, params),
+    });
+    try {
+      await bridge.start();
+    } catch (err) {
+      if (!opts.quiet) {
+        console.error(`olle: mesh bridge failed to start: ${(err as Error).message}`);
+      }
+      bridge = undefined;
+    }
+    if (bridge) {
+      wiredBridge = wireBridgeToBus({ bus, bridge: bridge.asBridge() });
+    }
+  }
+
+  // Team tools — registered even when mesh is disabled so the IPC surface
+  // can return a clean "mesh disabled" error rather than 404. When the
+  // bridge is undefined, tool calls fail at execute-time with a clear
+  // diagnostic; status remains read-only and always works.
+  const teamTools: ToolDef[] = bridge
+    ? buildTeamTools({ bus, store, hostId, bridge, olleRoot: paths.root })
+    : [];
+
   ensureRepo(paths.extensionsDir);
   const extensions = createExtensionHost({
     bus,
@@ -154,6 +209,8 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     rootAgentId,
     humanAgentId,
     inbox,
+    teamTools,
+    meshEnabled: bridge !== undefined,
     chatStatus: () => ({
       enabled: chat !== undefined,
       reason: chatDisabledReason,
@@ -275,6 +332,11 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         // oversize result lands, the agent needs this in the same turn or
         // it'd burn an extra round-trip just to learn the recovery path.
         ...buildToolResultTools({ store: toolResultStore }),
+        // Team substrate — cell-to-cell federation. Empty when the mesh
+        // is disabled (test daemon, missing bridge), so the agent's
+        // catalog reflects "team category absent" rather than offering
+        // tools that would always fail.
+        ...teamTools,
       ];
       // Boot invariants — last gate before chat goes live. Tool-name
       // duplication, malformed schemas, etc. surface here as a named
@@ -501,6 +563,14 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         /* best-effort */
       }
     }
+    if (wiredBridge) wiredBridge.unwire();
+    if (bridge) {
+      try {
+        await bridge.close();
+      } catch {
+        /* best-effort */
+      }
+    }
     await ipc.close();
     bus.close();
     store.close();
@@ -526,11 +596,151 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     inbox,
     rootAgentId,
     humanAgentId,
+    bridge,
+    teamTools,
     chat,
     chatAgentId,
     agentManager: managerHolder.ref,
     shutdown,
   };
+}
+
+function resolveMeshPort(override?: number): number {
+  if (override !== undefined) return override;
+  const envPort = process.env.OLLE_MESH_PORT;
+  if (envPort) {
+    const n = Number.parseInt(envPort, 10);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  // 0 lets the OS pick. Production operators who care about a stable
+  // peer-dial addr should set OLLE_MESH_PORT explicitly.
+  return 0;
+}
+
+interface PeerStatusUpdate {
+  teamId: string;
+  peerHostId: string;
+  status: string;
+  addr?: string;
+  lastReceivedEventId?: string;
+}
+
+function persistPeerStatus(store: Store, params: PeerStatusUpdate): void {
+  // Upsert: the bridge may emit transitions for peers we haven't yet
+  // committed to local state (welcome-time, mid-handshake). INSERT OR
+  // IGNORE the row first, then UPDATE the live columns.
+  const now = Date.now();
+  try {
+    store.raw
+      .prepare(
+        `INSERT OR IGNORE INTO team_peers
+           (team_id, peer_host_id, addr, status, last_heartbeat_at,
+            last_received_event_id, joined_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        params.teamId,
+        params.peerHostId,
+        params.addr ?? "",
+        params.status,
+        params.status === "connected" ? now : null,
+        params.lastReceivedEventId ?? null,
+        now,
+      );
+    type Bind = string | number | null;
+    const updates: string[] = ["status = ?"];
+    const args: Bind[] = [params.status];
+    if (params.addr !== undefined) {
+      updates.push("addr = ?");
+      args.push(params.addr);
+    }
+    if (params.status === "connected") {
+      updates.push("last_heartbeat_at = ?");
+      args.push(now);
+    }
+    if (params.lastReceivedEventId !== undefined) {
+      updates.push("last_received_event_id = ?");
+      args.push(params.lastReceivedEventId);
+    }
+    args.push(params.teamId, params.peerHostId);
+    store.raw
+      .prepare(
+        `UPDATE team_peers SET ${updates.join(", ")} WHERE team_id = ? AND peer_host_id = ?`,
+      )
+      .run(...args);
+  } catch (err) {
+    // eslint-disable-next-line no-console -- daemon infra
+    console.error(`[daemon] persistPeerStatus failed: ${(err as Error).message}`);
+  }
+}
+
+interface InviteRedemption {
+  teamId: string;
+  inviteId: string;
+  byHostId: string;
+}
+
+function redeemInviteInStore(store: Store, params: InviteRedemption): boolean {
+  const now = Date.now();
+  try {
+    const row = store.raw
+      .prepare(
+        `SELECT invite_id, team_id, expires_at, redeemed_at FROM team_invites WHERE invite_id = ?`,
+      )
+      .get(params.inviteId) as
+      | { invite_id: string; team_id: string; expires_at: number | null; redeemed_at: number | null }
+      | undefined;
+    if (!row) return false;
+    if (row.team_id !== params.teamId) return false;
+    if (row.redeemed_at != null) return false;
+    if (row.expires_at != null && row.expires_at < now) return false;
+    const result = store.raw
+      .prepare(
+        `UPDATE team_invites
+           SET redeemed_at = ?, redeemed_by_host_id = ?
+         WHERE invite_id = ? AND redeemed_at IS NULL`,
+      )
+      .run(now, params.byHostId, params.inviteId);
+    return (result.changes ?? 0) > 0;
+  } catch (err) {
+    // eslint-disable-next-line no-console -- daemon infra
+    console.error(`[daemon] redeemInvite failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+function loadTeamsFromStore(
+  store: Store,
+  paths: OllePaths,
+): Array<{ teamId: string; secret: string; peers: Array<{ peerHostId: string; addr: string; lastReceivedEventId: string | null }> }> {
+  const teams = store.select().from(tables.teams).all();
+  const out: Array<{
+    teamId: string;
+    secret: string;
+    peers: Array<{ peerHostId: string; addr: string; lastReceivedEventId: string | null }>;
+  }> = [];
+  for (const t of teams) {
+    let secret: string;
+    try {
+      secret = readFileSync(join(paths.secretsDir, "team", t.id), "utf8").trim();
+    } catch {
+      // Missing secret file → team is dead-but-not-dropped. Skip; the
+      // agent can revisit via team_leave or olle inspect.
+      continue;
+    }
+    const peers = store
+      .select()
+      .from(tables.teamPeers)
+      .all()
+      .filter((p) => p.teamId === t.id)
+      .map((p) => ({
+        peerHostId: p.peerHostId,
+        addr: p.addr,
+        lastReceivedEventId: p.lastReceivedEventId,
+      }));
+    out.push({ teamId: t.id, secret, peers });
+  }
+  return out;
 }
 
 function buildHostContextPrompt(paths: OllePaths, hostId: string): string {

@@ -11,6 +11,7 @@ import {
 import { join } from "node:path";
 import type { EventBus } from "../bus/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
+import type { ToolDef } from "../extensions/types.ts";
 import { history, revertSubtree } from "../extensions/git.ts";
 import { installStarter, listStarters } from "../starters/index.ts";
 import type { OllePaths } from "../paths.ts";
@@ -65,6 +66,13 @@ export interface IpcServerOptions {
    *  Returns true when a turn was running and was signalled to abort,
    *  false when no active turn was found. */
   chatCancel?: (threadId: string) => boolean;
+  /** Team tools — same factory result the agent core uses. CLI `team.*`
+   *  methods dispatch through these so the parallel-tool-surface rule
+   *  holds (no privileged human path). Empty when the mesh is disabled. */
+  teamTools?: ToolDef[];
+  /** True when the mesh bridge is alive. `team.*` mutating calls return
+   *  a clean error when false rather than a confusing tool failure. */
+  meshEnabled?: boolean;
 }
 
 export interface IpcServer {
@@ -615,6 +623,66 @@ async function dispatch(
           ok: true,
           value: { open: opts.inbox.listOpen(ownerAgentId).length },
         });
+        return;
+      }
+      // Team substrate — `olle team ...` and any future bridge surface
+      // route through the same tools the agent core uses, with the
+      // human agent as the synthetic actor. Mutating methods refuse
+      // when the mesh is disabled; status is always-on (read-only).
+      case "team.create":
+      case "team.invite":
+      case "team.join":
+      case "team.leave":
+      case "team.status": {
+        const toolName = req.method.replace("team.", "team_");
+        const tools = opts.teamTools ?? [];
+        const tool = tools.find((t) => t.name === toolName);
+        if (!tool) {
+          if (!opts.meshEnabled) {
+            send({
+              id: req.id,
+              ok: false,
+              error: {
+                message:
+                  "mesh disabled on this daemon; team operations unavailable",
+              },
+            });
+            return;
+          }
+          send({
+            id: req.id,
+            ok: false,
+            error: { message: `team tool not registered: ${toolName}` },
+          });
+          return;
+        }
+        const actorId = (req.params?.actorId as string | undefined) ?? opts.humanAgentId;
+        if (!actorId) {
+          send({
+            id: req.id,
+            ok: false,
+            error: { message: "humanAgentId required to invoke team tools" },
+          });
+          return;
+        }
+        const args = (req.params ?? {}) as Record<string, unknown>;
+        const ctx = {
+          hostId: opts.rootAgentId ? "(daemon)" : "(daemon)",
+          extensionId: "core",
+          actorId,
+          abort: new AbortController().signal,
+          secrets: {} as Record<string, string>,
+        };
+        Promise.resolve()
+          .then(() => tool.execute(args, ctx))
+          .then((value) => send({ id: req.id, ok: true, value }))
+          .catch((err: unknown) =>
+            send({
+              id: req.id,
+              ok: false,
+              error: { message: (err as Error).message ?? String(err) },
+            }),
+          );
         return;
       }
       default:

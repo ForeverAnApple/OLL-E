@@ -82,6 +82,16 @@ const CATEGORY_PROSE: Record<string, { tagline: string; body: string }> = {
       "extensions. Use before filesystem or subprocess work — knowing\n" +
       "beats guessing at error strings.",
   },
+  team: {
+    tagline: "cell-to-cell federation",
+    body:
+      "Teams are peer cells negotiating around a shared goal. Use\n" +
+      "`team_create` to start a new shared identity rooted on this host,\n" +
+      "`team_invite` to mint a bearer code another host can redeem,\n" +
+      "`team_join` to accept a code, and `team_leave` to drop out.\n" +
+      "`team_status` is the read-only roster. Strategic tier on create/\n" +
+      "invite/join — entering or expanding a trust relationship.",
+  },
   scratch: {
     tagline: "task-ephemeral working files",
     body:

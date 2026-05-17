@@ -79,6 +79,10 @@ export async function runCli(args: string[]): Promise<void> {
     case "inbox":
       await cmdInbox(rest);
       return;
+    case "team":
+    case "teams":
+      await cmdTeam(rest);
+      return;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
@@ -574,6 +578,111 @@ async function cmdSecret(args: string[]): Promise<void> {
       }
       default:
         throw new Error(`unknown secret subcommand: ${sub}`);
+    }
+  });
+}
+
+async function cmdTeam(args: string[]): Promise<void> {
+  const [sub, ...rest] = args;
+  const paths = resolvePaths();
+  await withIpc(paths.socketFile, async (client) => {
+    switch (sub) {
+      case "create": {
+        const name = rest.join(" ").trim();
+        if (!name) throw new Error("usage: olle team create <name>");
+        const r = await client.call<{
+          ok: boolean;
+          teamId?: string;
+          error?: string;
+        }>("team.create", { name });
+        if (!r.ok) throw new Error(`team create failed: ${r.error ?? "unknown"}`);
+        console.log(`Created team "${name}" (${r.teamId}).`);
+        console.log(`Use 'olle team invite ${r.teamId}' to add peers.`);
+        return;
+      }
+      case "invite": {
+        const teamId = rest[0];
+        if (!teamId) throw new Error("usage: olle team invite <teamId> [--ttl <ms>]");
+        const ttlRaw = parseFlagValue(rest.slice(1), "--ttl");
+        const ttlMs = ttlRaw ? Number.parseInt(ttlRaw, 10) : undefined;
+        if (ttlRaw && (!Number.isFinite(ttlMs!) || ttlMs! < 0)) {
+          throw new Error(`--ttl must be a non-negative integer (ms), got ${ttlRaw}`);
+        }
+        const params: Record<string, unknown> = { teamId };
+        if (ttlMs !== undefined) params.ttlMs = ttlMs;
+        const r = await client.call<{
+          ok: boolean;
+          code?: string;
+          inviteId?: string;
+          error?: string;
+        }>("team.invite", params);
+        if (!r.ok) throw new Error(`team invite failed: ${r.error ?? "unknown"}`);
+        console.log(r.code);
+        console.log(`(invite ${r.inviteId} — share the code above out-of-band)`);
+        return;
+      }
+      case "join": {
+        const code = rest[0];
+        if (!code) throw new Error("usage: olle team join <code>");
+        const r = await client.call<{
+          ok: boolean;
+          teamId?: string;
+          peerHostId?: string;
+          error?: string;
+        }>("team.join", { code });
+        if (!r.ok) throw new Error(`team join failed: ${r.error ?? "unknown"}`);
+        console.log(`Joined team ${r.teamId} via peer ${r.peerHostId}.`);
+        return;
+      }
+      case "leave": {
+        const teamId = rest[0];
+        if (!teamId) throw new Error("usage: olle team leave <teamId>");
+        const r = await client.call<{ ok: boolean; teamId?: string; error?: string }>(
+          "team.leave",
+          { teamId },
+        );
+        if (!r.ok) throw new Error(`team leave failed: ${r.error ?? "unknown"}`);
+        console.log(`Left team ${r.teamId}.`);
+        return;
+      }
+      case undefined:
+      case "status": {
+        const r = await client.call<{
+          teams: Array<{
+            teamId: string;
+            name: string;
+            members: Array<{ actorId: string; role: string }>;
+            peers: Array<{
+              peerHostId: string;
+              status: string;
+              addr: string;
+              lastHeartbeatAt: number | null;
+            }>;
+          }>;
+        }>("team.status");
+        if (r.teams.length === 0) {
+          console.log("(no teams)");
+          return;
+        }
+        for (const t of r.teams) {
+          console.log(`${t.name}  ${t.teamId}`);
+          console.log(`  members: ${t.members.map((m) => `${m.actorId} (${m.role})`).join(", ") || "(none)"}`);
+          if (t.peers.length === 0) {
+            console.log(`  peers:   (none)`);
+          } else {
+            for (const p of t.peers) {
+              const hb =
+                p.lastHeartbeatAt != null
+                  ? new Date(p.lastHeartbeatAt).toISOString()
+                  : "-";
+              console.log(`  peer ${p.peerHostId}  ${p.status}  ${p.addr}  hb=${hb}`);
+            }
+          }
+        }
+        return;
+      }
+      default:
+        throw new Error(`unknown team subcommand: ${sub}`);
     }
   });
 }
@@ -1076,10 +1185,10 @@ function summarizeScalar(v: unknown, budget: number, depth: number): string {
   return String(v);
 }
 
-function summarizeInput(input: unknown): string {
+function summarizeInput(input: unknown, width: number = termWidth()): string {
   try {
     if (input === null || input === undefined) return "";
-    const max = Math.max(20, termWidth() - 16);
+    const max = Math.max(20, width - 16);
     if (typeof input !== "object") return clipString(String(input), max);
     if (Array.isArray(input)) return clipString(summarizeScalar(input, max, 0), max);
 
@@ -1123,16 +1232,16 @@ function summarizeInput(input: unknown): string {
     // proxies, etc). The chat UI should never go down because of bad
     // tool arguments — a string fallback always renders.
     try {
-      return clipString(String(input), Math.max(20, termWidth() - 16));
+      return clipString(String(input), Math.max(20, width - 16));
     } catch {
       return "(unrenderable)";
     }
   }
 }
 
-function summarizeResult(content: string): string {
+function summarizeResult(content: string, width: number = termWidth()): string {
   const oneLine = content.replace(/\s+/g, " ").trim();
-  const max = Math.max(20, termWidth() - 8);
+  const max = Math.max(20, width - 8);
   return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
 }
 
@@ -1163,6 +1272,10 @@ export interface ChatUIOpts {
 export function createChatUI(opts: ChatUIOpts) {
   const out: ChatUIOut = opts.out ?? process.stdout;
   const headerLabel = `◆ ${opts.agentName}`;
+  const color = (code: string, s: string): string => {
+    if (!out.isTTY) return s;
+    return `${code}${s}${ANSI.reset}`;
+  };
 
   // Progressive block-commit streaming. The assistant block has two halves:
   //   committed — header + already-rendered markdown blocks. Written once,
@@ -1655,7 +1768,7 @@ export function createChatUI(opts: ChatUIOpts) {
         flushAssistant();
         const icon = toolIcon(name);
         const head = color(ANSI.muted, `  ${icon} `);
-        const body = `${color(ANSI.text, name)}${color(ANSI.muted, `(${summarizeInput(input)})`)}`;
+        const body = `${color(ANSI.text, name)}${color(ANSI.muted, `(${summarizeInput(input, termWidth())})`)}`;
         out.write(`${head}${body}\n`);
       });
     },
@@ -1677,7 +1790,7 @@ export function createChatUI(opts: ChatUIOpts) {
         }
         const lines = text.split("\n");
         if (lines.length === 1) {
-          const oneLine = summarizeResult(text);
+          const oneLine = summarizeResult(text, termWidth());
           out.write(`    ${bar} ${color(bodyColor, oneLine)}\n`);
           return;
         }
@@ -2568,6 +2681,13 @@ function printHelp(): void {
       "  secret list                 list secret names (values never shown)",
       "  secret set <NAME> [value]   store a secret (or pipe on stdin)",
       "  secret remove <NAME>        remove a stored secret",
+      "",
+      "  Teams — cell-to-cell federation (paired with team_* tools):",
+      "  team status                                   list teams, members, and connected peers",
+      "  team create <name>                            mint a new team rooted on this host",
+      "  team invite <teamId> [--ttl <ms>]             issue a bearer code peers can redeem",
+      "  team join <code>                              accept a bearer code from a peer",
+      "  team leave <teamId>                           drop out of a team",
       "",
       "  Inbox — async decisions awaiting your response (paired with mail_* tools):",
       "  inbox                                         interactive TUI (vim keys; ? for help)",
