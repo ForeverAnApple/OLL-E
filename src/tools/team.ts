@@ -22,6 +22,7 @@ import type { Store } from "../store/db.ts";
 import { tables } from "../store/index.ts";
 import type { ToolDef } from "../extensions/types.ts";
 import { ulid } from "../id/index.ts";
+import { teamRoster, type TeamRosterRow } from "../observability/index.ts";
 import {
   decodeBearerCode,
   encodeBearerCode,
@@ -52,18 +53,7 @@ export interface TeamToolsOptions {
   joinTimeoutMs?: number;
 }
 
-interface TeamStatusEntry {
-  teamId: string;
-  name: string;
-  members: Array<{ actorId: string; role: string; joinedAt: number }>;
-  peers: Array<{
-    peerHostId: string;
-    addr: string;
-    status: string;
-    lastHeartbeatAt: number | null;
-    lastReceivedEventId: string | null;
-  }>;
-}
+type TeamStatusEntry = TeamRosterRow;
 
 interface PeerSetEntry {
   peerHostId: string;
@@ -412,39 +402,10 @@ export function buildTeamTools(opts: TeamToolsOptions): ToolDef[] {
     description:
       "Return every team this host is a member of, with member roster and peer connectivity (status, last heartbeat, last received event watermark). Read-only — safe to call any time, including between strategic turns to confirm a join landed or to diagnose flapping peers.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
-    execute: () => {
-      const teamRows = store.select().from(tables.teams).all();
-      const result: TeamStatusEntry[] = [];
-      for (const t of teamRows) {
-        const members = store
-          .select()
-          .from(tables.teamMembers)
-          .where(eq(tables.teamMembers.teamId, t.id))
-          .all();
-        const peers = store
-          .select()
-          .from(tables.teamPeers)
-          .where(eq(tables.teamPeers.teamId, t.id))
-          .all();
-        result.push({
-          teamId: t.id,
-          name: t.name,
-          members: members.map((m) => ({
-            actorId: m.actorId,
-            role: m.role,
-            joinedAt: m.joinedAt,
-          })),
-          peers: peers.map((p) => ({
-            peerHostId: p.peerHostId,
-            addr: p.addr,
-            status: p.status,
-            lastHeartbeatAt: p.lastHeartbeatAt,
-            lastReceivedEventId: p.lastReceivedEventId,
-          })),
-        });
-      }
-      return { teams: result };
-    },
+    // Single source of truth for "what teams am I in" lives in the
+    // observability layer; this tool and `olle status` both call it so
+    // they can't drift (AGENTS.md vision-check rule).
+    execute: () => teamRoster(store),
   };
 
   return [create, invite, joinTeam, leave, status];

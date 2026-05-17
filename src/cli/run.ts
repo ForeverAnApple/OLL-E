@@ -9,6 +9,7 @@ import type {
   BudgetStatus,
   RecentEventRow,
   RunHistoryRow,
+  TeamRoster,
   ThreadInventoryRow,
   UsageStats,
 } from "../observability/index.ts";
@@ -115,7 +116,7 @@ async function cmdStatus(args: string[]): Promise<void> {
     // All independent reads in flight at once. Each tolerates failure so
     // an older daemon (or one mid-startup) still produces a partial view
     // rather than crashing the dashboard.
-    const [host, chat, rootAgent, exts, usage, runs, threads, inbox] =
+    const [host, chat, rootAgent, exts, usage, runs, threads, inbox, teams] =
       await Promise.all([
         client
           .call<{ hostId: string; pid: number; uptimeMs: number }>("status")
@@ -147,6 +148,9 @@ async function cmdStatus(args: string[]): Promise<void> {
         client
           .call<InboxRow[]>("inbox.list")
           .catch(() => [] as InboxRow[]),
+        client
+          .call<TeamRoster>("observability.teams")
+          .catch(() => ({ teams: [] }) as TeamRoster),
       ]);
 
     const self = rootAgent
@@ -155,7 +159,8 @@ async function cmdStatus(args: string[]): Promise<void> {
           .catch(() => null)
       : null;
 
-    const sinceLabel = fmtAge(Date.now() - sinceMs);
+    const now = Date.now();
+    const sinceLabel = fmtAge(now - sinceMs);
     const heading = (s: string) => color(ANSI.accent, s);
     const label = (s: string) => color(ANSI.muted, s);
     const ok = (s: string) => color(ANSI.success, s);
@@ -188,10 +193,55 @@ async function cmdStatus(args: string[]): Promise<void> {
       console.log(`  ${label("        ")}${principles}  ${tools}`);
     }
 
+    // ─── teams ─────────────────────────────────────────────────────────
+    // Only render when this host is in at least one team. Solo users get
+    // the un-cluttered dashboard; federated hosts get peer connectivity
+    // surfaced up top where flapping links are easy to spot.
+    if (teams.teams.length > 0) {
+      console.log("");
+      console.log(heading("teams"));
+      for (const t of teams.teams) {
+        const memberCount = t.members.length;
+        const peerCount = t.peers.length;
+        const connected = t.peers.filter((p) => p.status === "connected").length;
+        const stale = t.peers.filter((p) => p.status === "stale").length;
+        const disconnected = t.peers.filter(
+          (p) => p.status === "disconnected" || p.status === "connecting" || p.status === "rejected",
+        ).length;
+        const left = t.peers.filter((p) => p.status === "left").length;
+        const peerSummary: string[] = [];
+        if (connected > 0) peerSummary.push(ok(`${connected} connected`));
+        if (stale > 0) peerSummary.push(warn(`${stale} stale`));
+        if (disconnected > 0) peerSummary.push(err(`${disconnected} disconnected`));
+        if (left > 0) peerSummary.push(label(`${left} left`));
+        const peersTxt =
+          peerCount === 0 ? label("(no peers yet)") : peerSummary.join("  ");
+        console.log(
+          `  ${t.name}  ${color(ANSI.muted, t.teamId.slice(0, 10))}  ${memberCount} ${memberCount === 1 ? "member" : "members"}  ${peersTxt}`,
+        );
+        for (const p of t.peers.slice(0, 5)) {
+          const statusFmt =
+            p.status === "connected"
+              ? ok(p.status)
+              : p.status === "stale"
+                ? warn(p.status)
+                : p.status === "left"
+                  ? label(p.status)
+                  : err(p.status);
+          const hb =
+            p.lastHeartbeatAt != null
+              ? color(ANSI.muted, `hb=${fmtAge(now - p.lastHeartbeatAt)}`)
+              : color(ANSI.muted, "hb=—");
+          console.log(
+            `    ${color(ANSI.muted, p.peerHostId.slice(0, 10))}  ${statusFmt.padEnd(20)}  ${color(ANSI.muted, p.addr)}  ${hb}`,
+          );
+        }
+      }
+    }
+
     // ─── inbox ─────────────────────────────────────────────────────────
     const open = inbox.filter((d) => d.status === "open").length;
     const unreadReplies = inbox.reduce((n, d) => n + (d.unreadReplyCount ?? 0), 0);
-    const now = Date.now();
     const stale = inbox.filter(
       (d) => d.status === "open" && d.staleness != null && d.staleness < now,
     ).length;

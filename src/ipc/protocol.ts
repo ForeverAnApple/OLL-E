@@ -36,7 +36,8 @@ export type Method =
   | "team.invite"
   | "team.join"
   | "team.leave"
-  | "team.status";
+  | "team.status"
+  | "observability.teams";
 
 export function isRequest(v: unknown): v is Request {
   if (!v || typeof v !== "object") return false;

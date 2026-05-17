@@ -28,6 +28,7 @@ import {
   budgetStatus,
   recentEvents,
   runHistory,
+  teamRoster,
   threadInventory,
   usageStats,
 } from "../observability/index.ts";
@@ -475,6 +476,9 @@ async function dispatch(
       }
       case "observability.events":
         observabilityCall(req, opts, send, (store, params) => recentEvents(store, params));
+        return;
+      case "observability.teams":
+        observabilityCall(req, opts, send, (store) => teamRoster(store));
         return;
       // Decision-inbox surface — same Inbox the askUp chain writes to. CLI
       // (`olle inbox`) and agent core tools (mail_list/mail_respond) both
