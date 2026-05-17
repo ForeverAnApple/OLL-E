@@ -479,6 +479,20 @@ export const memoryReads = sqliteTable(
   }),
 );
 
+// Federation tombstones (migration 0004). A peer's `memory.forgotten`
+// can arrive before its corresponding `memory.wrote` under network
+// reorder / catch-up replay. The projector consults this table on
+// every `memory.wrote` and refuses to resurrect a row whose tombstone
+// hlc dominates the write. host_id and actor_id are weak refs — a
+// tombstone authored by a peer carries that peer's identity.
+export const memoryTombstones = sqliteTable("memory_tombstones", {
+  memoryId: text("memory_id").primaryKey(),
+  hlc: text("hlc").notNull(),
+  hostId: text("host_id").notNull(),
+  actorId: text("actor_id").notNull(),
+  forgottenAt: integer("forgotten_at").notNull(),
+});
+
 // ─── Team mesh substrate (migration 0003) ─────────────────────────────────
 //
 // Local view of "who else is in this team and how do I reach them right
@@ -585,3 +599,5 @@ export type TeamInvite = typeof teamInvites.$inferSelect;
 export type NewTeamInvite = typeof teamInvites.$inferInsert;
 export type TeamClaim = typeof teamClaims.$inferSelect;
 export type NewTeamClaim = typeof teamClaims.$inferInsert;
+export type MemoryTombstone = typeof memoryTombstones.$inferSelect;
+export type NewMemoryTombstone = typeof memoryTombstones.$inferInsert;

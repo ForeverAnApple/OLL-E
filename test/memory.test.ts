@@ -791,6 +791,41 @@ describe("memory tools", () => {
     expect(reads.length).toBe(1);
     s.stop();
   });
+
+  it("memory_forget carries team scope for mesh routing", async () => {
+    const s = setup();
+    const write = getTool(s.tools, "memory_write");
+    const forget = getTool(s.tools, "memory_forget");
+    const teamId = ulid();
+    s.store.insert(tables.teams).values({ id: teamId, name: "t", createdAt: Date.now() }).run();
+    s.store
+      .insert(tables.teamMembers)
+      .values({ teamId, actorId: "alice", role: "member", joinedAt: Date.now() })
+      .run();
+    const forgotten: Array<{ payload: unknown }> = [];
+    s.bus.subscribe(MEMORY_FORGOTTEN, (event) => {
+      forgotten.push({ payload: event.payload });
+    });
+
+    const r = await write.execute(
+      {
+        title: "shared",
+        bodyMd: "x",
+        role: "knowledge",
+        scope: "team",
+        scopeRef: teamId,
+      },
+      makeCtx("alice", s.hostId),
+    );
+    await forget.execute({ id: r.id }, makeCtx("alice", s.hostId));
+
+    expect(forgotten[0]!.payload).toMatchObject({
+      id: r.id,
+      scope: "team",
+      scopeRef: teamId,
+    });
+    s.stop();
+  });
 });
 
 describe("principle injection", () => {
@@ -903,6 +938,196 @@ describe("principle injection", () => {
     proj.stop();
     r.bus.close();
     r.store.close();
+  });
+});
+
+describe("memory projector — federation correctness (LOG 2026-05-14)", () => {
+  it("preserves event.hostId on remote-injected memory.wrote", () => {
+    const r = rig();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const memId = ulid();
+    const remoteHost = ulid();
+    const remoteEvent = {
+      id: ulid(),
+      hlc: "01HABCDEF0000000-0000",
+      hostId: remoteHost,
+      actorId: "peer-agent",
+      type: MEMORY_WROTE,
+      payload: {
+        id: memId,
+        actorId: "peer-agent",
+        scope: "team",
+        scopeRef: "team-1",
+        role: "knowledge",
+        title: "from-peer",
+        bodyMd: "hi",
+        tags: [],
+        depth: 1,
+      },
+      createdAt: Date.now(),
+      durable: true,
+    } as const;
+    r.bus.inject(remoteEvent, { remote: true });
+    const row = r.store.raw
+      .query<{ host_id: string; actor_id: string; title: string }, [string]>(
+        "SELECT host_id, actor_id, title FROM memories WHERE id = ?",
+      )
+      .all(memId)[0];
+    expect(row).toBeDefined();
+    expect(row?.host_id).toBe(remoteHost);
+    expect(row?.actor_id).toBe("peer-agent");
+    proj.stop();
+  });
+
+  it("out-of-order forget→write does not resurrect when write HLC <= tombstone HLC", () => {
+    const r = rig();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const memId = ulid();
+    const peerHost = ulid();
+    const tombstoneHlc = encodeStamp({ l: 0xffffffffffff, c: 0xffff });
+    // Forget arrives first with a maximum-future HLC.
+    r.bus.inject(
+      {
+        id: ulid(),
+        hlc: tombstoneHlc,
+        hostId: peerHost,
+        actorId: "peer",
+        type: MEMORY_FORGOTTEN,
+        payload: { id: memId },
+        createdAt: Date.now(),
+        durable: true,
+      },
+      { remote: true },
+    );
+    // Tombstone row was laid down even though no memory existed locally.
+    const tombRow = r.store.raw
+      .query<{ hlc: string }, [string]>("SELECT hlc FROM memory_tombstones WHERE memory_id = ?")
+      .all(memId)[0];
+    expect(tombRow?.hlc).toBe(tombstoneHlc);
+    // Now a stale write arrives — its HLC is below the tombstone's; must be rejected.
+    r.bus.publish({
+      type: MEMORY_WROTE,
+      hostId: r.hostId,
+      actorId: "a",
+      durable: true,
+      payload: {
+        id: memId,
+        actorId: "a",
+        scope: "private",
+        scopeRef: "a",
+        role: "knowledge",
+        title: "should-not-resurrect",
+        bodyMd: "x",
+        tags: [],
+        depth: 1,
+      },
+    });
+    const row = r.store.raw.query("SELECT id FROM memories WHERE id = ?").get(memId);
+    expect(row).toBeNull();
+    proj.stop();
+  });
+
+  it("strictly-newer write after tombstone succeeds (event.hlc > tombstone.hlc)", () => {
+    const r = rig();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const memId = ulid();
+    // Tombstone with a small HLC.
+    r.bus.publish({
+      type: MEMORY_FORGOTTEN,
+      hostId: r.hostId,
+      actorId: "a",
+      durable: true,
+      payload: { id: memId },
+    });
+    // Inject a write with a guaranteed-newer (far-future) HLC.
+    const futureHlc = encodeStamp({ l: 0xffffffffffff, c: 0xffff });
+    r.bus.inject(
+      {
+        id: ulid(),
+        hlc: futureHlc,
+        hostId: r.hostId,
+        actorId: "a",
+        type: MEMORY_WROTE,
+        payload: {
+          id: memId,
+          actorId: "a",
+          scope: "private",
+          scopeRef: "a",
+          role: "knowledge",
+          title: "newer-survives",
+          bodyMd: "x",
+          tags: [],
+          depth: 1,
+        },
+        createdAt: Date.now(),
+        durable: true,
+      },
+      { remote: true },
+    );
+    const row = r.store.raw
+      .query<{ title: string }, [string]>("SELECT title FROM memories WHERE id = ?")
+      .all(memId)[0];
+    expect(row?.title).toBe("newer-survives");
+    proj.stop();
+  });
+
+  it("tombstone keeps the larger HLC on conflict (later forget wins)", () => {
+    const r = rig();
+    const proj = startMemoryProjector({ bus: r.bus, store: r.store, hostId: r.hostId });
+    const memId = ulid();
+    const smallHlc = "01HABCDEF0000000-0000";
+    const bigHlc = encodeStamp({ l: 0xffffffffffff, c: 0xffff });
+    // First forget — small HLC.
+    r.bus.inject(
+      {
+        id: ulid(),
+        hlc: smallHlc,
+        hostId: r.hostId,
+        actorId: "a",
+        type: MEMORY_FORGOTTEN,
+        payload: { id: memId },
+        createdAt: Date.now(),
+        durable: true,
+      },
+      { remote: true },
+    );
+    // Second forget — big HLC.
+    r.bus.inject(
+      {
+        id: ulid(),
+        hlc: bigHlc,
+        hostId: r.hostId,
+        actorId: "a",
+        type: MEMORY_FORGOTTEN,
+        payload: { id: memId },
+        createdAt: Date.now(),
+        durable: true,
+      },
+      { remote: true },
+    );
+    const row = r.store.raw
+      .query<{ hlc: string }, [string]>("SELECT hlc FROM memory_tombstones WHERE memory_id = ?")
+      .all(memId)[0];
+    expect(row?.hlc).toBe(bigHlc);
+    // Reverse order — small-after-big must not regress the tombstone.
+    r.bus.inject(
+      {
+        id: ulid(),
+        hlc: smallHlc,
+        hostId: r.hostId,
+        actorId: "a",
+        type: MEMORY_FORGOTTEN,
+        payload: { id: memId },
+        createdAt: Date.now(),
+        durable: true,
+      },
+      { remote: true },
+    );
+    const row2 = r.store.raw
+      .query<{ hlc: string }, [string]>("SELECT hlc FROM memory_tombstones WHERE memory_id = ?")
+      .all(memId)[0];
+    expect(row2?.hlc).toBe(bigHlc);
+    proj.stop();
   });
 });
 

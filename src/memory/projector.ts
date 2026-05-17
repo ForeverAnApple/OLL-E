@@ -6,19 +6,21 @@
 // each side reprojects locally.
 //
 // Semantics:
-//  - `memory.wrote(id, ...)` — upsert. If no row: insert with event.hlc.
-//    If row exists with hlc < event.hlc: update. Else ignore (stale).
-//  - `memory.forgotten(id)` — delete iff existing row's hlc < event.hlc.
+//  - `memory.wrote(id, ...)` — upsert iff no dominating tombstone. If no
+//    row: insert with event.hlc / event.hostId. If row exists with hlc <
+//    event.hlc: update. Else ignore (stale).
+//  - `memory.forgotten(id)` — upsert tombstone (later HLC wins). Delete
+//    row iff existing row's hlc < event.hlc.
 //  - `memory.read(id, reader)` — append to memory_reads.
+//
+// Tombstones (migration 0004, LOG 2026-05-14) handle out-of-order delivery
+// across the mesh. A peer's `memory.forgotten` can land before its
+// `memory.wrote`; without the table, the late write would resurrect a
+// forgotten memory.
 //
 // The projector is synchronous (via bus dispatch). Persisting the event
 // row happens *before* dispatch in createBus (persist: persistToStore),
 // so a row in `events` always precedes the projection side-effect.
-//
-// v1+ federation note: out-of-order delivery (forgotten arrives before
-// wrote) is not handled — v0 bus is in-process, events flow in HLC order
-// per host. When cross-host mesh lands we need a tombstone records table
-// or equivalent. See LOG entry on memory surface for the full trade.
 
 import { and, desc, eq } from "drizzle-orm";
 import type { EventBus } from "../bus/index.ts";
@@ -37,6 +39,10 @@ import {
 export interface ProjectorOptions {
   bus: EventBus;
   store: Store;
+  /** Retained for API compatibility — the projector now reads each event's
+   *  own `hostId` (LOG 2026-05-14 honest event identity) so federated
+   *  events keep their origin. Local writes still carry the local host
+   *  via the bus's clock, so behavior is unchanged for in-process publish. */
   hostId: string;
 }
 
@@ -46,7 +52,7 @@ export interface MemoryProjector {
 }
 
 export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
-  const { bus, store, hostId } = opts;
+  const { bus, store } = opts;
 
   function applyWrote(event: Event<MemoryWrotePayload>): void {
     const p = event.payload;
@@ -68,6 +74,15 @@ export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
       console.warn(`[memory.projector] skip ${p.id}: missing title or bodyMd`);
       return;
     }
+    // Tombstone dominance check (LOG 2026-05-14). If a forgotten event
+    // already arrived for this id with HLC >= this write's HLC, the row
+    // stays dead. Strictly-newer writes (event.hlc > tombstone.hlc) win.
+    const tomb = store
+      .select({ hlc: tables.memoryTombstones.hlc })
+      .from(tables.memoryTombstones)
+      .where(eq(tables.memoryTombstones.memoryId, p.id))
+      .all()[0];
+    if (tomb && tomb.hlc >= event.hlc) return;
     const existing = store
       .select({ hlc: tables.memories.hlc })
       .from(tables.memories)
@@ -83,7 +98,7 @@ export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
         .values({
           id: p.id,
           hlc: event.hlc,
-          hostId,
+          hostId: event.hostId,
           actorId: p.actorId,
           scope: p.scope,
           scopeRef: p.scopeRef ?? null,
@@ -164,6 +179,23 @@ export function startMemoryProjector(opts: ProjectorOptions): MemoryProjector {
   function applyForgotten(event: Event<MemoryForgottenPayload>): void {
     const p = event.payload;
     if (!p || typeof p.id !== "string") return;
+    // Upsert tombstone first — even if no local row exists, we must
+    // remember this id is dead so a late-arriving `memory.wrote` doesn't
+    // resurrect it. Conflict resolution: keep the row with the larger
+    // HLC. Raw SQL because Drizzle's onConflictDoUpdate doesn't expose
+    // a WHERE clause on the update branch.
+    store.raw
+      .prepare(
+        `INSERT INTO memory_tombstones (memory_id, hlc, host_id, actor_id, forgotten_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(memory_id) DO UPDATE SET
+           hlc = excluded.hlc,
+           host_id = excluded.host_id,
+           actor_id = excluded.actor_id,
+           forgotten_at = excluded.forgotten_at
+         WHERE excluded.hlc > memory_tombstones.hlc`,
+      )
+      .run(p.id, event.hlc, event.hostId, event.actorId, event.createdAt);
     const existing = store
       .select({
         hlc: tables.memories.hlc,

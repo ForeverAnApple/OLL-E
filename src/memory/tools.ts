@@ -485,7 +485,11 @@ export function buildMemoryTools(opts: MemoryToolsOptions): ToolDef[] {
         hostId,
         actorId: ctx.actorId,
         durable: true,
-        payload: { id: existing.id },
+        payload: {
+          id: existing.id,
+          scope: existing.scope,
+          scopeRef: existing.scopeRef ?? undefined,
+        },
       });
       return { id: existing.id, forgotten: true };
     },

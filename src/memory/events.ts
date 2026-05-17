@@ -54,6 +54,11 @@ export interface MemoryWrotePayload {
  *  out-of-order delivery will need one — seam noted in LOG.) */
 export interface MemoryForgottenPayload {
   id: string;
+  /** Scope at forget time. Mesh routing needs this because the projector may
+   *  delete the memory row before wildcard bridge subscribers run. */
+  scope?: MemoryScope;
+  /** For scope=team this is the team id. */
+  scopeRef?: string;
 }
 
 /** `memory.read` event — audit trail. Written by the `memory_read` tool
