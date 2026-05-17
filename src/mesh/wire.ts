@@ -1,15 +1,19 @@
-// Wire a MeshBridge to an EventBus:
-//  - local durable events (unless marked already-remote) are broadcast
-//    to the bridge;
-//  - events received from the bridge are re-published on the local bus
-//    with a marker so re-broadcast doesn't loop.
+// Wire a MeshBridge to an EventBus with honest event identity.
 //
-// Dedup: we track seen event ids so two peers can't ping-pong when a
-// future bridge has more than one path.
+// Outbound: local durable events flow through bus.subscribe with a
+// `{ remote: false }` delivery context. Mirror the original event to the
+// bridge — no payload mutation, no re-mint. Bridge receivers see exactly
+// what the originating publisher emitted.
+//
+// Inbound: a peer hands us its event; we call bus.inject(event, {remote:
+// true}). Persist is idempotent on event.id, dispatch is dedup'd in-memory
+// by the bus, and handlers see the original hostId / hlc / actorId. The
+// subscribe handler then skips re-broadcast based on ctx.remote, so no
+// REMOTE_TAG payload pollution is needed to prevent the ping-pong.
 
 import type { EventBus } from "../bus/index.ts";
 import type { Event } from "../bus/types.ts";
-import { isRemote, REMOTE_TAG, type MeshBridge } from "./types.ts";
+import type { MeshBridge } from "./types.ts";
 
 export interface WireOptions {
   bus: EventBus;
@@ -20,43 +24,20 @@ export interface WireOptions {
 
 export interface WiredBridge {
   unwire(): void;
-  seen: ReadonlySet<string>;
 }
 
 export function wireBridgeToBus(opts: WireOptions): WiredBridge {
-  const seen = new Set<string>();
   const filter = opts.typeFilter ?? (() => true);
 
-  const unsubLocal = opts.bus.subscribe("*", (event) => {
+  const unsubLocal = opts.bus.subscribe("*", (event, ctx) => {
     if (!event.durable) return; // transient locals stay local
-    if (isRemote(event)) return; // arrived from a peer; don't reflect
-    if (seen.has(event.id)) return;
+    if (ctx.remote) return; // arrived from a peer; don't reflect
     if (!filter(event)) return;
-    seen.add(event.id);
     opts.bridge.broadcast(event);
   });
 
   const unsubRemote = opts.bridge.onReceive((event) => {
-    if (seen.has(event.id)) return;
-    seen.add(event.id);
-    const payload = event.payload as Record<string, unknown>;
-    // Keep REMOTE_TAG on the re-published event so the local "*" hook
-    // doesn't loop it back across the bridge. Durable: mesh semantics
-    // are log-merge — every team cell keeps its own copy, and FK
-    // consumers (claims, ledger) need the row to exist locally.
-    opts.bus.publish({
-      type: event.type,
-      payload: {
-        ...payload,
-        [REMOTE_TAG]: true,
-        remoteOrigin: event.hostId,
-        remoteEventId: event.id,
-      },
-      hostId: opts.bus.hostId,
-      actorId: event.actorId,
-      parentEventId: event.parentEventId,
-      durable: true,
-    });
+    opts.bus.inject(event, { remote: true });
   });
 
   return {
@@ -64,6 +45,5 @@ export function wireBridgeToBus(opts: WireOptions): WiredBridge {
       unsubLocal();
       unsubRemote();
     },
-    seen,
   };
 }

@@ -1,9 +1,21 @@
-// In-memory bridge pair for exercising the mesh protocol inside one
-// process. Two cells created back-to-back call createLocalPair() and get
-// back two bridges that pipe events to each other.
+// In-memory bridge pair for exercising the mesh wire-up inside one
+// process. Tests that want to verify the bus↔bridge seam (wire.ts,
+// honest event identity, no-bounce) use this; tests that want the
+// real WebSocket + HMAC stack use `startRealMeshBridge`.
+//
+// **Bypass mode (deliberate):** local-pair forwards every durable
+// event regardless of `payload.teamId` or `scope`. Scope filtering is
+// a property of `RealMeshBridge`; the local-pair exists to prove the
+// wire-up, not the filter. Tests asserting filter behavior live next
+// to RealMeshBridge (test/mesh-bridge.test.ts).
+//
+// The pair simulates "another host sent us this": deliver the event
+// byte-identical to what was broadcast. wire.ts flips it through
+// bus.inject(event, {remote: true}) on the receiving side; remote-ness
+// lives in the bus's DeliveryContext, not on the payload (LOG 2026-05-14).
 
 import type { Event } from "../bus/types.ts";
-import { REMOTE_TAG, type MeshBridge, type MeshReceiver } from "./types.ts";
+import type { MeshBridge, MeshReceiver } from "./types.ts";
 
 export interface LocalPair {
   a: MeshBridge;
@@ -18,16 +30,9 @@ export function createLocalPair(opts?: { nameA?: string; nameB?: string }): Loca
   const bRecv: Set<MeshReceiver> = new Set();
 
   const deliver = (dest: Set<MeshReceiver>, event: Event): void => {
-    const marked: Event = {
-      ...event,
-      payload: {
-        ...(event.payload as Record<string, unknown>),
-        [REMOTE_TAG]: true,
-      },
-    };
     for (const fn of dest) {
       try {
-        fn(marked);
+        fn(event);
       } catch (err) {
         // eslint-disable-next-line no-console -- mesh is infra
         console.error("[mesh] receiver threw:", err);
