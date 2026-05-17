@@ -360,38 +360,99 @@ CLI: `olle extension history <name>`, `olle extension revert <name> [--to <sha>]
 
 ## Cross-host mesh (v0)
 
-**Claim model only. No remote code execution.**
+**Claim model only. No remote code execution.** The substrate is the most-agentic shape we can ship (LOG 2026-05-13): peer-mesh, leaderless arbitration, every cell sovereign. Centralization is a behavior an extension grows on top, not a shape the binary forces.
 
-What crosses host boundaries:
-- Events (published to peers in the same team)
-- Memory (team-tier is synced; private and scratch are not)
-- Decision-inbox items (addressed to a principal via whichever host owns that principal's channel)
-- Approval messages (ask-up chains may traverse hosts)
-- Task offers (`task-available`) and claims
+### Wire
 
-What does **not** cross:
+JSON over WebSocket. LAN `ws://` only in v0; `wss://` and relays are deferred. Authentication is per-team HMAC-SHA256 keyed on a shared secret minted at `team_create`. The wire envelope (`src/mesh/envelope.ts`):
+
+```
+{ proto: "olle.v0", envelopeId, teamId, fromHostId,
+  kind: "event"|"hello"|"welcome"|"heartbeat"|"catchup_request"|"catchup_chunk"|"peer_left"|"error",
+  event? | payload?, sentAt, hmac }
+```
+
+HMAC over canonical JSON of the envelope minus the `hmac` field. Bad HMAC / proto / teamId mismatch → drop, close link, emit `mesh.envelope-rejected`.
+
+### Topology
+
+Any team member can mint an invite (`team_invite` → bearer code = `base64url(JSON{proto,teamId,inviteId,addr,secret})`). The joiner (`team_join`) dials the inviter, sends a signed `hello`, receives `welcome { peerHostId, peerSet }`, and then dials every other peer in the set. O(N²) fully-connected mesh is fine for v0 team sizes.
+
+Heartbeat every 15s; peer goes stale after 60s of silence; reconnect backoff at 1s, 2s, 5s, 15s, 60s, cap. TCP close → reconnect with the same schedule.
+
+### What crosses, what stays
+
+Outbound (local → bridge) forwards a durable event only if its `payload.teamId` matches an active local team and (for memory events) `payload.scope === "team"`. Inbound mismatch → drop + `mesh.scope-violation`. Concretely:
+
+- **Crosses:** `memory.wrote` (scope=team), `memory.forgotten` (scope=team), claimable work events with `payload.teamId`, `task.claim`, `team.peer.*`.
+- **Stays:** private/scratch memory, chat turns, secrets, tool results, decisions, ledger rows, runs — anything without `payload.teamId`.
+
+### Honest event identity
+
+Cross-host events keep their original `id, hlc, hostId, actorId, payload, parentEventId, toAgentId, threadId, parentThreadId, createdAt`. The bus exposes `inject(event, { remote: true })` for this (LOG 2026-05-14 — the "honest event identity" slice replaced the old payload-tagged `bus.publish` re-mint path). Persist is `INSERT OR IGNORE` and stubs a `hosts` row for unknown peer host ids. Dispatch carries a delivery context `{ remote: boolean }` to handlers; the flag is never written into payload.
+
+Federation is event-log merge: every peer keeps its own copy, the memory projector reads `event.hostId` not `bus.hostId`, and rows round-trip without lying about provenance.
+
+### Leaderless claim window
+
+Per LOG 2026-05-13: no origin-host arbiter. When a team-scoped claimable event arrives on any peer, the scheduler (`src/scheduler/claims.ts`):
+
+1. Persists a `team_claims` row with `status = "intent"` and emits a `task.claim` event.
+2. Arms a 100ms timer keyed on `event.id`. Default is `claimWindowMs` in `SchedulerOptions`; configurable for tests.
+3. On timer expiry: reads all intent rows for the event, picks the lowest `(claim_hlc, claiming_host_id, claim_id)` tuple lex-wise.
+4. If lowest is ours → `status = "won"`, run the task. Else → `status = "lost"`, don't run.
+
+Partition handling: if a lower-tuple claim arrives *after* our timer fired and we're already running, mark the row `split_brain`, emit a durable `mesh.claim-split-brain` event, but **do not abort the running task**. Mid-run abort is messier than the duplicate; v0 acknowledges partition risk honestly.
+
+The single-host fast path (events without `payload.teamId`) bypasses the window — non-team claimable events execute immediately via the legacy `claims` table.
+
+### Catchup on reconnect
+
+Per-peer-link watermark `team_peers.last_received_event_id`. On (re)connect:
+
+1. Send `catchup_request { teamId, sinceEventId }` (the local watermark).
+2. Peer scans its store for team-scoped events with `id > sinceEventId`, paginated at 200 per chunk (default; `catchupChunkSize` configurable).
+3. Peer sends `catchup_chunk { events, hasMore }`; recipient calls `bus.inject` on each, updates watermark to the highest id seen, requests the next chunk if `hasMore`.
+
+Live events arriving during catchup deduplicate through `bus.inject`'s in-memory seen set + `INSERT OR IGNORE` at the SQL layer. Whichever peer Alice reconnects to first feeds her the missing tail — no global sequencer.
+
+### Memory tombstones
+
+`memory_tombstones (memory_id PRIMARY KEY, hlc, host_id, actor_id, forgotten_at)`. On `memory.wrote`, the projector first checks tombstones: if one exists with `hlc >= event.hlc`, the write is rejected (the memory was forgotten after this write). On `memory.forgotten`, the projector upserts the tombstone (later HLC wins on conflict) and deletes the live row if `event.hlc > existing.hlc`.
+
+LWW + tombstone-wins. No version vectors, no CRDTs. Three rules, one table.
+
+### Trust model
+
+v0 trust is "the friend you handed the code to." Bearer code = credential, not single-use ticket: single-use is enforced at the inviter on the same `inviteId`, but anyone with the code holds the team secret. Leak = rotate the team secret (rotation is `[DEFERRED-to-v0.1]`). No per-actor wire signatures; multi-trust within a team is also `[DEFERRED-to-v0.1]`.
+
+### What does **not** cross
+
 - Task handler code / function invocation
 - Local tools
 - Per-host scratch or filesystem paths
 - Per-agent private memory
+- Decision-inbox rows (schema-unblocked by the LOG 2026-05-14 principals collapse; cross-host sync deferred to a follow-up slice)
 
-### Claim protocol
+### Deferred for v0.1+
 
-1. Task emitted on host A is tagged `claimable: true` with eligibility criteria.
-2. Event bridged to all peer hosts in the team.
-3. Each peer's scheduler checks local eligibility (tag match, capacity, tool availability, budget). If eligible, emits a `claim` event.
-4. First claim wins — all hosts observe the ordering (HLC). Losers drop.
-5. Winner runs the task locally, using its own tools and its own budget. Result is bridged back.
-6. If winner fails or times out (deadline on claim), claim lapses and task becomes available again.
+- TLS / `wss://`; relays; mDNS; hole-punch — LAN-only assumption is the v0 bar.
+- Per-team secret rotation.
+- Per-agent / per-actor wire signatures.
+- Cross-host decision-row sync (schema unblocked, transport deferred).
+- Group E2E encryption (pairs with relays).
+- Per-extension task-fingerprint registry (the `task_fingerprint` field is opaque string in v0).
+- Conflict-visibility UI (LWW + attribution covers v0).
+- Sandboxed remote code execution.
 
-### v1+ mesh seams
+### Claim protocol — quick reference
 
-These protocols are **designed for** in v0 but unimplemented:
-
-- Peer discovery (LAN mDNS, team-supplied bootstrap peer list, hole-punch relay)
-- Formal wire protocol with auth (per-team shared secret → per-principal key in v1+)
-- Conflict resolution for concurrent memory writes (last-write-wins with attribution in v0; CRDT in v1+)
-- Remote code execution under sandbox (not in v0, possibly v1+ with opt-in host policy)
+1. Task emitted on host A with `payload.teamId` + `claimable: true`.
+2. Event bridged to peers (scope filter passes).
+3. Each peer's scheduler registers intent (`task.claim` event, `team_claims` row).
+4. Window closes; lowest `(claim_hlc, claiming_host_id, claim_id)` wins.
+5. Winner runs the task locally on its own tools and budget. Result events flow back.
+6. Winner failure → next claim window if the event is re-emitted; no automatic retry in v0.
 
 ## CLI surface
 
