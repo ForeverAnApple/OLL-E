@@ -1039,6 +1039,22 @@ This is a class of bug, not a one-off. Any migration collapse, rename, or conten
 
 ---
 
+## 2026-05-16 — Symmetric mesh: hello carries the dialer's listener addr
+
+Writing the two-cell integration test for `docs/plan/teams.plan.md` criterion 3 ("Alice goes offline, Bob does the work, Alice still sees what happened when she reconnects") surfaced a real substrate gap: it didn't work in the inviter-restart direction. The joiner-restart direction worked fine. Asymmetric.
+
+Two reasons compounded. Catchup is triggered only on outbound `connected` transitions (`src/mesh/bridge.ts:280`) — inbound links don't fire it. And the inviter never learned the joiner's addr, because the bearer code carries only the inviter's addr; the joiner's hello named the team and the host but not a routable address. So the inviter held only an inbound link from the joiner, no outbound link to it, and on restart had no path to dial the joiner and pull missing events. The joiner's outbound reconnect succeeded, but the joiner is the one *with* the new events — its catchup request asked the inviter for events the inviter didn't have. The inviter's missing tail never crossed.
+
+**Fix.** Every outgoing `hello` now carries the dialer's own `listenerAddr` (peer.ts), and the listener's `onPeerHello` handler in the bridge calls `addPeer(joinerHostId, listenerAddr)` to open the reverse outbound link. Both peers end up with one inbound + one outbound link to every other peer — the literal O(N²) mesh the architecture doc already described. Catchup now fires symmetrically: whoever restarts dials out, the outbound link transitions to `connected`, and the catchup request flows in the direction that has the gap.
+
+Also fixed `addPeer`'s no-op-on-same-addr path. The existing comment promised it; the code closed the link unconditionally. With reverse-dial happening on every hello, that bug would have churned the catchup window on every reconnect, so this had to land in the same change.
+
+**What this rejects.** Two alternatives were on the table. (a) Trigger catchup on inbound `connected` too — would have worked, but would have left the mesh asymmetric (the inviter still has no outbound link, so any future feature that assumes outbound presence would re-break the inviter side). (b) Bake the joiner's addr into `welcome` instead of `hello` — no, hello-first is right because reconnect hellos need the addr too, and welcome only fires on first contact. Putting it on hello matches the lifecycle: every new socket re-advertises, every restart re-asserts.
+
+**What this leaves deferred.** Per-actor wire signatures still aren't a thing; the addr is trusted at HMAC-verified-team-secret level. Multi-NIC hosts still rely on `OLLE_ADVERTISE_ADDR` rather than negotiation. NAT traversal stays out of v0. None of these block the demo; all are listed in the plan's deferrals table.
+
+---
+
 ## How to use this log
 
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.

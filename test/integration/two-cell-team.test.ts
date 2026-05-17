@@ -5,12 +5,18 @@
 // then exercises the success criteria from docs/plan/teams.plan.md:
 //
 //  1. team_status on both cells reports two members + the connected peer
-//  2. (deferred to mesh-claims unit tests) team-scoped claimable events:
-//     covered in test/team-claims.test.ts so we don't re-do the timing
-//     dance here
+//  2. team-scoped claimable event: exactly one cell runs the handler;
+//     both stores observe the won + lost claim rows; event identity
+//     preserved across the bridge
 //  3. memory.wrote (scope=team) propagates Alice → Bob (forward direction)
 //  4. memory.wrote (scope=private) does NOT propagate
 //  5. memory.forgotten followed by a stale memory.wrote does not resurrect
+//  6. Alice (inviter) offline → Bob publishes team memory + team event
+//     → Alice reconnects → catchup pulls Bob's gap events into Alice's
+//     store with original hostId/hlc preserved. Plan-faithful direction
+//     (the literal demo). Works because hello carries the joiner's
+//     listener addr; the inviter addPeer's the joiner on first hello
+//     and on restart re-dials, so catchup fires symmetrically.
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -201,6 +207,85 @@ describe("two-cell team substrate", () => {
     expect(aliceRow).toBeDefined();
   });
 
+  it("team-scoped claimable event runs on exactly one cell; both observe won + lost claims", async () => {
+    // Same task id on both cells — the claim fingerprint defaults to
+    // `${task.id}:${event.id}` so the schedulers arbitrate against each
+    // other. Each handler records its host so we can assert the singleton.
+    const taskId = "team-bug-fix";
+    const ranOn: string[] = [];
+    alice.scheduler.register({
+      id: taskId,
+      agentId: alice.rootAgentId,
+      tier: "operational",
+      eventType: "team.bug",
+      handler: () => {
+        ranOn.push(alice.hostId);
+      },
+    });
+    bob.scheduler.register({
+      id: taskId,
+      agentId: bob.rootAgentId,
+      tier: "operational",
+      eventType: "team.bug",
+      handler: () => {
+        ranOn.push(bob.hostId);
+      },
+    });
+
+    const trigger = alice.bus.publish({
+      type: "team.bug",
+      payload: { claimable: true, teamId, summary: "fix the auth bug" },
+      hostId: alice.hostId,
+      actorId: alice.humanAgentId,
+      durable: true,
+    });
+
+    // Default claim window is 100ms; crossing latency + arbitration
+    // callbacks need headroom. waitFor polls until both stores have
+    // observed both intents (the wire round-trip completed).
+    for (const cell of [alice, bob]) {
+      await waitFor(() => {
+        const rows = cell.store.raw
+          .query<{ status: string }, [string]>(
+            `SELECT status FROM team_claims WHERE event_id = ?`,
+          )
+          .all(trigger.id);
+        return rows.length === 2 ? rows : null;
+      }, 2_000);
+    }
+    // Let any second handler that's racing the assertion settle.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(ranOn.length).toBe(1);
+    const winnerHostId = ranOn[0]!;
+
+    // Leaderless = each peer transitions its OWN row to reflect its
+    // local decision. The winner additionally demotes peer rows to
+    // "lost" in the same window; the loser leaves the winner's row at
+    // "intent" because she has no authority over peer-owned rows. So
+    // the cross-cell invariant is "both rows present + each cell's own
+    // row matches its decision," not "both stores see won + lost."
+    for (const cell of [alice, bob]) {
+      const ownRow = cell.store.raw
+        .query<{ status: string }, [string, string]>(
+          `SELECT status FROM team_claims WHERE event_id = ? AND claiming_host_id = ?`,
+        )
+        .all(trigger.id, cell.hostId)[0]!;
+      const expected = cell.hostId === winnerHostId ? "won" : "lost";
+      expect(ownRow.status).toBe(expected);
+    }
+
+    // Honest event identity: Bob's local row for the triggering event
+    // carries Alice's hostId + hlc, not re-minted on cross.
+    const bobsEventRow = bob.store
+      .select()
+      .from(tables.events)
+      .all()
+      .find((e) => e.id === trigger.id);
+    expect(bobsEventRow).toBeDefined();
+    expect(bobsEventRow!.hostId).toBe(alice.hostId);
+    expect(bobsEventRow!.hlc).toBe(trigger.hlc);
+  });
+
   it("out-of-order tombstone keeps memory forgotten", async () => {
     // Write team memory on Alice → propagates → forget on Alice →
     // propagates → then attempt an older-HLC write on Bob. The tombstone
@@ -285,4 +370,106 @@ describe("two-cell team substrate", () => {
       .find((m) => m.id === memoryId);
     expect(row).toBeUndefined();
   });
+
+  // Catchup-on-reconnect (criterion 3) — plan-faithful direction:
+  // the inviter (Alice) goes offline, the joiner (Bob) does work,
+  // the inviter reconnects and pulls the gap.
+  //
+  // Works because hello carries the joiner's advertised listener addr,
+  // the inviter's bridge addPeer's the joiner on first hello and
+  // persists that addr, and on inviter restart bridge.start() re-dials
+  // the joiner — catchup fires on the outbound `connected` transition.
+  // Without that addr the inviter has no outbound link to dial and only
+  // the joiner can request catchup (which is the wrong direction).
+  it(
+    "Alice offline → Bob publishes → Alice reconnects → catchup pulls gap events with original hostId/hlc",
+    async () => {
+    // Pin Alice's port so her bridge re-binds at the same addr Bob has
+    // in team_peers. meshPort=0 would re-roll the port and Bob's
+    // outbound reconnect would chase a dead socket.
+    const alicePort = alice.bridge!.listenerPort;
+
+    // Alice goes dark.
+    aliceClient.close();
+    await alice.shutdown();
+
+    // While Alice is offline, Bob writes a team memory and emits a
+    // separate team event. Both are durable; neither reaches Alice live.
+    const offlineMemoryId = ulid();
+    bob.bus.publish({
+      type: MEMORY_WROTE,
+      payload: {
+        id: offlineMemoryId,
+        actorId: bob.humanAgentId,
+        scope: "team",
+        scopeRef: teamId,
+        role: "knowledge",
+        title: "while-alice-was-offline",
+        bodyMd: "bob wrote this during the gap",
+        tags: [],
+        depth: 1,
+      },
+      hostId: bob.hostId,
+      actorId: bob.humanAgentId,
+      durable: true,
+    });
+    const offlineEvent = bob.bus.publish({
+      type: "team.work",
+      payload: { teamId, summary: "work-during-alice-offline" },
+      hostId: bob.hostId,
+      actorId: bob.humanAgentId,
+      durable: true,
+    });
+
+    // Snapshot Bob's authoritative rows so we can compare identity
+    // fields after they land on Alice via catchup.
+    const bobMemoryRow = bob.store
+      .select()
+      .from(tables.memories)
+      .all()
+      .find((m) => m.id === offlineMemoryId)!;
+    const bobEventRow = bob.store
+      .select()
+      .from(tables.events)
+      .all()
+      .find((e) => e.id === offlineEvent.id)!;
+
+    // Alice reconnects with the same data root + the same listener port.
+    // Bridge.start() iterates team_peers, dials Bob using the addr
+    // recorded from his original hello; on the `connected` transition,
+    // catchup kicks off using the persisted last_received_event_id
+    // watermark and pulls the gap.
+    alice = await startDaemon({
+      root: aliceRoot,
+      version: "test",
+      quiet: true,
+      meshPort: alicePort,
+    });
+    aliceClient = await connectIpc(alice.paths.socketFile);
+
+    const recoveredMemory = await waitFor(() => {
+      return alice.store
+        .select()
+        .from(tables.memories)
+        .all()
+        .find((m) => m.id === offlineMemoryId);
+    }, 8_000);
+    const recoveredEvent = await waitFor(() => {
+      return alice.store
+        .select()
+        .from(tables.events)
+        .all()
+        .find((e) => e.id === offlineEvent.id);
+    }, 8_000);
+
+    // Honest event identity preserved across catchup.
+    expect(recoveredMemory.hostId).toBe(bob.hostId);
+    expect(recoveredMemory.actorId).toBe(bob.humanAgentId);
+    expect(recoveredMemory.hlc).toBe(bobMemoryRow.hlc);
+    expect(recoveredEvent.hostId).toBe(bob.hostId);
+    expect(recoveredEvent.actorId).toBe(bob.humanAgentId);
+    expect(recoveredEvent.hlc).toBe(bobEventRow.hlc);
+  },
+  15_000,
+  );
 });

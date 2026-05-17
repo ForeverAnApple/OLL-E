@@ -41,6 +41,10 @@ export interface PeerLinkOptions {
   maxQueue?: number;
   /** Optional injection for tests; defaults to the global WebSocket. */
   webSocketFactory?: (addr: string) => WebSocket;
+  /** Our own listener addr advertised in every outgoing `hello` payload.
+   *  Lets the dialed peer addPeer us back so catchup fires symmetrically
+   *  on the resulting outbound link instead of only one direction. */
+  listenerAddr?: string;
 }
 
 export interface PeerLink {
@@ -135,13 +139,18 @@ export function createPeerLink(opts: PeerLinkOptions): PeerLink {
   }
 
   function makeHelloEnvelope(): MeshEnvelope {
+    const payload: Record<string, unknown> = {
+      teamId: opts.teamId,
+      fromHostId: opts.hostId,
+    };
+    if (opts.listenerAddr) payload.listenerAddr = opts.listenerAddr;
     const unsigned: UnsignedEnvelope = {
       proto: MESH_PROTO,
       envelopeId: ulid(),
       teamId: opts.teamId,
       fromHostId: opts.hostId,
       kind: "hello",
-      payload: { teamId: opts.teamId, fromHostId: opts.hostId },
+      payload,
       sentAt: Date.now(),
     };
     const hmac = signEnvelope(unsigned, opts.secret);

@@ -378,6 +378,8 @@ HMAC over canonical JSON of the envelope minus the `hmac` field. Bad HMAC / prot
 
 Any team member can mint an invite (`team_invite` → bearer code = `base64url(JSON{proto,teamId,inviteId,addr,secret})`). The joiner (`team_join`) dials the inviter, sends a signed `hello`, receives `welcome { peerHostId, peerSet }`, and then dials every other peer in the set. O(N²) fully-connected mesh is fine for v0 team sizes.
 
+Every `hello` carries the sender's own `listenerAddr`. The receiver `addPeer`s the dialer using that addr, opening a reverse outbound link. Both sides end up with one inbound and one outbound link to every peer, and catchup-on-reconnect fires on whichever side restarts (catchup is triggered on outbound `connected` transitions only — without the reverse link, an inviter restart leaves no path for the inviter to pull the joiner's gap).
+
 Heartbeat every 15s; peer goes stale after 60s of silence; reconnect backoff at 1s, 2s, 5s, 15s, 60s, cap. TCP close → reconnect with the same schedule.
 
 ### What crosses, what stays

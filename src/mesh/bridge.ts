@@ -272,6 +272,10 @@ export function startRealMeshBridge(opts: RealMeshBridgeOptions): RealMeshBridge
       secret,
       addr,
       webSocketFactory: opts.webSocketFactory,
+      // Advertise our listener addr in every hello so the peer can
+      // addPeer us back — symmetric mesh, both sides own an outbound
+      // link, catchup fires on either side's reconnect.
+      listenerAddr: listener?.addr,
       onEnvelope: (env) => {
         dispatchEnvelope(env, { send: (out) => link.send(out) });
       },
@@ -336,7 +340,10 @@ export function startRealMeshBridge(opts: RealMeshBridgeOptions): RealMeshBridge
     }
     const existing = teamPeers.get(peerHostId);
     if (existing) {
-      // Replace on addr change; otherwise no-op.
+      // No-op when the addr is unchanged — every inbound hello re-asserts
+      // the joiner's listener addr, and tearing down a working outbound
+      // link to dial the same place would churn the catchup window.
+      if (existing.addr === addr) return;
       existing.link.close();
     }
     const k = pkey(teamId, peerHostId);
@@ -437,6 +444,17 @@ export function startRealMeshBridge(opts: RealMeshBridgeOptions): RealMeshBridge
             params.reject = true;
             return;
           }
+        }
+        // Honor the joiner's advertised listener addr: addPeer so we
+        // open our own outbound link back. Catchup only fires on
+        // outbound `connected` transitions, so without this the
+        // inviter-restart direction never recovers the joiner's gap.
+        const joinerAddr =
+          typeof params.helloPayload.listenerAddr === "string"
+            ? (params.helloPayload.listenerAddr as string)
+            : null;
+        if (joinerAddr) {
+          addPeer(params.teamId, params.fromHostId, joinerAddr, null);
         }
         // The bridge already knows the team; register an inbound link
         // entry so outbound broadcasts can opt to use it if no outbound
