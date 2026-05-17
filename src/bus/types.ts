@@ -24,7 +24,19 @@ export interface Event<T = unknown> {
   readonly durable: boolean;
 }
 
-export type EventHandler<T = unknown> = (event: Event<T>) => void | Promise<void>;
+/** Per-dispatch context. `remote = true` means this event arrived from a
+ *  peer over the mesh and was replayed locally via `bus.inject` — the
+ *  in-memory flag never lands on `event.payload`, so the persisted row
+ *  matches what the original publisher emitted. Bridges and re-broadcast
+ *  guards use this to avoid looping the mesh; pure projectors ignore it. */
+export interface DeliveryContext {
+  readonly remote: boolean;
+}
+
+export type EventHandler<T = unknown> = (
+  event: Event<T>,
+  ctx: DeliveryContext,
+) => void | Promise<void>;
 export type Unsubscribe = () => void;
 
 /** Wildcard matches every event. Type strings may use dots; we match on prefix via ":" paths deliberately not — v0 stays literal. */
