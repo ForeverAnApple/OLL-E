@@ -14,4 +14,12 @@ sweep() { rm -f .*.bun-build 2>/dev/null || true; }
 trap sweep EXIT
 sweep
 
-bun build --compile --target=bun ./src/cli/index.ts --outfile=dist/olle
+# Ink's compiled `devtools.js` has a top-of-module
+# `import devtools from 'react-devtools-core'` that bun's bundler tries
+# to resolve even though Ink only loads `devtools.js` under
+# `if (process.env.DEV === 'true')`. We don't ship the ~16MB devtools
+# package; instead a tsconfig `paths` entry redirects the import to a
+# noop stub at src/_stubs/react-devtools-core.ts. The stub never runs
+# at runtime because DEV is never 'true' in production.
+bun build --compile --target=bun \
+  ./src/cli/index.ts --outfile=dist/olle

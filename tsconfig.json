@@ -19,15 +19,18 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": false,
 
+    "jsx": "react-jsx",
+
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "noEmit": true,
 
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "react-devtools-core": ["src/_stubs/react-devtools-core.ts"]
     }
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "test/**/*.tsx"],
   "exclude": ["node_modules", "dist", "references"]
 }

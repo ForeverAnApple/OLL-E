@@ -1055,6 +1055,24 @@ Also fixed `addPeer`'s no-op-on-same-addr path. The existing comment promised it
 
 ---
 
+## 2026-05-20 — LLM layer on Vercel AI SDK; Ink scaffold for `olle chat`
+
+Two surgical swaps, prompted by named pain rather than architectural anxiety. The user named the toil honestly: hand-rolled streaming/cursor management in `cmdChat` (random text streaming bugs, 7-10 rounds of AI-pairing to get aesthetics right) and hand-maintained per-provider LLM adapters (cache-breakpoint plumbing, retry observability, streaming bridges, usage normalization across two SDK shapes). Neither pain was OLL-E architecture — both were plumbing layers any production agent codebase will write once and maintain forever if not delegated.
+
+**LLM swap.** `src/llm/anthropic.ts` and `src/llm/openai.ts` now wrap Vercel AI SDK (`ai` + `@ai-sdk/anthropic` + `@ai-sdk/openai`) behind the existing `Llm` / `CompletionRequest` / `Completion` interface in `src/llm/types.ts`. The provider-neutral seam holds; downstream callers (router, ledger, chat loop) didn't move. Cache breakpoints — system segments, last tool, last user message — translate to `providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } }` per AI SDK's declarative form. `createInstrumentedFetch` survives unchanged and wires into the provider factory's `fetch` param so retry-observability still surfaces `onRetry` callbacks. Tests rewrote against `MockLanguageModelV3` from `ai/test` (a tiny `streamOf` helper builds the ReadableStream<LanguageModelV3StreamPart>). `@anthropic-ai/sdk` + `openai` packages dropped from dependencies. ~500 LOC of vendor-specific glue replaced with ~80 LOC of mapper code and a 55-LOC shared `vercel-mappers.ts`. 405/407 tests green (2 pre-existing skips, 0 fail). Adding a third provider is now `import { google } from "@ai-sdk/google"` against the existing mappers, not a fork-and-write.
+
+**Vision check passed.** Adopting an SDK for the LLM client doesn't violate "habitat, not framework" — AI SDK is a library, not a framework. The agent loop, six primitives, mesh, decision inbox, extension authoring loop, memory projector — all unchanged. We deleted vendor-adapter code, not architectural code.
+
+**Ink scaffold (parallel, opt-in).** New `olle chat-ink` command mounts a React tree (Ink) instead of cmdChat's hand-rolled LineEditor + ANSI cursor dance. Ink owns the redraw loop, so streaming `chat.assistant-delta` events just bump React state and the terminal repaints itself — no manual erase/refresh, no overlap bugs, no walking-over-the-prompt failure mode that drove the suspend()-during-streaming hack in the old chat. Scrollback uses Ink's `<Static>` for the committed history (cheap rerender), with the in-progress streaming text rendered separately below in a dynamic region. Input is `@inkjs/ui`'s uncontrolled `<TextInput>`; Ctrl-C handling is two-tap-quit when idle, cancel-turn when streaming, matching the old behavior. Slash commands `/help`, `/clear`, `/new`, `/cancel`, `/model`, `/exit` are wired. Markdown rendering inside scrollback is **not** ported yet — assistant text renders as plain markdown source until a follow-up adds a marked-to-Ink-component path.
+
+**Parallel-not-replacement.** `cmdChat` stays as-is; `chat-ink` is the experimental opt-in surface. Once chat-ink carries the full surface (tray for in-flight queued messages, suggestions tray, reconnect loop, markdown rendering) and the user prefers it, we delete cmdChat in a separate change. The point of the parallel path is to prove the streaming-bug class is solved by Ink before committing to ripping out the working chat.
+
+**What this rejects.** Two adjacent moves were on the table and rejected. (a) Adopting a full agent SDK (Mastra, LangGraph, CrewAI, OpenAI Agents SDK, Claude Agent SDK, Cersei): all impose their own primitive model (agent class, workflow graph, memory abstraction). Adopting one would bend OLL-E's six primitives to fit, costing the habitat property to save adapter code. Cersei is also Rust — a language port, not a library swap. (b) A "huge rewrite" framing for the toil pain: rejected as elegance-as-avoidance. The toil was real but local; the fix was surgical replacement of two commodity plumbing layers, not architectural surrender.
+
+**What this leaves open.** Markdown rendering inside Ink scrollback; per-thread loadout durability when chat-ink replaces cmdChat (the in-memory loaded set survives one process, not restart — same constraint cmdChat has today). Adding a third provider (Google, Mistral, Ollama, OpenRouter) is now mechanically trivial and queued for the next provider-need-driven session.
+
+---
+
 ## How to use this log
 
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.

@@ -46,6 +46,9 @@ export async function runCli(args: string[]): Promise<void> {
     case "chat":
       await cmdChat();
       return;
+    case "chat-ink":
+      await cmdChatInk();
+      return;
     case "extension":
     case "extensions":
     case "ext":
@@ -755,6 +758,13 @@ async function cmdTeam(args: string[]): Promise<void> {
         throw new Error(`unknown team subcommand: ${sub}`);
     }
   });
+}
+
+async function cmdChatInk(): Promise<void> {
+  // Lazy import so the legacy chat path doesn't pay React/Ink module
+  // load cost. Once chat-ink replaces cmdChat outright this collapses.
+  const { runInkChat } = await import("./chat-ink/render.tsx");
+  await runInkChat();
 }
 
 async function cmdChat(): Promise<void> {
@@ -2756,6 +2766,7 @@ function printHelp(): void {
       "  status [--since 24h]        dashboard: daemon, agent, inbox, usage, runs, extensions",
       "  daemon restart              SIGTERM the daemon and wait for the supervisor to bring it back",
       "  chat                        REPL connected to the default agent",
+      "  chat-ink                    Ink-based chat REPL (experimental, parallel to `chat`)",
       "  tail [type]                 stream events (default: all)",
       "  publish <type> [json]       emit a durable event",
       "  extension list              list loaded extensions",

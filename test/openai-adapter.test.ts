@@ -4,83 +4,10 @@
 // inherits that wrapper unchanged.
 
 import { describe, expect, test } from "bun:test";
-import OpenAI from "openai";
+import { MockLanguageModelV3 } from "ai/test";
 import { createOpenAIAdapter } from "../src/llm/openai.ts";
 import type { CompletionRequest } from "../src/llm/types.ts";
-
-interface FakeStreamResult {
-  /** Optional content deltas to emit before resolving. */
-  contentDeltas?: string[];
-  /** The completion the stream resolves to. */
-  completion: OpenAI.ChatCompletion;
-}
-
-function fakeClient(results: FakeStreamResult[]): OpenAI {
-  let i = 0;
-  return {
-    chat: {
-      completions: {
-        stream: () => {
-          const res = results[Math.min(i, results.length - 1)]!;
-          i++;
-          const handlers = new Map<string, (s: string) => void>();
-          const finalPromise = (async () => {
-            // Let the adapter attach listeners first.
-            await Promise.resolve();
-            for (const d of res.contentDeltas ?? []) {
-              handlers.get("content")?.(d);
-            }
-            return res.completion;
-          })();
-          return {
-            on: (ev: string, fn: (s: string) => void) => {
-              handlers.set(ev, fn);
-            },
-            finalChatCompletion: () => finalPromise,
-          };
-        },
-      },
-    },
-  } as unknown as OpenAI;
-}
-
-function chatCompletion(overrides: {
-  content?: string | null;
-  refusal?: string | null;
-  tool_calls?: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[];
-  finish_reason?: OpenAI.Chat.Completions.ChatCompletion.Choice["finish_reason"];
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  cached_tokens?: number;
-}): OpenAI.ChatCompletion {
-  return {
-    id: "fake",
-    object: "chat.completion",
-    created: 0,
-    model: "gpt-5",
-    choices: [
-      {
-        index: 0,
-        finish_reason: overrides.finish_reason ?? "stop",
-        logprobs: null,
-        message: {
-          role: "assistant",
-          content: overrides.content ?? null,
-          refusal: overrides.refusal ?? null,
-          ...(overrides.tool_calls ? { tool_calls: overrides.tool_calls } : {}),
-        } as OpenAI.Chat.Completions.ChatCompletionMessage,
-      },
-    ],
-    usage: {
-      prompt_tokens: overrides.prompt_tokens ?? 10,
-      completion_tokens: overrides.completion_tokens ?? 5,
-      total_tokens: (overrides.prompt_tokens ?? 10) + (overrides.completion_tokens ?? 5),
-      ...(overrides.cached_tokens !== undefined
-        ? { prompt_tokens_details: { cached_tokens: overrides.cached_tokens } }
-        : {}),
-    },
-  };
-}
+import { streamOf } from "./_helpers/mock-stream.ts";
 
 const baseReq: CompletionRequest = {
   model: "gpt-5",
@@ -88,16 +15,46 @@ const baseReq: CompletionRequest = {
   maxTokens: 16,
 };
 
+function mockModel(parts: unknown[]) {
+  return new MockLanguageModelV3({
+    provider: "openai",
+    modelId: "gpt-5",
+    doStream: async () => ({
+      stream: streamOf(parts as never[]),
+    }),
+  });
+}
+
+function textRun(deltas: string[], usage: {
+  total?: number; cacheRead?: number; output?: number;
+}, finish: "stop" | "length" | "tool-calls" | "content-filter" = "stop") {
+  const id = "t1";
+  return [
+    { type: "stream-start", warnings: [] },
+    { type: "text-start", id },
+    ...deltas.map((d) => ({ type: "text-delta", id, delta: d })),
+    { type: "text-end", id },
+    {
+      type: "finish",
+      usage: {
+        inputTokens: {
+          total: usage.total ?? 0,
+          noCache: undefined,
+          cacheRead: usage.cacheRead ?? 0,
+          cacheWrite: 0,
+        },
+        outputTokens: { total: usage.output ?? 0, text: usage.output ?? 0, reasoning: 0 },
+      },
+      finishReason: { unified: finish, raw: undefined },
+    },
+  ];
+}
+
 describe("openai adapter streaming", () => {
   test("forwards content deltas and returns the assembled message", async () => {
     const deltas: string[] = [];
-    const client = fakeClient([
-      {
-        contentDeltas: ["hello ", "world"],
-        completion: chatCompletion({ content: "hello world" }),
-      },
-    ]);
-    const llm = createOpenAIAdapter({ client });
+    const model = mockModel(textRun(["hello ", "world"], { total: 10, output: 5 }));
+    const llm = createOpenAIAdapter({ languageModel: model });
     const out = await llm.complete({ ...baseReq, onTextDelta: (d) => deltas.push(d) });
     expect(deltas).toEqual(["hello ", "world"]);
     expect(out.content).toEqual([{ type: "text", text: "hello world" }]);
@@ -107,20 +64,13 @@ describe("openai adapter streaming", () => {
 
 describe("openai adapter usage mapping", () => {
   test("subtracts cached_tokens from inputTokens and reports cache reads", async () => {
-    const client = fakeClient([
-      {
-        completion: chatCompletion({
-          content: "ok",
-          prompt_tokens: 100,
-          completion_tokens: 20,
-          cached_tokens: 60,
-        }),
-      },
-    ]);
-    const llm = createOpenAIAdapter({ client });
+    const model = mockModel(
+      textRun(["ok"], { total: 100, cacheRead: 60, output: 20 }),
+    );
+    const llm = createOpenAIAdapter({ languageModel: model });
     const out = await llm.complete(baseReq);
     expect(out.usage).toEqual({
-      inputTokens: 40, // 100 - 60 cached
+      inputTokens: 40, // 100 total - 60 cached
       outputTokens: 20,
       cacheReadInputTokens: 60,
       cacheCreationInputTokens: 0,
@@ -128,17 +78,9 @@ describe("openai adapter usage mapping", () => {
     });
   });
 
-  test("handles missing prompt_tokens_details (no cache)", async () => {
-    const client = fakeClient([
-      {
-        completion: chatCompletion({
-          content: "ok",
-          prompt_tokens: 10,
-          completion_tokens: 5,
-        }),
-      },
-    ]);
-    const llm = createOpenAIAdapter({ client });
+  test("handles missing cache info (no cache)", async () => {
+    const model = mockModel(textRun(["ok"], { total: 10, output: 5 }));
+    const llm = createOpenAIAdapter({ languageModel: model });
     const out = await llm.complete(baseReq);
     expect(out.usage.cacheReadInputTokens).toBe(0);
     expect(out.usage.inputTokens).toBe(10);
@@ -146,22 +88,25 @@ describe("openai adapter usage mapping", () => {
 });
 
 describe("openai adapter stop reasons", () => {
-  test("tool_calls finish_reason → tool_use", async () => {
-    const client = fakeClient([
+  test("tool-calls finish reason → tool_use, with tool_use blocks in content", async () => {
+    const model = mockModel([
+      { type: "stream-start", warnings: [] },
       {
-        completion: chatCompletion({
-          finish_reason: "tool_calls",
-          tool_calls: [
-            {
-              id: "call_1",
-              type: "function",
-              function: { name: "do_thing", arguments: '{"x": 1}' },
-            },
-          ],
-        }),
+        type: "tool-call",
+        toolCallId: "call_1",
+        toolName: "do_thing",
+        input: '{"x":1}',
+      },
+      {
+        type: "finish",
+        usage: {
+          inputTokens: { total: 5, noCache: undefined, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 5, text: 0, reasoning: 0 },
+        },
+        finishReason: { unified: "tool-calls", raw: undefined },
       },
     ]);
-    const llm = createOpenAIAdapter({ client });
+    const llm = createOpenAIAdapter({ languageModel: model });
     const out = await llm.complete(baseReq);
     expect(out.stopReason).toBe("tool_use");
     expect(out.content).toEqual([
@@ -169,52 +114,17 @@ describe("openai adapter stop reasons", () => {
     ]);
   });
 
-  test("length finish_reason → max_tokens", async () => {
-    const client = fakeClient([
-      { completion: chatCompletion({ content: "...", finish_reason: "length" }) },
-    ]);
-    const llm = createOpenAIAdapter({ client });
+  test("length finish reason → max_tokens", async () => {
+    const model = mockModel(textRun(["..."], { total: 5, output: 5 }, "length"));
+    const llm = createOpenAIAdapter({ languageModel: model });
     const out = await llm.complete(baseReq);
     expect(out.stopReason).toBe("max_tokens");
   });
 
-  test("refusal field beats finish_reason", async () => {
-    const client = fakeClient([
-      {
-        completion: chatCompletion({
-          content: null,
-          refusal: "I cannot help with that.",
-          finish_reason: "stop",
-        }),
-      },
-    ]);
-    const llm = createOpenAIAdapter({ client });
+  test("content-filter finish reason → refusal", async () => {
+    const model = mockModel(textRun([], { total: 5, output: 0 }, "content-filter"));
+    const llm = createOpenAIAdapter({ languageModel: model });
     const out = await llm.complete(baseReq);
     expect(out.stopReason).toBe("refusal");
-    expect(out.content).toEqual([{ type: "text", text: "I cannot help with that." }]);
-  });
-});
-
-describe("openai adapter tool_call argument parsing", () => {
-  test("invalid JSON arguments fall through as _raw rather than throwing", async () => {
-    const client = fakeClient([
-      {
-        completion: chatCompletion({
-          finish_reason: "tool_calls",
-          tool_calls: [
-            {
-              id: "call_1",
-              type: "function",
-              function: { name: "do_thing", arguments: "{not json" },
-            },
-          ],
-        }),
-      },
-    ]);
-    const llm = createOpenAIAdapter({ client });
-    const out = await llm.complete(baseReq);
-    expect(out.content).toEqual([
-      { type: "tool_use", id: "call_1", name: "do_thing", input: { _raw: "{not json" } },
-    ]);
   });
 });

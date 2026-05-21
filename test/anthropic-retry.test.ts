@@ -1,9 +1,8 @@
-// Retry observability behavior. The Anthropic SDK owns the retry loop
-// (we pass `maxRetries` and let it back off internally); our code's
-// contribution is `createInstrumentedFetch`, which observes the SDK
-// re-invoking fetch and surfaces those as onRetry callbacks. These
-// tests pin that wrapper in isolation plus the adapter's streaming
-// text-delta forwarding.
+// Retry observability behavior. The Vercel AI SDK owns the retry loop;
+// our code's contribution is `createInstrumentedFetch`, which observes
+// the SDK re-invoking fetch and surfaces those as onRetry callbacks.
+// These tests pin that wrapper in isolation plus the adapter's
+// streaming text-delta forwarding.
 //
 // Regression guard: a prior refactor silently dropped retry handling
 // entirely, leaving users staring at raw "API overloaded" errors. The
@@ -11,16 +10,11 @@
 // fires onRetry on every retry attempt and not on the first call.
 
 import { describe, expect, test } from "bun:test";
-import Anthropic from "@anthropic-ai/sdk";
+import { MockLanguageModelV3 } from "ai/test";
 import { createAnthropicAdapter } from "../src/llm/anthropic.ts";
 import { createInstrumentedFetch, type FetchLike } from "../src/llm/instrumented-fetch.ts";
 import type { CompletionRequest, RetryInfo } from "../src/llm/types.ts";
-
-const successResp = {
-  content: [{ type: "text", text: "ok" }],
-  stop_reason: "end_turn",
-  usage: { input_tokens: 1, output_tokens: 1 },
-};
+import { streamOf } from "./_helpers/mock-stream.ts";
 
 const baseReq: CompletionRequest = {
   model: "claude-opus-4-7",
@@ -74,31 +68,33 @@ describe("createInstrumentedFetch", () => {
 });
 
 describe("anthropic adapter streaming", () => {
-  test("forwards text deltas to req.onTextDelta and assembles the final message", async () => {
+  test("forwards text deltas to req.onTextDelta and assembles the final content", async () => {
     const deltas: string[] = [];
-    const client = {
-      messages: {
-        stream: () => {
-          const handlers = new Map<string, (s: string) => void>();
-          const finalPromise = (async () => {
-            // Let the adapter attach its listener first.
-            await Promise.resolve();
-            handlers.get("text")?.("hello ");
-            handlers.get("text")?.("world");
-            return successResp;
-          })();
-          return {
-            on: (ev: string, fn: (s: string) => void) => {
-              handlers.set(ev, fn);
+    const model = new MockLanguageModelV3({
+      provider: "anthropic",
+      modelId: "claude-opus-4-7",
+      doStream: async () => ({
+        stream: streamOf([
+          { type: "stream-start", warnings: [] },
+          { type: "text-start", id: "t1" },
+          { type: "text-delta", id: "t1", delta: "hello " },
+          { type: "text-delta", id: "t1", delta: "world" },
+          { type: "text-end", id: "t1" },
+          {
+            type: "finish",
+            usage: {
+              inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+              outputTokens: { total: 2, text: 2, reasoning: 0 },
             },
-            finalMessage: () => finalPromise,
-          };
-        },
-      },
-    } as unknown as Anthropic;
-    const llm = createAnthropicAdapter({ client });
+            finishReason: { unified: "stop", raw: undefined },
+          },
+        ]),
+      }),
+    });
+    const llm = createAnthropicAdapter({ languageModel: model });
     const out = await llm.complete({ ...baseReq, onTextDelta: (d) => deltas.push(d) });
     expect(deltas).toEqual(["hello ", "world"]);
-    expect(out.content[0]).toMatchObject({ type: "text", text: "ok" });
+    expect(out.content).toEqual([{ type: "text", text: "hello world" }]);
+    expect(out.stopReason).toBe("end_turn");
   });
 });
