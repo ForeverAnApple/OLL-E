@@ -20,6 +20,7 @@
     "@anthropic-ai/sdk": "^0.38.0",
     "drizzle-orm": "^0.45.2",
     "marked": "^18.0.2",
+    "openai": "^6.38.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {

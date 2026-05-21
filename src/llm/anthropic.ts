@@ -32,11 +32,11 @@ import type {
   ContentBlock,
   Llm,
   Message,
-  RetryInfo,
   SystemSegment,
   ToolSpec,
   Usage,
 } from "./types.ts";
+import { createInstrumentedFetch, type FetchLike } from "./instrumented-fetch.ts";
 
 export interface AnthropicAdapterOptions {
   apiKey?: string;
@@ -45,49 +45,44 @@ export interface AnthropicAdapterOptions {
   /** Inject a client for tests. */
   client?: Anthropic;
   /** How many transient-failure retries we'll attempt before giving up.
-   *  Default 12, which with the capped backoff below buys ~5–6 minutes
-   *  of ride-out — enough to coast through Anthropic's typical overload
-   *  windows without surfacing a crash to the user. */
+   *  Default 40. The SDK's backoff is `min(0.5 * 2^n, 8s)` per attempt
+   *  with jitter, so the first ~4 retries climb 0.5→8s and the remaining
+   *  ~36 sit at the 8s cap → ~5 minutes of ride-out, enough to coast
+   *  through Anthropic's typical overload windows. */
   maxRetries?: number;
-  /** Initial backoff in ms (doubled with jitter on each retry). */
-  retryInitialMs?: number;
-  /** Cap on per-retry sleep. Backoff plateaus here so we don't sit idle
-   *  for minutes on a single attempt. */
-  retryMaxMs?: number;
-  /** Override the sleeper (tests inject a synchronous one). */
-  sleep?: (ms: number) => Promise<void>;
+  /** Override the standard fetch function (primarily for testing retries). */
+  fetch?: FetchLike;
 }
 
 export const DEFAULT_MODEL = "claude-opus-4-7";
-const DEFAULT_MAX_RETRIES = 12;
-const DEFAULT_RETRY_INITIAL_MS = 1000;
-const DEFAULT_RETRY_MAX_MS = 30_000;
+const DEFAULT_MAX_RETRIES = 40;
 
 export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm {
-  // We own the retry loop; disable the SDK's so the two layers don't compound.
+  // Caller resolves the key from the secrets store and passes it explicitly.
+  // No env fallback — secrets have one source of truth (~/.olle/secrets/).
   const client =
     opts.client ??
     new Anthropic({
-      // Caller (the daemon) resolves the key from the secrets store and
-      // passes it explicitly. No env fallback — secrets have one source of
-      // truth (~/.olle/secrets/), env is reserved for behavior toggles.
       apiKey: opts.apiKey,
-      maxRetries: 0,
     });
   const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
-  const initialMs = opts.retryInitialMs ?? DEFAULT_RETRY_INITIAL_MS;
-  const maxMs = opts.retryMaxMs ?? DEFAULT_RETRY_MAX_MS;
-  const sleep = opts.sleep ?? defaultSleep;
 
   return {
     provider: "anthropic",
     defaultModel: opts.model ?? DEFAULT_MODEL,
 
     async complete(req: CompletionRequest): Promise<Completion> {
-      const resp = await callWithRetry(
-        () => runStream(client, req),
-        { maxRetries, initialMs, maxMs, sleep, onRetry: req.onRetry },
-      );
+      // Wrap fetch only if the caller is listening for retry events.
+      // Otherwise pass through opts.fetch (or undefined → SDK default).
+      const fetchWrapper = req.onRetry
+        ? createInstrumentedFetch(req.onRetry, opts.fetch ?? fetch)
+        : opts.fetch;
+
+      const resp = await runStream(client, req, {
+        maxRetries,
+        signal: req.signal,
+        ...(fetchWrapper && { fetch: fetchWrapper }),
+      });
 
       const content: ContentBlock[] = resp.content.map(fromAnthropicBlock);
       const cacheRead = readCacheField(resp.usage, "cache_read_input_tokens");
@@ -97,9 +92,8 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
         outputTokens: resp.usage.output_tokens,
         cacheReadInputTokens: cacheRead,
         cacheCreationInputTokens: cacheCreation,
-        // total = everything billed this call. Cache reads are billable
-        // (cheap), so they count; cache creation is also billable
-        // (premium), so it counts.
+        // Cache reads (cheap) and cache creation (premium) are both
+        // billable, so they count toward total. Don't "fix" this formula.
         totalTokens:
           resp.usage.input_tokens +
           resp.usage.output_tokens +
@@ -123,13 +117,14 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
  * non-streaming-shaped response the adapter would otherwise build.
  *
  * Why always stream, even if no one's listening? It keeps the request
- * path single-shaped (one HTTP path, one place where transient errors
- * surface), and the cost of streaming when no delta callback is set is
- * essentially zero — we just discard the deltas.
+ * path single-shaped (one HTTP path, one place where errors surface)
+ * and the cost when no delta callback is set is essentially zero — the
+ * deltas just get discarded.
  */
 async function runStream(
   client: Anthropic,
   req: CompletionRequest,
+  options: Anthropic.RequestOptions,
 ): Promise<Anthropic.Messages.Message> {
   const stream = client.messages.stream(
     {
@@ -140,7 +135,7 @@ async function runStream(
       messages: buildMessages(req.messages),
       tools: req.tools?.length ? buildTools(req.tools) : undefined,
     } as Anthropic.Messages.MessageCreateParamsStreaming,
-    req.signal ? { signal: req.signal } : undefined,
+    options,
   );
   if (req.onTextDelta) {
     stream.on("text", (delta: string) => {
@@ -192,10 +187,10 @@ function buildTools(tools: ToolSpec[]): Anthropic.Messages.Tool[] {
 
 /**
  * Build messages with a cache breakpoint on the LAST USER MESSAGE.
- * This caches the conversation prefix through that point so each
- * subsequent turn (which appends a new user message) reads through it.
- * Without this, multi-turn agent loops re-charge the entire conversation
- * every turn.
+ * Caches the conversation prefix through that point so each subsequent
+ * turn (which appends a new user message) reads through it. Without
+ * this, multi-turn agent loops re-charge the entire conversation every
+ * turn.
  */
 function buildMessages(messages: Message[]): Anthropic.Messages.MessageParam[] {
   const out = messages.map(toAnthropicMessage);
@@ -233,9 +228,6 @@ function withTrailingCacheControl(
   const blocks = m.content.slice();
   const last = blocks[blocks.length - 1];
   if (!last) return m;
-  // Tool-result blocks accept cache_control too; text blocks definitely do.
-  // Spreading is enough to attach the field — vendor types accept it on
-  // every block kind we emit.
   blocks[blocks.length - 1] = {
     ...(last as object),
     cache_control: { type: "ephemeral" },
@@ -288,92 +280,19 @@ function mapStopReason(
     case "end_turn":
       return "end_turn";
     default:
-      // Newer stop reasons ("refusal", "pause_turn", etc) — map to
-      // end_turn so v0 keeps moving. Adapters can refine later.
+      // Newer stop reasons ("pause_turn" etc) — map to end_turn so v0
+      // keeps moving. Refusal is the one case we propagate distinctly.
       return r === "refusal" ? "refusal" : "end_turn";
   }
 }
 
-// Cache fields are present on the SDK's usage type but are nullable
-// across SDK minor versions; some return null when caching is disabled
-// or the provider didn't report. Normalize to a number.
+// Cache fields are present on the SDK's usage type but nullable across
+// SDK minor versions; some return null when caching is disabled or the
+// provider didn't report. Normalize to a number.
 function readCacheField(
   usage: Anthropic.Messages.Usage,
   field: "cache_read_input_tokens" | "cache_creation_input_tokens",
 ): number {
   const raw = (usage as unknown as Record<string, unknown>)[field];
   return typeof raw === "number" ? raw : 0;
-}
-
-interface RetryOpts {
-  maxRetries: number;
-  initialMs: number;
-  maxMs: number;
-  sleep: (ms: number) => Promise<void>;
-  onRetry?: (info: RetryInfo) => void;
-}
-
-/**
- * Retries `fn` on transient Anthropic failures (overload, rate limit, 5xx)
- * with exponential backoff capped at `maxMs`. Surfaces every retry through
- * the optional `onRetry` so the surrounding loop can show "API busy" status
- * instead of letting the user stare at a frozen prompt.
- *
- * Non-transient errors (4xx other than 408/409/429) bypass retry entirely.
- * On exhaustion we rewrap the last error into a clean message — the raw
- * APIError's stack-shaped string is hostile in chat output.
- */
-async function callWithRetry<T>(fn: () => Promise<T>, opts: RetryOpts): Promise<T> {
-  let lastErr: unknown;
-  for (let attempt = 1; attempt <= opts.maxRetries + 1; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (!isTransient(err) || attempt > opts.maxRetries) break;
-      // Decorrelated jitter: pick uniformly in [initial, prev*3], cap at maxMs.
-      // Smooths the herd if many requests hit overload at once.
-      const base = Math.min(opts.maxMs, opts.initialMs * 2 ** (attempt - 1));
-      const waitMs = Math.min(opts.maxMs, opts.initialMs + Math.random() * base);
-      const status = err instanceof Anthropic.APIError ? err.status : undefined;
-      const message =
-        err instanceof Error ? err.message : typeof err === "string" ? err : undefined;
-      opts.onRetry?.({ attempt, status, waitMs, message });
-      await opts.sleep(waitMs);
-    }
-  }
-  throw rewrapTransient(lastErr, opts.maxRetries);
-}
-
-function isTransient(err: unknown): boolean {
-  if (!(err instanceof Anthropic.APIError)) return false;
-  const s = err.status;
-  if (!s) return true; // network-level failure with no HTTP status — worth retrying
-  return s === 408 || s === 409 || s === 429 || s >= 500;
-}
-
-function rewrapTransient(err: unknown, maxRetries: number): Error {
-  if (err instanceof Anthropic.APIError) {
-    const s = err.status;
-    if (s === 529 || s === 503) {
-      return new Error(
-        `Anthropic API overloaded (HTTP ${s}) after ${maxRetries} retries — try again shortly`,
-      );
-    }
-    if (s === 429) {
-      return new Error(
-        `Anthropic rate limit hit (HTTP 429) after ${maxRetries} retries — back off and retry`,
-      );
-    }
-    if (s && s >= 500) {
-      return new Error(
-        `Anthropic server error (HTTP ${s}) after ${maxRetries} retries: ${err.message}`,
-      );
-    }
-  }
-  return err instanceof Error ? err : new Error(String(err));
-}
-
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

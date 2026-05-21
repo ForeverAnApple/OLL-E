@@ -51,8 +51,6 @@ export interface RetryInfo {
   attempt: number;
   /** HTTP status if the failure was an APIError. */
   status?: number;
-  /** Wall-clock ms we'll sleep before the next attempt. */
-  waitMs: number;
   /** Provider/error message, for display. */
   message?: string;
 }
@@ -67,9 +65,11 @@ export interface CompletionRequest {
   maxTokens: number;
   temperature?: number;
   /** Fired by the adapter when a transient failure (overload, rate limit,
-   *  5xx) is about to be retried. Lets the surrounding loop emit a visible
-   *  "API busy, retrying..." status so the user sees the agent waiting on
-   *  physics rather than crashing. */
+   *  5xx) triggered the SDK's retry. Fires once per retry attempt at the
+   *  start of the new attempt — the SDK owns the backoff timing, so we
+   *  can't report ms-until-next-attempt up front. Surface for the UI to
+   *  show "API busy, retrying…" rather than letting the user stare at a
+   *  frozen prompt. */
   onRetry?: (info: RetryInfo) => void;
   /** Fired with each text delta as it streams in from the provider. The
    *  adapter still returns the assembled Completion; this is purely a

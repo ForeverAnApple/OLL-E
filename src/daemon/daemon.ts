@@ -5,7 +5,19 @@ import { createIpcServer, type IpcServer } from "../ipc/server.ts";
 import { createExtensionHost, ensureRepo, type ExtensionHost } from "../extensions/index.ts";
 import { createLedger, type Ledger } from "../ledger/index.ts";
 import { createScheduler, type Scheduler } from "../scheduler/index.ts";
-import { createAnthropicAdapter } from "../llm/index.ts";
+import {
+  createAnthropicAdapter,
+  createOpenAIAdapter,
+  createRouterLlm,
+  providerForModel,
+  type RouterAdapters,
+  type RouterLlm,
+} from "../llm/index.ts";
+import {
+  fallbackForProvider,
+  readDefaultModel,
+  writeDefaultModel,
+} from "./model-preference.ts";
 import {
   startAgentLoop,
   createAgentManager,
@@ -198,6 +210,11 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   let chatAgentId: string | undefined;
   let chatHealth: ChatHealthMonitor | undefined;
   let chatDisabledReason: string | undefined;
+  // The multi-provider router. Lives in outer state so the `model.set`
+  // and `secret.set` subscribers can mutate it (switch active model,
+  // hot-add a provider when a second API key lands) without restarting
+  // chat.
+  let router: RouterLlm | undefined;
 
   const ipc = createIpcServer({
     socketPath: paths.socketFile,
@@ -216,6 +233,23 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       reason: chatDisabledReason,
     }),
     chatCancel: (threadId: string) => (chat ? chat.cancel(threadId) : false),
+    modelControl: {
+      current: () =>
+        router ? router.defaultModel : readDefaultModel(paths.defaultModelFile),
+      validate: (model: string) => {
+        // Always reject unknown provider prefixes (typos like
+        // "claud-opus-4-7"). When the router is alive, also reject
+        // models whose provider has no loaded adapter — refuses to
+        // persist a default the daemon can't actually use.
+        const provider = providerForModel(model);
+        if (router && !router.hasAdapter(provider)) {
+          const keyName = provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
+          throw new Error(
+            `model "${model}" requires the ${provider} adapter — set ${keyName} via \`olle secret set ${keyName}\``,
+          );
+        }
+      },
+    },
   });
   await ipc.listen();
 
@@ -251,13 +285,52 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     // Idempotent: a `secret.set` event that races with another bringup
     // attempt sees chat already running and short-circuits cleanly.
     if (chat) return { brought: true };
+    // Build whichever provider adapters have keys on disk; the router
+    // refuses to start if the currently selected model's provider is
+    // missing. Either-or, not both-required — a host with only an OpenAI
+    // key (or only an Anthropic key) is a valid v1 install.
     const anthropicKey = readSecret(paths.secretsDir, "ANTHROPIC_API_KEY");
-    if (!anthropicKey) {
+    const openaiKey = readSecret(paths.secretsDir, "OPENAI_API_KEY");
+    const adapters: RouterAdapters = {};
+    if (anthropicKey) adapters.anthropic = createAnthropicAdapter({ apiKey: anthropicKey });
+    if (openaiKey) adapters.openai = createOpenAIAdapter({ apiKey: openaiKey });
+    if (!adapters.anthropic && !adapters.openai) {
       return {
         brought: false,
         reason:
-          "No ANTHROPIC_API_KEY secret stored. Set it with: `olle secret set ANTHROPIC_API_KEY` (paste value or pipe on stdin) — chat will come alive automatically.",
+          "No LLM API key stored. Set ANTHROPIC_API_KEY (for claude-*) or OPENAI_API_KEY (for gpt-*/o*) via `olle secret set <NAME>` — chat will come alive automatically.",
       };
+    }
+    const desiredModel = readDefaultModel(paths.defaultModelFile);
+    // Fall back to whichever provider IS loaded if the desired model's
+    // provider has no key on disk. "Constraints feel like physics" — a
+    // host with one key shouldn't refuse to boot just because the
+    // persisted default points at a different provider. The user keeps
+    // their stated preference; we just temporarily use a runnable model
+    // until the missing key arrives.
+    let bootModel = desiredModel;
+    try {
+      const desiredProvider = providerForModel(desiredModel);
+      if (!adapters[desiredProvider]) {
+        const fallbackProvider = adapters.anthropic ? "anthropic" : "openai";
+        bootModel = fallbackForProvider(fallbackProvider);
+        if (!opts.quiet) {
+          console.log(
+            `olle: ${desiredModel} requires ${desiredProvider} key (missing) — booting on ${bootModel} until it arrives`,
+          );
+        }
+      }
+    } catch {
+      // Unknown prefix in the persisted default. Let the router throw
+      // below with its own diagnostic; we don't try to repair garbage.
+    }
+    let localRouter: RouterLlm;
+    try {
+      localRouter = createRouterLlm({ adapters, defaultModel: bootModel });
+    } catch (err) {
+      // Even the fallback failed (e.g. persisted default has an unknown
+      // prefix). Surface the router's diagnostic.
+      return { brought: false, reason: (err as Error).message };
     }
     const rootLoopAgentId = rootAgentId;
     // Construction is split into two phases:
@@ -271,7 +344,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     let localChat: AgentLoop | undefined;
     let localHealth: ChatHealthMonitor | undefined;
     try {
-      const llm = createAnthropicAdapter({ apiKey: anthropicKey });
+      const llm = localRouter;
       // Spilled tool-output store. Owned by the daemon so chat-loop
       // truncation and the read_tool_result recovery tool share one row
       // surface — same physics on write and read.
@@ -442,6 +515,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     chatAgentId = rootLoopAgentId;
     chatHealth = localHealth;
     managerHolder.ref = localManager;
+    router = localRouter;
     return { brought: true };
   };
 
@@ -498,26 +572,84 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     installBouncer();
   }
 
-  // Hot-reload: when the principal stores the API key after install, wake
-  // chat without forcing a daemon restart. We deliberately do NOT swap
-  // adapters when chat is already up — the running LLM client captured
-  // the prior key and rotation requires a fresh adapter graph; that's a
-  // restart concern, not a hot-reload one. (Hence `olle daemon restart`.)
+  // Hot-reload: when the principal stores an LLM API key after install,
+  // wake chat (if down) or hot-add the provider's adapter to the router
+  // (if up) without forcing a daemon restart. Constraints feel like
+  // physics — adding the resource adds the capability.
+  //
+  // Key rotation on the SAME provider with chat already up is still a
+  // restart concern: the running adapter captured the prior key and we
+  // don't swap it out under the agent's feet. `olle daemon restart`.
   bus.subscribe<{ name?: string }>("secret.set", (ev) => {
     const name = ev.payload?.name;
-    if (name !== "ANTHROPIC_API_KEY") return;
+    if (name !== "ANTHROPIC_API_KEY" && name !== "OPENAI_API_KEY") return;
+    if (chat && router) {
+      // Chat is up — hot-add the adapter if it wasn't already loaded.
+      // (Same-provider re-set is the rotation case noted above; we don't
+      // overwrite the running adapter.)
+      const provider = name === "ANTHROPIC_API_KEY" ? "anthropic" : "openai";
+      if (!router.hasAdapter(provider)) {
+        const key = readSecret(paths.secretsDir, name);
+        if (key) {
+          const adapter =
+            provider === "anthropic"
+              ? createAnthropicAdapter({ apiKey: key })
+              : createOpenAIAdapter({ apiKey: key });
+          router.setAdapter(provider, adapter);
+          if (!opts.quiet) console.log(`olle: ${name} received — ${provider} adapter loaded`);
+          // Reapply the persisted preference if it pointed at this
+          // provider and was overridden by the boot fallback. The
+          // user's stated default takes precedence once it becomes
+          // runnable.
+          const desired = readDefaultModel(paths.defaultModelFile);
+          if (desired !== router.defaultModel) {
+            try {
+              const desiredProvider = providerForModel(desired);
+              if (desiredProvider === provider) {
+                router.setDefaultModel(desired);
+                if (!opts.quiet) console.log(`olle: restored persisted default model → ${desired}`);
+              }
+            } catch {
+              // Persisted default has an unknown prefix — leave the
+              // router on the fallback model; the user can `olle model
+              // <name>` to fix it.
+            }
+          }
+        }
+      }
+      return;
+    }
     if (chat) return;
     const r = tryBringChatAgentUp();
     if (r.brought) {
       chatDisabledReason = undefined;
       removeBouncer();
       if (!opts.quiet) {
-        console.log("olle: ANTHROPIC_API_KEY received — chat agent live");
+        console.log(`olle: ${name} received — chat agent live`);
       }
     } else if (r.reason) {
       // Only update on real failures — the idempotent early-return
       // (chat already up) goes through the `r.brought` branch above.
       chatDisabledReason = r.reason;
+    }
+  });
+
+  // Live model swap. The IPC `model.set` handler persists to the
+  // default-model file and publishes this event; we mutate the router
+  // here so the next chat turn picks up the new model. If chat is down,
+  // the next bringup reads the file and uses the new model.
+  bus.subscribe<{ model?: string }>("model.set", (ev) => {
+    const model = ev.payload?.model;
+    if (typeof model !== "string" || model.length === 0) return;
+    if (!router) return;
+    try {
+      router.setDefaultModel(model);
+      if (!opts.quiet) console.log(`olle: default model → ${model}`);
+    } catch (err) {
+      // Provider missing for this model. The IPC handler already
+      // surfaced the error to the caller; log it so the daemon trail
+      // has the same diagnostic.
+      if (!opts.quiet) console.error(`olle: model.set rejected — ${(err as Error).message}`);
     }
   });
 

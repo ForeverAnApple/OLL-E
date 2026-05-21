@@ -70,6 +70,7 @@ describe("meta tools", () => {
         socketFile: join(root, "run", "olle.sock"),
         pidFile: join(root, "run", "olle.pid"),
         secretsDir: join(root, "secrets"),
+        defaultModelFile: join(root, "default_model"),
         threadsDir: join(root, "threads"),
       };
       const tools = buildMetaTools({

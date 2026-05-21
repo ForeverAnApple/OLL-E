@@ -84,11 +84,31 @@ export async function runCli(args: string[]): Promise<void> {
     case "teams":
       await cmdTeam(rest);
       return;
+    case "model":
+      await cmdModel(rest);
+      return;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
       process.exit(2);
   }
+}
+
+async function cmdModel(args: string[]): Promise<void> {
+  // `olle model` → print the current default.
+  // `olle model <name>` → set the default; daemon swaps live if up.
+  const paths = resolvePaths();
+  await withIpc(paths.socketFile, async (client) => {
+    if (args.length === 0) {
+      const r = await client.call<{ model: string }>("model.get");
+      console.log(r.model || "(unset)");
+      return;
+    }
+    const model = args.join(" ").trim();
+    if (!model) throw new Error("usage: olle model [<model>]");
+    const r = await client.call<{ model: string }>("model.set", { model });
+    console.log(`default model → ${r.model}`);
+  });
 }
 
 async function cmdRun(): Promise<void> {
@@ -811,6 +831,7 @@ async function cmdChat(): Promise<void> {
     { name: "/clear", description: "clear scrollback and start a fresh thread" },
     { name: "/new", description: "alias of /clear — fresh thread, fresh scrollback" },
     { name: "/cancel", description: "cancel the current agent turn" },
+    { name: "/model", description: "show or set the default LLM model (/model claude-opus-4-7)" },
     { name: "/exit", description: "exit chat" },
     { name: "/quit", description: "exit chat" },
   ];
@@ -916,7 +937,11 @@ async function cmdChat(): Promise<void> {
       editor.refresh();
       return;
     }
-    const slash = slashCommands.find((c) => c.name === text);
+    // Slash commands match on the FIRST whitespace-separated token so
+    // `/model gpt-5.5` resolves to `/model` with `gpt-5.5` as the arg.
+    const firstToken = text.split(/\s+/, 1)[0]!;
+    const slashArg = text.slice(firstToken.length).trim();
+    const slash = slashCommands.find((c) => c.name === firstToken);
     if (slash) {
       ui.commitUserInput(text);
       if (slash.name === "/exit" || slash.name === "/quit") {
@@ -924,6 +949,19 @@ async function cmdChat(): Promise<void> {
         return;
       }
       if (slash.name === "/help") ui.printSlashHelp(slashCommands);
+      else if (slash.name === "/model") {
+        try {
+          if (slashArg) {
+            const r = await current.call<{ model: string }>("model.set", { model: slashArg });
+            ui.note(`default model → ${r.model}`);
+          } else {
+            const r = await current.call<{ model: string }>("model.get");
+            ui.note(`current model: ${r.model || "(unset)"}`);
+          }
+        } catch (err) {
+          ui.note(`model: ${(err as Error).message}`);
+        }
+      }
       else if (slash.name === "/clear" || slash.name === "/new") {
         // Cancel any in-flight turn first — the user is wiping
         // context, no reason to leave a doomed turn running on the
@@ -1075,7 +1113,6 @@ async function cmdChat(): Promise<void> {
           ui.retry({
             attempt: numFrom(p.attempt),
             status: typeof p.status === "number" ? p.status : undefined,
-            waitMs: numFrom(p.waitMs),
             message: typeof p.message === "string" ? p.message : undefined,
           });
         } else if (ev.type === "chat.turn-end") {
@@ -1859,10 +1896,9 @@ export function createChatUI(opts: ChatUIOpts) {
       });
     },
 
-    retry(info: { attempt: number; status?: number; waitMs: number; message?: string }): void {
+    retry(info: { attempt: number; status?: number; message?: string }): void {
       inFrame(() => {
         flushAssistant();
-        const waitS = (info.waitMs / 1000).toFixed(1);
         const statusStr = info.status ? ` HTTP ${info.status}` : "";
         const reason =
           info.status === 529 || info.status === 503
@@ -1870,7 +1906,7 @@ export function createChatUI(opts: ChatUIOpts) {
             : info.status === 429
               ? "rate limited"
               : "API hiccup";
-        const line = `  ⟳ ${reason}${statusStr} — retrying in ${waitS}s (attempt ${info.attempt + 1})`;
+        const line = `  ⟳ ${reason}${statusStr} — retrying (attempt ${info.attempt + 1})`;
         out.write(color(ANSI.warning, line) + "\n");
       });
     },
@@ -2731,6 +2767,7 @@ function printHelp(): void {
       "  secret list                 list secret names (values never shown)",
       "  secret set <NAME> [value]   store a secret (or pipe on stdin)",
       "  secret remove <NAME>        remove a stored secret",
+      "  model [<name>]              show or set the default LLM model (claude-opus-4-7, gpt-5.5, …)",
       "",
       "  Teams — cell-to-cell federation (paired with team_* tools):",
       "  team status                                   list teams, members, and connected peers",

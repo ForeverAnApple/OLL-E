@@ -33,6 +33,7 @@ import {
   usageStats,
 } from "../observability/index.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
+import { readDefaultModel, writeDefaultModel } from "../daemon/model-preference.ts";
 
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
@@ -74,6 +75,19 @@ export interface IpcServerOptions {
   /** True when the mesh bridge is alive. `team.*` mutating calls return
    *  a clean error when false rather than a confusing tool failure. */
   meshEnabled?: boolean;
+  /** Live default-model handle. `model.get` reads the router's current
+   *  model; `model.set` persists to disk + publishes a `model.set` event
+   *  the router subscribes to. Absent when chat has never been brought
+   *  up (router not constructed) — `model.set` still persists, so the
+   *  next bringup picks it up. */
+  modelControl?: {
+    /** Returns the current model name. Reads from the router when alive,
+     *  otherwise falls back to the persisted file. */
+    current(): string;
+    /** Validate that `model` has a buildable provider before persisting.
+     *  Throws when the model maps to a provider with no loaded adapter. */
+    validate(model: string): void;
+  };
 }
 
 export interface IpcServer {
@@ -405,6 +419,56 @@ async function dispatch(
           payload: { name, bytes },
         });
         send({ id: req.id, ok: true, value: { name, bytes } });
+        return;
+      }
+      case "model.get": {
+        // Router is the source of truth when chat is up — that's what the
+        // next turn will actually use. Fall back to the persisted file
+        // when chat hasn't been brought up yet (router not constructed).
+        const current = opts.modelControl
+          ? opts.modelControl.current()
+          : opts.paths
+            ? readDefaultModel(opts.paths.defaultModelFile)
+            : "";
+        send({ id: req.id, ok: true, value: { model: current } });
+        return;
+      }
+      case "model.set": {
+        if (!opts.paths) {
+          send({ id: req.id, ok: false, error: { message: "paths unavailable" } });
+          return;
+        }
+        const model = req.params?.model as string | undefined;
+        if (typeof model !== "string" || model.length === 0) {
+          send({ id: req.id, ok: false, error: { message: "model required" } });
+          return;
+        }
+        // Validate before persisting so a bad model name doesn't get
+        // written to disk and re-applied on the next boot. When chat is
+        // up the router refuses unknown providers / missing keys; when
+        // chat is down we still catch unknown-provider names via the
+        // providerForModel check inside the router import.
+        if (opts.modelControl) {
+          try {
+            opts.modelControl.validate(model);
+          } catch (err) {
+            send({
+              id: req.id,
+              ok: false,
+              error: { message: (err as Error).message },
+            });
+            return;
+          }
+        }
+        writeDefaultModel(opts.paths.defaultModelFile, model);
+        opts.bus.publish({
+          type: "model.set",
+          hostId: opts.bus.hostId,
+          actorId: opts.humanAgentId ?? opts.bus.hostId,
+          durable: true,
+          payload: { model },
+        });
+        send({ id: req.id, ok: true, value: { model } });
         return;
       }
       case "secrets.remove": {
