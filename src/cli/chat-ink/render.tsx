@@ -31,7 +31,7 @@ export async function runInkChat(): Promise<void> {
   ]);
   if (!chatStatus.enabled) {
     client.close();
-    console.error(`olle chat-ink: chat agent is disabled\n  ${chatStatus.reason ?? "chat loop not running"}`);
+    console.error(`olle chat: chat agent is disabled\n  ${chatStatus.reason ?? "chat loop not running"}`);
     process.exit(1);
   }
   const self = await client
