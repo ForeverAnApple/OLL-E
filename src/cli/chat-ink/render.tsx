@@ -1,21 +1,34 @@
-// Entry for the Ink-based chat REPL. Owns IPC bringup, fetches the
-// daemon-side metadata cmdChat used to fetch, then mounts <ChatApp>.
+// Entry for the Ink-based chat REPL. Owns initial IPC bringup +
+// metadata fetch, then hands ownership of the connection lifecycle to
+// <ChatApp> (which reconnects on its own).
 
 import { render } from "ink";
 import { resolvePaths } from "../../paths.ts";
 import { connectOrExit } from "../ipc-helper.ts";
 import { ChatApp } from "./app.tsx";
-import { mintId } from "./ids.ts";
+import { mintThreadId } from "./ids.ts";
 import type { AgentSelf } from "../../observability/index.ts";
 
 export async function runInkChat(): Promise<void> {
   const paths = resolvePaths();
   const client = await connectOrExit(paths.socketFile);
 
-  const { rootAgentId } = await client.call<{ rootAgentId: string }>("status.rootAgent");
-  const chatStatus = await client
-    .call<{ enabled: boolean; reason: string | null }>("status.chat")
-    .catch(() => ({ enabled: true, reason: null as string | null }));
+  // rootAgentId blocks observability.self below; everything else is
+  // independent so fire them in parallel.
+  const [{ rootAgentId }, chatStatus, inboxOpen, initialModel] = await Promise.all([
+    client.call<{ rootAgentId: string }>("status.rootAgent"),
+    client
+      .call<{ enabled: boolean; reason: string | null }>("status.chat")
+      .catch(() => ({ enabled: true, reason: null as string | null })),
+    client
+      .call<{ open: number }>("inbox.count")
+      .then((r) => r.open)
+      .catch(() => 0),
+    client
+      .call<{ model: string }>("model.get")
+      .then((r) => r.model)
+      .catch(() => ""),
+  ]);
   if (!chatStatus.enabled) {
     client.close();
     console.error(`olle chat-ink: chat agent is disabled\n  ${chatStatus.reason ?? "chat loop not running"}`);
@@ -26,19 +39,12 @@ export async function runInkChat(): Promise<void> {
     .catch(() => null);
   const agentName =
     self?.displayName?.trim() || self?.name?.trim() || "agent";
-  const inboxOpen = await client
-    .call<{ open: number }>("inbox.count")
-    .then((r) => r.open)
-    .catch(() => 0);
-  const initialModel = await client
-    .call<{ model: string }>("model.get")
-    .then((r) => r.model)
-    .catch(() => "");
-  const initialThreadId = mintId("cli:");
+  const initialThreadId = mintThreadId();
 
   const app = render(
     <ChatApp
       client={client}
+      socketFile={paths.socketFile}
       agentId={rootAgentId}
       agentName={agentName}
       initialThreadId={initialThreadId}
@@ -49,5 +55,8 @@ export async function runInkChat(): Promise<void> {
   );
 
   await app.waitUntilExit();
-  try { client.close(); } catch { /* already closed */ }
+  // ChatApp owns the connection lifecycle (it may have rebuilt the
+  // client across reconnects). Closing the prop-supplied one here would
+  // be a no-op on the current connection — leave it to the app's
+  // teardown path.
 }

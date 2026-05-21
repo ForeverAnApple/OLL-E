@@ -1,21 +1,45 @@
 // Ink chat REPL. Subscribes to the daemon's tail stream, renders
 // committed scrollback through <Static> (cheap rerender), and keeps a
 // live region below for the in-progress assistant response. Ink owns
-// the redraw loop — streaming deltas just bump state and the terminal
+// the redraw loop — streaming deltas bump state and the terminal
 // repaints, no manual cursor management.
+//
+// Connection lifecycle is owned here: the prop-supplied client is the
+// initial connection; on socket drop we reconnect to `socketFile` with
+// exponential backoff and resubscribe on the same threadId. Chat
+// survives daemon restarts without losing scrollback.
 
 import { Box, Static, Text, useApp, useInput } from "ink";
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import type * as React from "react";
 import type { IpcClient } from "../../ipc/client.ts";
+import { connectIpc } from "../../ipc/client.ts";
 import type { Event } from "../../bus/types.ts";
-import { MessageRow, type ScrollbackEntry } from "./message.tsx";
+import { MessageRow, TrayList, type ScrollbackEntry } from "./message.tsx";
 import { InputFrame, StatusLine, type BarState } from "./input-bar.tsx";
 import { StatusFooter } from "./status-footer.tsx";
-import { mintId } from "./ids.ts";
+import { mintEntryId, mintThreadId, mintToolId } from "./ids.ts";
+import {
+  SLASH_COMMANDS,
+  exactCommand,
+  inlineSuggestions,
+} from "./commands.ts";
+import {
+  clipString,
+  fmtAge,
+  statusGlyph,
+  type InboxRow,
+} from "./format.ts";
+
+/** Soft cap on the in-flight tray. Realistic exposure is low (you'd
+ *  have to type past this many messages mid-turn), but capping avoids
+ *  unbounded growth + slow re-renders if `chat.input-folded` never
+ *  fires (daemon hang, partition). FIFO drop. */
+const TRAY_MAX = 50;
 
 export interface ChatAppProps {
   client: IpcClient;
+  socketFile: string;
   agentId: string;
   agentName: string;
   initialThreadId: string;
@@ -25,10 +49,13 @@ export interface ChatAppProps {
 
 type Action =
   | { type: "user-submit"; text: string }
+  | { type: "enqueue-tray"; text: string }
+  | { type: "drain-tray"; count: number }
+  | { type: "discard-tray-last" }
   | { type: "delta"; text: string }
   | { type: "assistant-text"; text: string }
   | { type: "tool-call"; name: string; input: unknown }
-  | { type: "tool-result"; toolId: string; content: string; isError: boolean }
+  | { type: "tool-result"; content: string; isError: boolean }
   | { type: "note"; text: string }
   | { type: "error"; text: string }
   | { type: "retry"; attempt: number; status?: number; message?: string }
@@ -36,21 +63,25 @@ type Action =
   | { type: "cancelled" }
   | { type: "thread-rotated"; threadId: string }
   | { type: "model-changed"; model: string }
-  | { type: "turn-busy"; busy: boolean };
+  | { type: "turn-busy"; busy: boolean }
+  | { type: "inbox-count"; open: number };
 
 interface ChatState {
   scrollback: ScrollbackEntry[];
   streaming: string;
-  renderedToolResults: Set<string>;
   turnBusy: boolean;
   threadId: string;
   model: string;
-  /** Cumulative spend on this thread since the REPL started (or last /clear). */
+  inboxOpen: number;
+  /** Mid-turn submits pinned above the input until the daemon emits
+   *  `chat.input-folded` — at that point they drain FIFO into
+   *  scrollback at the natural conversational slot. */
+  tray: string[];
+  /** Cumulative spend on this thread since REPL start (or last /clear). */
   totalUsdMicros: number;
   /** Cumulative billed tokens — in + out + cache_read + cache_write.
-   *  Single number on purpose: separate in/out + cache breakdowns were
-   *  the source of the earlier "weird counter" feedback. One number,
-   *  total throughput. */
+   *  Single number on purpose: separate breakdowns mislead more than
+   *  they inform; the per-turn line still shows the breakdown. */
   totalBilledTokens: number;
 }
 
@@ -59,38 +90,53 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "user-submit":
       return {
         ...state,
-        scrollback: [...state.scrollback, { kind: "user", id: mintId("e:"), text: action.text }],
+        scrollback: [...state.scrollback, { kind: "user", id: mintEntryId(), text: action.text }],
       };
+    case "enqueue-tray": {
+      const tray = [...state.tray, action.text];
+      // FIFO-drop the oldest if we've blown the cap.
+      return { ...state, tray: tray.length > TRAY_MAX ? tray.slice(-TRAY_MAX) : tray };
+    }
+    case "drain-tray": {
+      const n = Math.min(Math.max(0, action.count), state.tray.length);
+      if (n === 0) return state;
+      const drained = state.tray.slice(0, n);
+      const newEntries: ScrollbackEntry[] = drained.map((text) => ({
+        kind: "user", id: mintEntryId(), text,
+      }));
+      return { ...state, tray: state.tray.slice(n), scrollback: [...state.scrollback, ...newEntries] };
+    }
+    case "discard-tray-last":
+      // Publish failed mid-tray: drop the orphan we just enqueued so it
+      // doesn't sit pinned forever pretending to be queued for the agent.
+      return state.tray.length === 0 ? state : { ...state, tray: state.tray.slice(0, -1) };
     case "delta":
       return { ...state, streaming: state.streaming + action.text };
     case "assistant-text": {
       const text = action.text || state.streaming;
       const next: ScrollbackEntry[] = text.length > 0
-        ? [...state.scrollback, { kind: "assistant", id: mintId("e:"), text }]
+        ? [...state.scrollback, { kind: "assistant", id: mintEntryId(), text }]
         : state.scrollback;
       return { ...state, scrollback: next, streaming: "" };
     }
     case "tool-call":
       return {
         ...state,
-        scrollback: [...state.scrollback, { kind: "tool-call", id: mintId("e:"), name: action.name, input: action.input }],
+        scrollback: [...state.scrollback, { kind: "tool-call", id: mintEntryId(), name: action.name, input: action.input }],
       };
-    case "tool-result": {
-      if (state.renderedToolResults.has(action.toolId)) return state;
-      const ids = new Set(state.renderedToolResults);
-      ids.add(action.toolId);
+    case "tool-result":
+      // Dedup happens before dispatch (see dispatchTailEvent), so this
+      // arm always inserts.
       return {
         ...state,
-        renderedToolResults: ids,
-        scrollback: [...state.scrollback, { kind: "tool-result", id: mintId("e:"), content: action.content, isError: action.isError }],
+        scrollback: [...state.scrollback, { kind: "tool-result", id: mintEntryId(), content: action.content, isError: action.isError }],
       };
-    }
     case "note":
-      return { ...state, scrollback: [...state.scrollback, { kind: "note", id: mintId("e:"), text: action.text }] };
+      return { ...state, scrollback: [...state.scrollback, { kind: "note", id: mintEntryId(), text: action.text }] };
     case "error":
       return {
         ...state,
-        scrollback: [...state.scrollback, { kind: "error", id: mintId("e:"), text: action.text }],
+        scrollback: [...state.scrollback, { kind: "error", id: mintEntryId(), text: action.text }],
         streaming: "",
         turnBusy: false,
       };
@@ -99,19 +145,18 @@ function reducer(state: ChatState, action: Action): ChatState {
         ...state,
         scrollback: [...state.scrollback, {
           kind: "retry",
-          id: mintId("e:"),
+          id: mintEntryId(),
           attempt: action.attempt,
           ...(action.status !== undefined && { status: action.status }),
           ...(action.message !== undefined && { message: action.message }),
         }],
       };
     case "turn-end": {
-      // We stamp the entry with the **cumulative** USD at the close of
-      // this turn (not the per-turn delta). This makes each turn line
-      // read as a checkpoint — "after turn N, you've spent $X total" —
-      // which is the question the user actually asks. Per-turn cost is
-      // still derivable as the delta from the previous turn entry, but
-      // we don't render it: KISS, one cost per line.
+      // Stamp the entry with the **cumulative** USD at the close of
+      // this turn (not the per-turn delta). Each turn line reads as a
+      // checkpoint — "after turn N, you've spent $X total" — which is
+      // the question the user actually asks. Per-turn cost is still
+      // derivable as the delta from the previous turn entry.
       const cumulative = state.totalUsdMicros + action.usdMicros;
       const turnBilled =
         action.inputTokens + action.outputTokens + action.cacheReadTokens + action.cacheCreationTokens;
@@ -119,7 +164,7 @@ function reducer(state: ChatState, action: Action): ChatState {
         ...state,
         scrollback: [...state.scrollback, {
           kind: "turn-end",
-          id: mintId("e:"),
+          id: mintEntryId(),
           model: action.model,
           inputTokens: action.inputTokens,
           outputTokens: action.outputTokens,
@@ -130,7 +175,6 @@ function reducer(state: ChatState, action: Action): ChatState {
         }],
         streaming: "",
         turnBusy: false,
-        renderedToolResults: new Set(),
         totalUsdMicros: cumulative,
         totalBilledTokens: state.totalBilledTokens + turnBilled,
       };
@@ -138,10 +182,9 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "cancelled":
       return {
         ...state,
-        scrollback: [...state.scrollback, { kind: "note", id: mintId("e:"), text: "(cancelled)" }],
+        scrollback: [...state.scrollback, { kind: "note", id: mintEntryId(), text: "(cancelled)" }],
         streaming: "",
         turnBusy: false,
-        renderedToolResults: new Set(),
       };
     case "thread-rotated":
       return {
@@ -150,7 +193,7 @@ function reducer(state: ChatState, action: Action): ChatState {
         scrollback: [],
         streaming: "",
         turnBusy: false,
-        renderedToolResults: new Set(),
+        tray: [],
         totalUsdMicros: 0,
         totalBilledTokens: 0,
       };
@@ -158,103 +201,280 @@ function reducer(state: ChatState, action: Action): ChatState {
       return { ...state, model: action.model };
     case "turn-busy":
       return { ...state, turnBusy: action.busy };
+    case "inbox-count":
+      // No-op guard — every /inbox call dispatches here; without the
+      // guard the whole tree re-renders even when the count didn't move.
+      return action.open === state.inboxOpen ? state : { ...state, inboxOpen: action.open };
   }
 }
 
-export function ChatApp({ client, agentId, agentName, initialThreadId, initialModel, inboxOpen }: ChatAppProps): React.ReactElement {
+export function ChatApp({ client: initialClient, socketFile, agentId, agentName, initialThreadId, initialModel, inboxOpen }: ChatAppProps): React.ReactElement {
   const { exit } = useApp();
   const [state, dispatch] = useReducer(reducer, {
     scrollback: [],
     streaming: "",
-    renderedToolResults: new Set<string>(),
     turnBusy: false,
     threadId: initialThreadId,
     model: initialModel,
+    inboxOpen,
+    tray: [],
     totalUsdMicros: 0,
     totalBilledTokens: 0,
   });
-  // Force-remount the uncontrolled <TextInput> when /clear rotates the
-  // thread so its buffer wipes alongside the scrollback.
+  // Tool-result dedup: both chat.tool-result-live (UX) and chat.tool-result
+  // (canonical/durable) carry the same tool_use id. Render whichever lands
+  // first; suppress the other. Bounded by clear-on-turn-end since tool ids
+  // are unique within a turn. Lives as a ref — never read by render.
+  const toolDedupRef = useRef<Set<string>>(new Set());
+  // <TextInput> is uncontrolled — force-remount on submit/clear to wipe
+  // its internal buffer.
   const [inputKey, setInputKey] = useState(0);
   const [quitArmed, setQuitArmed] = useState(false);
+  // Mirror of the input buffer so the slash-completion pane sitting
+  // *outside* the TextInput can react. The keystroke-rate re-render
+  // is acceptable: it only re-runs <StatusLine> + <InputFrame> +
+  // <StatusFooter>; <Static> doesn't replay committed scrollback.
+  const [inputText, setInputText] = useState("");
+  const clientRef = useRef<IpcClient>(initialClient);
+  const threadIdRef = useRef(state.threadId);
+  const quitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => { threadIdRef.current = state.threadId; }, [state.threadId]);
 
+  // Single long-lived loop: subscribe → drain events → on close, try to
+  // reconnect (exponential backoff) → resubscribe. The AbortController
+  // both signals shutdown (teardown / unmount) AND unblocks the in-
+  // flight backoff sleep so the process exits promptly.
   useEffect(() => {
-    const sub = client.stream("tail", { type: "*" });
-    let aborted = false;
-    (async () => {
-      try {
-        for await (const ev of sub.events) {
-          if (aborted) break;
-          if (ev.threadId !== state.threadId) continue;
-          dispatchTailEvent(ev, dispatch);
+    const abortCtrl = new AbortController();
+    const { signal } = abortCtrl;
+    let activeSub: { cancel: () => Promise<void> } | null = null;
+
+    async function reconnect(): Promise<IpcClient | null> {
+      dispatch({ type: "note", text: "⟳ daemon disconnected — reconnecting…" });
+      let backoff = 250;
+      let attempt = 1;
+      while (!signal.aborted) {
+        try {
+          const c = await connectIpc(socketFile);
+          dispatch({ type: "note", text: "⟳ reconnected" });
+          return c;
+        } catch {
+          // Only surface the first failure — subsequent retries during a
+          // long outage stay silent so scrollback doesn't fill with
+          // identical "⟳ retry in Xs" notes.
+          if (attempt === 1) {
+            dispatch({ type: "note", text: `⟳ retry in ${(backoff / 1000).toFixed(1)}s…` });
+          }
+          await abortableSleep(backoff, signal);
+          backoff = Math.min(backoff * 2, 30_000);
+          attempt++;
         }
-      } catch {
-        /* ipc closed — caller handles */
+      }
+      return null;
+    }
+
+    (async () => {
+      while (!signal.aborted) {
+        let sub: { events: AsyncIterable<Event>; cancel(): Promise<void> };
+        try {
+          sub = clientRef.current.stream("tail", { type: "*" });
+        } catch {
+          // stream() throws when the socket is already closed; skip
+          // the iterator and reconnect.
+          const next = await reconnect();
+          if (!next) break;
+          clientRef.current = next;
+          continue;
+        }
+        activeSub = sub;
+        try {
+          for await (const ev of sub.events) {
+            if (signal.aborted) break;
+            if (ev.threadId !== threadIdRef.current) continue;
+            dispatchTailEvent(ev, dispatch, toolDedupRef.current);
+          }
+        } catch {
+          // ipc closed mid-stream — fall through to reconnect.
+        }
+        if (signal.aborted) break;
+        // Disconnect mid-turn never delivers chat.turn-end. Clear the
+        // busy flag so the prompt re-fires after we resubscribe.
+        dispatch({ type: "turn-busy", busy: false });
+        const next = await reconnect();
+        if (!next) break;
+        clientRef.current = next;
       }
     })();
+
     return () => {
-      aborted = true;
-      void sub.cancel().catch(() => {});
+      abortCtrl.abort();
+      if (activeSub) void activeSub.cancel().catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.threadId]);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (quitTimerRef.current) clearTimeout(quitTimerRef.current);
+    };
+  }, []);
 
   useInput((input, key) => {
-    // Ctrl-D = EOF / exit immediately. No confirm — that's the
-    // shell convention every terminal user knows.
     if (key.ctrl && input === "d") {
-      client.close();
-      exit();
+      teardown();
       return;
     }
     if (key.ctrl && input === "c") {
       if (state.turnBusy) {
-        void client.call("chat.cancel", { threadId: state.threadId }).catch(() => {});
+        void clientRef.current.call("chat.cancel", { threadId: state.threadId }).catch(() => {});
         return;
       }
       if (quitArmed) {
-        client.close();
-        exit();
+        teardown();
         return;
       }
-      // Guard: a held-down Ctrl-C would otherwise stack a fresh
-      // 2s-disarm timeout on every keypress.
-      if (quitArmed) return;
       setQuitArmed(true);
-      setTimeout(() => setQuitArmed(false), 2000);
+      // Replace any prior arm-timer — a held-down Ctrl-C should not
+      // stack disarm timers.
+      if (quitTimerRef.current) clearTimeout(quitTimerRef.current);
+      quitTimerRef.current = setTimeout(() => {
+        quitTimerRef.current = null;
+        setQuitArmed(false);
+      }, 2000);
     }
   });
+
+  function teardown(): void {
+    try { clientRef.current.close(); } catch { /* already gone */ }
+    exit();
+  }
+
+  async function handleSlashLocal(text: string): Promise<boolean> {
+    const cmd = exactCommand(text);
+    if (!cmd) {
+      const firstToken = text.split(/\s+/, 1)[0]!;
+      dispatch({ type: "note", text: `unknown command: ${firstToken}` });
+      return true;
+    }
+    const arg = text.slice(cmd.name.length).trim();
+    const client = clientRef.current;
+    switch (cmd.name) {
+      case "/exit":
+      case "/quit":
+        teardown();
+        return true;
+      case "/help":
+        dispatch({ type: "note", text: formatHelp() });
+        return true;
+      case "/clear":
+      case "/new":
+        // Cancel any in-flight turn first — wiping context shouldn't
+        // leave a doomed turn running on the daemon. chat.* events on
+        // the old threadId are dropped by the tail filter post-rotate.
+        if (state.turnBusy) {
+          await client.call("chat.cancel", { threadId: state.threadId }).catch(() => {});
+        }
+        toolDedupRef.current.clear();
+        dispatch({ type: "thread-rotated", threadId: mintThreadId() });
+        return true;
+      case "/cancel":
+        if (!state.turnBusy) {
+          dispatch({ type: "note", text: "no agent turn in progress" });
+          return true;
+        }
+        await client.call("chat.cancel", { threadId: state.threadId }).catch(() => {});
+        return true;
+      case "/model":
+        await runModel(arg, client);
+        return true;
+      case "/inbox":
+        await runInbox(arg, client);
+        return true;
+    }
+    return true;
+  }
+
+  async function runModel(arg: string, client: IpcClient): Promise<void> {
+    if (arg) {
+      try {
+        const r = await client.call<{ model: string }>("model.set", { model: arg });
+        dispatch({ type: "model-changed", model: r.model });
+        dispatch({ type: "note", text: `default model → ${r.model}` });
+      } catch (e) {
+        dispatch({ type: "error", text: `model set: ${(e as Error).message}` });
+      }
+      return;
+    }
+    try {
+      const r = await client.call<{ model: string }>("model.get");
+      dispatch({ type: "note", text: `current model: ${r.model || "(unset)"}` });
+    } catch (e) {
+      dispatch({ type: "error", text: `model get: ${(e as Error).message}` });
+    }
+  }
+
+  async function runInbox(arg: string, client: IpcClient): Promise<void> {
+    if (arg) {
+      try {
+        const r = await client.call<InboxRow>("inbox.get", { id: arg });
+        dispatch({ type: "note", text: formatInboxOne(r) });
+      } catch (e) {
+        dispatch({ type: "error", text: `inbox: ${(e as Error).message}` });
+      }
+      return;
+    }
+    try {
+      const rows = await client.call<InboxRow[]>("inbox.list");
+      dispatch({ type: "inbox-count", open: rows.filter((r) => r.status === "open").length });
+      if (rows.length === 0) {
+        dispatch({ type: "note", text: "(inbox zero — nothing waiting for you)" });
+        return;
+      }
+      dispatch({ type: "note", text: formatInboxList(rows) });
+    } catch (e) {
+      dispatch({ type: "error", text: `inbox: ${(e as Error).message}` });
+    }
+  }
 
   async function onSubmit(text: string): Promise<void> {
     const trimmed = text.replace(/\s+$/, "");
     if (!trimmed) return;
-    // @inkjs/ui's <TextInput> reducer has no submit case — the buffer
-    // doesn't clear on its own. Force-remount on every submit so the
-    // user can keep typing without staring at the previous message.
+    // @inkjs/ui's <TextInput> reducer has no submit case — bump the
+    // remount key and clear the mirror so the next render is fresh.
     setInputKey((k) => k + 1);
+    setInputText("");
     if (trimmed.startsWith("/")) {
-      const handled = await handleSlash(trimmed, {
-        client,
-        threadId: state.threadId,
-        agentId,
-        dispatch,
-        exit,
-        resetInput: () => setInputKey((k) => k + 1),
-      });
+      const handled = await handleSlashLocal(trimmed);
       if (handled) return;
     }
-    dispatch({ type: "user-submit", text: trimmed });
-    dispatch({ type: "turn-busy", busy: true });
+    // Snapshot the busy state before mutating — `extendTurn` is true
+    // only when the user submitted while the previous turn was still
+    // running, which is what the daemon uses to fold the message into
+    // the in-flight turn instead of queuing fresh.
+    const wasBusy = state.turnBusy;
+    if (wasBusy) {
+      // Park in the tray. Scrollback commit waits for `chat.input-
+      // folded` — at that point the message has graduated from
+      // "queued, unread" to "part of the conversation."
+      dispatch({ type: "enqueue-tray", text: trimmed });
+    } else {
+      dispatch({ type: "user-submit", text: trimmed });
+      dispatch({ type: "turn-busy", busy: true });
+    }
     try {
-      await client.call("publish", {
+      await clientRef.current.call("publish", {
         type: "chat.input",
-        payload: { text: trimmed, extendTurn: state.turnBusy },
+        payload: { text: trimmed, extendTurn: wasBusy },
         actorId: "cli",
         durable: true,
         toAgentId: agentId,
         threadId: state.threadId,
       });
     } catch (e) {
+      // The publish never reached the daemon, so the tray entry we
+      // just parked would otherwise sit pinned forever pretending to
+      // be queued. Drop it before reporting the failure.
+      if (wasBusy) dispatch({ type: "discard-tray-last" });
       dispatch({ type: "error", text: `send failed: ${(e as Error).message}` });
     }
   }
@@ -263,6 +483,7 @@ export function ChatApp({ client, agentId, agentName, initialThreadId, initialMo
   const placeholder = state.turnBusy
     ? "type to fold into the running turn…"
     : "ask anything  (/ for commands, Ctrl-C to quit)";
+  const suggestions = inlineSuggestions(inputText);
 
   return (
     <Box flexDirection="column">
@@ -274,13 +495,21 @@ export function ChatApp({ client, agentId, agentName, initialThreadId, initialMo
           {state.streaming.split("\n").map((line, i) => <Text key={i}>{line}</Text>)}
         </Box>
       )}
+      {state.tray.length > 0 && <TrayList items={state.tray} />}
       <Box marginTop={1} flexDirection="column">
-        <StatusLine state={barState} quitArmed={quitArmed} />
-        <InputFrame state={barState} inputKey={inputKey} placeholder={placeholder} onSubmit={onSubmit} />
+        <StatusLine state={barState} quitArmed={quitArmed} input={inputText} />
+        <InputFrame
+          state={barState}
+          inputKey={inputKey}
+          placeholder={placeholder}
+          suggestions={suggestions}
+          onChange={setInputText}
+          onSubmit={onSubmit}
+        />
         <StatusFooter
           agentName={agentName}
           model={state.model}
-          inboxOpen={inboxOpen}
+          inboxOpen={state.inboxOpen}
           threadId={state.threadId}
           totalBilledTokens={state.totalBilledTokens}
         />
@@ -289,62 +518,53 @@ export function ChatApp({ client, agentId, agentName, initialThreadId, initialMo
   );
 }
 
-interface SlashContext {
-  client: IpcClient;
-  threadId: string;
-  agentId: string;
-  dispatch: React.Dispatch<Action>;
-  exit: () => void;
-  resetInput: () => void;
+/** Sleep that resolves on either timeout or abort. Without the abort
+ *  hook, an unmount during the reconnect backoff would keep the
+ *  process alive for up to 30s while the timer ran down. */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const onAbort = (): void => { clearTimeout(t); resolve(); };
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
-async function handleSlash(text: string, ctx: SlashContext): Promise<boolean> {
-  const firstToken = text.split(/\s+/, 1)[0]!;
-  const arg = text.slice(firstToken.length).trim();
-  const cmd = firstToken.toLowerCase();
-  if (cmd === "/exit" || cmd === "/quit") {
-    ctx.client.close();
-    ctx.exit();
-    return true;
-  }
-  if (cmd === "/help") {
-    ctx.dispatch({ type: "note", text: "/help · /clear · /new · /cancel · /model [name] · /exit" });
-    return true;
-  }
-  if (cmd === "/clear" || cmd === "/new") {
-    const newId = mintId("cli:");
-    ctx.dispatch({ type: "thread-rotated", threadId: newId });
-    ctx.resetInput();
-    return true;
-  }
-  if (cmd === "/cancel") {
-    await ctx.client.call("chat.cancel", { threadId: ctx.threadId }).catch(() => {});
-    return true;
-  }
-  if (cmd === "/model") {
-    if (arg) {
-      try {
-        const r = await ctx.client.call<{ model: string }>("model.set", { model: arg });
-        ctx.dispatch({ type: "model-changed", model: r.model });
-        ctx.dispatch({ type: "note", text: `default model → ${r.model}` });
-      } catch (e) {
-        ctx.dispatch({ type: "error", text: `model set: ${(e as Error).message}` });
-      }
-    } else {
-      try {
-        const r = await ctx.client.call<{ model: string }>("model.get");
-        ctx.dispatch({ type: "note", text: `current model: ${r.model || "(unset)"}` });
-      } catch (e) {
-        ctx.dispatch({ type: "error", text: `model get: ${(e as Error).message}` });
-      }
-    }
-    return true;
-  }
-  ctx.dispatch({ type: "note", text: `unknown command: ${firstToken}` });
-  return true;
+function formatHelp(): string {
+  const nameW = SLASH_COMMANDS.reduce((w, c) => Math.max(w, c.name.length), 0);
+  return SLASH_COMMANDS
+    .map((c) => `  ${c.name.padEnd(nameW)}  ${c.description}`)
+    .join("\n");
 }
 
-function dispatchTailEvent(ev: Event, dispatch: React.Dispatch<Action>): void {
+function formatInboxList(rows: InboxRow[]): string {
+  const now = Date.now();
+  const lines = rows.slice(0, 10).map((r) => {
+    const id = r.id.slice(0, 10);
+    const age = fmtAge(Math.max(0, now - r.createdAt));
+    const unread = (r.unreadReplyCount ?? 0) > 0 ? ` (${r.unreadReplyCount} new)` : "";
+    const from = r.proposingAgentName ?? r.proposingAgentId.slice(0, 8);
+    return `  ${statusGlyph(r.status)} ${id}  ${r.tier.padEnd(11)}  ${age.padStart(4)}  ${from} — ${r.summary}${unread}`;
+  });
+  const more = rows.length > 10 ? `\n  … +${rows.length - 10} more — \`olle inbox list\`` : "";
+  return `inbox (${rows.length}):\n${lines.join("\n")}${more}`;
+}
+
+function formatInboxOne(r: InboxRow): string {
+  const age = fmtAge(Math.max(0, Date.now() - r.createdAt));
+  const from = r.proposingAgentName ?? r.proposingAgentId.slice(0, 8);
+  return [
+    `${statusGlyph(r.status)} ${r.id}  ${r.tier}  ${age} ago  ${from}`,
+    `  ${r.summary}`,
+    r.payload ? `  payload: ${clipString(JSON.stringify(r.payload), 280)}` : "",
+    `  respond: olle inbox respond ${r.id} approve|deny|modify`,
+  ].filter(Boolean).join("\n");
+}
+
+function dispatchTailEvent(ev: Event, dispatch: React.Dispatch<Action>, toolDedup: Set<string>): void {
   const p = (ev.payload ?? {}) as Record<string, unknown>;
   const numFrom = (v: unknown): number => (typeof v === "number" ? v : 0);
   switch (ev.type) {
@@ -358,14 +578,22 @@ function dispatchTailEvent(ev: Event, dispatch: React.Dispatch<Action>): void {
       dispatch({ type: "tool-call", name: String(p.name ?? "?"), input: p.input });
       return;
     case "chat.tool-result-live":
-    case "chat.tool-result":
+    case "chat.tool-result": {
+      const id = String(p.id ?? mintToolId());
+      if (toolDedup.has(id)) return;
+      toolDedup.add(id);
       dispatch({
         type: "tool-result",
-        toolId: String(p.id ?? mintId("tool:")),
         content: String(p.content ?? ""),
         isError: Boolean(p.isError),
       });
       return;
+    }
+    case "chat.input-folded": {
+      const count = numFrom(p.count);
+      if (count > 0) dispatch({ type: "drain-tray", count });
+      return;
+    }
     case "chat.api-retry":
       dispatch({
         type: "retry",
@@ -375,6 +603,7 @@ function dispatchTailEvent(ev: Event, dispatch: React.Dispatch<Action>): void {
       });
       return;
     case "chat.turn-end":
+      toolDedup.clear();
       dispatch({
         type: "turn-end",
         model: typeof p.model === "string" ? p.model : "",
@@ -390,8 +619,8 @@ function dispatchTailEvent(ev: Event, dispatch: React.Dispatch<Action>): void {
       dispatch({ type: "error", text: String(p.error ?? "") });
       return;
     case "chat.cancelled":
+      toolDedup.clear();
       dispatch({ type: "cancelled" });
       return;
   }
 }
-

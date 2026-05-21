@@ -139,3 +139,9 @@ export function priceTokens(provider: string, model: string, usage: PricedUsage)
 export function hasPostedPrice(provider: string, model: string): boolean {
   return PRICES[provider]?.[model] !== undefined;
 }
+
+/** Every model name across every provider with a posted price. Order
+ *  is provider-grouped, then declaration order within the provider. */
+export function listKnownModels(): string[] {
+  return Object.values(PRICES).flatMap((byModel) => Object.keys(byModel));
+}

@@ -10,6 +10,7 @@
 import { Box, Text } from "ink";
 import { theme, sym } from "./theme.ts";
 import { Markdown } from "./markdown.tsx";
+import { clipString } from "./format.ts";
 
 export type ScrollbackEntry =
   | { kind: "user"; id: string; text: string }
@@ -44,6 +45,23 @@ export function MessageRow({ entry }: { entry: ScrollbackEntry }): React.ReactEl
  *  rather than silently rendering nothing at runtime. */
 function assertNever(x: never): never {
   throw new Error(`MessageRow: unhandled scrollback entry kind: ${JSON.stringify(x)}`);
+}
+
+/** Mid-turn submits pinned above the input bar until the daemon
+ *  emits `chat.input-folded`. Visually distinct from the committed
+ *  user gutter — same `▎` accent but muted + a `(queued)` tag. */
+export function TrayList({ items }: { items: string[] }): React.ReactElement {
+  return (
+    <Box flexDirection="column" paddingX={1} marginTop={1}>
+      {items.map((text, i) => (
+        <Box key={i}>
+          <Text color={theme.muted}>{sym.bar} </Text>
+          <Text color={theme.muted}>{text}  </Text>
+          <Text color={theme.warn}>(queued)</Text>
+        </Box>
+      ))}
+    </Box>
+  );
 }
 
 function UserRow({ text }: { text: string }): React.ReactElement {
@@ -190,17 +208,17 @@ function formatCallArgs(input: unknown): string {
   //   `memory_search("dave")` — single string arg uses positional form
   //   `write_file(path="/x", content="…")` — multi-arg keeps keys
   if (input == null) return "";
-  if (typeof input === "string") return JSON.stringify(clip(input, 40));
+  if (typeof input === "string") return JSON.stringify(clipString(input, 40));
   if (typeof input !== "object") return String(input);
   try {
     const entries = Object.entries(input as Record<string, unknown>);
     if (entries.length === 0) return "";
     if (entries.length === 1 && typeof entries[0]![1] === "string") {
-      return JSON.stringify(clip(entries[0]![1] as string, 40));
+      return JSON.stringify(clipString(entries[0]![1] as string, 40));
     }
-    const parts = entries.slice(0, 4).map(([k, v]) => `${k}=${clip(stringifyShort(v), 24)}`);
+    const parts = entries.slice(0, 4).map(([k, v]) => `${k}=${clipString(stringifyShort(v), 24)}`);
     const suffix = entries.length > 4 ? `, +${entries.length - 4}` : "";
-    return clip(parts.join(", "), 80) + suffix;
+    return clipString(parts.join(", "), 80) + suffix;
   } catch {
     return "";
   }
@@ -210,11 +228,6 @@ function stringifyShort(v: unknown): string {
   if (typeof v === "string") return v;
   if (v == null || typeof v !== "object") return String(v);
   try { return JSON.stringify(v); } catch { return "[obj]"; }
-}
-
-function clip(s: string, n: number): string {
-  if (s.length <= n) return s;
-  return s.slice(0, n - 1) + "…";
 }
 
 function truncate(s: string, opts: { maxLines: number; maxChars: number }): { head: string; more: number } {
