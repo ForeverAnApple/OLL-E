@@ -60,6 +60,7 @@ type Action =
   | { type: "error"; text: string }
   | { type: "retry"; attempt: number; status?: number; message?: string }
   | { type: "turn-end"; model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; usdMicros: number; stopReason: string }
+  | { type: "cancel-requested" }
   | { type: "cancelled" }
   | { type: "thread-rotated"; threadId: string }
   | { type: "model-changed"; model: string }
@@ -70,6 +71,11 @@ interface ChatState {
   scrollback: ScrollbackEntry[];
   streaming: string;
   turnBusy: boolean;
+  /** True between the user pressing Ctrl-C mid-turn and the daemon
+   *  emitting the terminal event (chat.cancelled / chat.error /
+   *  chat.turn-end). Drives the "cancelling…" spinner so the user
+   *  sees the request landed instead of staring at an unchanged UI. */
+  cancelling: boolean;
   threadId: string;
   model: string;
   inboxOpen: number;
@@ -139,6 +145,7 @@ function reducer(state: ChatState, action: Action): ChatState {
         scrollback: [...state.scrollback, { kind: "error", id: mintEntryId(), text: action.text }],
         streaming: "",
         turnBusy: false,
+        cancelling: false,
       };
     case "retry":
       return {
@@ -175,16 +182,22 @@ function reducer(state: ChatState, action: Action): ChatState {
         }],
         streaming: "",
         turnBusy: false,
+        cancelling: false,
         totalUsdMicros: cumulative,
         totalBilledTokens: state.totalBilledTokens + turnBilled,
       };
     }
+    case "cancel-requested":
+      // Idempotent — repeated Ctrl-C taps within the cancel window
+      // shouldn't keep cloning state.
+      return state.cancelling ? state : { ...state, cancelling: true };
     case "cancelled":
       return {
         ...state,
         scrollback: [...state.scrollback, { kind: "note", id: mintEntryId(), text: "(cancelled)" }],
         streaming: "",
         turnBusy: false,
+        cancelling: false,
       };
     case "thread-rotated":
       return {
@@ -193,6 +206,7 @@ function reducer(state: ChatState, action: Action): ChatState {
         scrollback: [],
         streaming: "",
         turnBusy: false,
+        cancelling: false,
         tray: [],
         totalUsdMicros: 0,
         totalBilledTokens: 0,
@@ -200,7 +214,7 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "model-changed":
       return { ...state, model: action.model };
     case "turn-busy":
-      return { ...state, turnBusy: action.busy };
+      return { ...state, turnBusy: action.busy, cancelling: action.busy ? state.cancelling : false };
     case "inbox-count":
       // No-op guard — every /inbox call dispatches here; without the
       // guard the whole tree re-renders even when the count didn't move.
@@ -214,6 +228,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
     scrollback: [],
     streaming: "",
     turnBusy: false,
+    cancelling: false,
     threadId: initialThreadId,
     model: initialModel,
     inboxOpen,
@@ -326,6 +341,13 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
     }
     if (key.ctrl && input === "c") {
       if (state.turnBusy) {
+        // Second Ctrl-C while a cancel is already in flight: the
+        // daemon is slow or hung. Don't trap the user — force-quit.
+        if (state.cancelling) {
+          teardown();
+          return;
+        }
+        dispatch({ type: "cancel-requested" });
         void clientRef.current.call("chat.cancel", { threadId: state.threadId }).catch(() => {});
         return;
       }
@@ -479,10 +501,18 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
     }
   }
 
-  const barState: BarState = quitArmed ? "quit-armed" : state.turnBusy ? "busy" : "idle";
-  const placeholder = state.turnBusy
-    ? "type to fold into the running turn…"
-    : "ask anything  (/ for commands, Ctrl-C to quit)";
+  const barState: BarState = quitArmed
+    ? "quit-armed"
+    : state.cancelling
+      ? "cancelling"
+      : state.turnBusy
+        ? "busy"
+        : "idle";
+  const placeholder = state.cancelling
+    ? "cancelling…"
+    : state.turnBusy
+      ? "type to fold into the running turn…"
+      : "ask anything  (/ for commands, Ctrl-C to quit)";
   const suggestions = inlineSuggestions(inputText);
 
   return (

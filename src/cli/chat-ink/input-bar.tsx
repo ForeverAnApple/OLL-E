@@ -8,11 +8,11 @@ import { Spinner, TextInput } from "@inkjs/ui";
 import { theme, sym } from "./theme.ts";
 import { matchSlash, exactCommand, splitSlash, type SlashCommand } from "./commands.ts";
 
-export type BarState = "idle" | "busy" | "error" | "quit-armed";
+export type BarState = "idle" | "busy" | "cancelling" | "error" | "quit-armed";
 
 function stateColor(state: BarState): string {
   if (state === "error") return theme.error;
-  if (state === "busy" || state === "quit-armed") return theme.warn;
+  if (state === "busy" || state === "cancelling" || state === "quit-armed") return theme.warn;
   return theme.primary;
 }
 
@@ -78,6 +78,15 @@ export function StatusLine({
       <Box paddingX={1}>
         <Spinner />
         <Text color={theme.muted}>  thinking…  (Ctrl-C to cancel)</Text>
+      </Box>
+    );
+  }
+  if (state === "cancelling") {
+    return (
+      <Box paddingX={1}>
+        <Spinner />
+        <Text color={theme.warn}>  cancelling…  </Text>
+        <Text color={theme.muted}>(Ctrl-C again to force quit)</Text>
       </Box>
     );
   }
