@@ -20,7 +20,7 @@ If a question is already answered in those files, defer to them. If you're about
 
 ## The lens
 
-OLL-E is a **world agents love to live in**, grown by its inhabitants. Every design choice descends from that. The operational restatements:
+OLL-E is the runtime that hosts a **world agents love to live in**, grown by its inhabitants. OLL-E is the thing you install; the world is what it hosts; the inhabitants are the named agents (humans included). The name never denotes a single being inside the world. Every design choice descends from that. The operational restatements:
 
 - **Humans are events.** A Discord DM, a CLI keystroke, an email, a webhook — all produce structurally identical events. No special-cased human UI, no privileged channel.
 - **Nothing blocks on humans.** Agent proposes to the decision inbox, keeps working. Replies reconcile async with staleness policies.

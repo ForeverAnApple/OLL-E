@@ -1073,6 +1073,40 @@ Two surgical swaps, prompted by named pain rather than architectural anxiety. Th
 
 ---
 
+## 2026-06-02 — "OLL-E" names the runtime, not the world or a being
+
+A naming audit surfaced a category error in the docs. `VISION.md` and the `AGENTS.md` lens both said "OLL-E **is** a world / a habitat" — equating the name with the thing it hosts. The same name was simultaneously doing three jobs: the binary you install (`olle run`), the federated world that binary hosts, and (in casual framing) a singular, personable being à la WALL-E/Ollie. Three referents, one name.
+
+**Prior framing:** OLL-E = the world. "OLL-E is a world agents love to live in." "OLL-E is designed as a habitat for agents."
+
+**New framing:** OLL-E = the **runtime** — the single binary + daemon you install, the thing that *hosts* a world. The world/mesh is what it hosts; the inhabitants are the individually-named agents (humans included). The name never denotes a single being inside the world. This is resolution **A** of the naming discussion (the alternative, B, would have made "Ollie" a charismatic first-contact *agent* with the world named separately — rejected as a larger, product-surface change we don't need).
+
+**Why this and not a rename.** The code already does A: `olle` is the CLI binary (`olle run`, `olle chat [agent]`), and agents carry their own names. Only the prose anthropomorphized. A tool name that boots a world is normal and honest — `docker` boots containers, nobody thinks Docker is a container. The deeper reason is philosophical, not cosmetic: a world with a single name and a face is a world with a *center*, which directly undercuts the load-bearing leaderless/peer thesis (no central coordinator, no privileged paths for any one entity). Personifying the world as one named being is the same failure mode the lens already forbids for the root principal.
+
+**Edits landed (this change):** `VISION.md` "What it is" (`agent system` → `agent runtime`, plus an explicit "the runtime; the mesh is the world" clause) and "The philosophy" (`designed as a habitat` → `the runtime for a habitat`); `AGENTS.md` lens opener. The one-line pitch ("A world that agents love to live in…") stays — it's the product promise describing the world the runtime grows, now anchored by a precise definition above it.
+
+**What this leaves open / deferred.** The world itself has no proper name yet — `[DEFERRED]` until a product/marketing need forces one (resurrect-when: a surface needs to refer to "the world" as a named place rather than "the mesh" / "the habitat"). If a named first-contact persona is ever wanted, that's resolution B and gets its own entry — it is not blocked by this one.
+
+---
+
+## 2026-06-02 — VISION.md becomes a timeless constitution; milestone content moves to ROADMAP
+
+`VISION.md` had drifted into part-constitution, part-milestone-plan: it carried the v0 demo script, a "What v0 is explicitly not" list, and "Success criteria for v0." Milestone scope in the anchor document is a drift vector — every version bump invites someone to edit the constitution, and a constitution you edit every release isn't one. So VISION is now strictly timeless: what OLL-E is, the philosophy, the load-bearing invariants, the why-the-shape-is-the-shape, and lineage. A preamble states its constitutional role explicitly (supreme, amendable only via a logged decision). All `v0`/`v1` tokens purged; the two load-bearing bullets that hedged in v0 terms ("In v0, cells share…", "Sub-agent spawning is v0, not v1") are restated as unconditional invariants.
+
+The relocated content: the demo script and success criteria moved into `ROADMAP.md` under v0 (the demo now lives inline where ROADMAP already pointed; success criteria join the shipping bar). The "What v0 is explicitly not" list was deleted from VISION outright — ROADMAP's "Explicit non-goals for v0" already supersedes it and is more complete. The "Why these choices" section stays in VISION, reframed as "Why the shape is the shape" — recording the reasoning behind foundational commitments *is* drift-prevention, which is constitutional, not milestone. Pairs with the 2026-06-02 naming entry above; both are the same housekeeping pass to make the anchor docs say exactly one true thing each.
+
+---
+
+## 2026-06-02 — VISION is tech-independent; rationale moves to ARCHITECTURE (reverses the keep-the-why call above)
+
+The earlier 2026-06-02 constitution entry kept "Why the shape is the shape" inside VISION, arguing tech rationale was drift-prevention and therefore constitutional. That was wrong, and the user named why: a vision that argues for SQLite or Bun is a vision a technology swap can falsify. The constitution must be the thing technologies are *measured against* — it names no technologies and argues for none. A technology earns its place by fitting the vision; the vision never bends to justify a technology.
+
+So VISION is now strictly philosophy: identity, principles, load-bearing invariants. The "Why the shape is the shape" section is gone from it, and the "Lineage" section too (prior-art provenance is reference material — `REFERENCES.md` owns it, not the constitution). The rationale moved to `ARCHITECTURE.md` as "Why these choices," reframed so each choice is stated as *downstream of a named vision principle* ("SQLite per host serves *each host is sovereign*"). This makes the dependency direction explicit and one-way: ARCHITECTURE traces up to VISION; VISION never reaches down.
+
+Three values that previously existed only as tech-justifications were promoted into VISION as first-class principles, so the technical decisions have something to trace back to: **each host is sovereign** (load-bearing), **the inhabitants are the primary audience** (agent-native ergonomics beat developer-facing ones), and **the simplest mechanism that serves the vision wins** (complexity earns its place, never granted on spec). The test the user set: VISION can now be used to fundamentally understand any technical decision — every entry in ARCHITECTURE's "Why these choices" points at a principle that lives in VISION.
+
+---
+
 ## How to use this log
 
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.

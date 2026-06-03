@@ -10,6 +10,17 @@ This document describes the v0 architecture of OLL-E. It is a working artifact �
 - **Persistence**: SQLite with Drizzle ORM. WAL mode, foreign keys on. Migrations from commit #1.
 - **IPC**: Unix socket (localhost HTTP/WS upgrade-able) between daemon and clients.
 
+## Why these choices
+
+Each foundational choice is downstream of a `VISION.md` principle — the technology serves the principle, never the reverse. If a better technology fits the same principle, it wins; the principle does not move.
+
+- **Single binary, daemon + thin client.** Serves *install anywhere* and *growth/background work is a normal state* — one-command install on any machine; the daemon runs while clients come and go. Bun's `--compile` delivers the binary across macOS and Linux.
+- **SQLite per host, not a shared database.** Serves *each host is sovereign* and *federation is the merge of sovereign histories, never a shared central store*.
+- **Agent-native markdown, not schema.** Serves *the inhabitants are the primary audience* — the format agents reason in natively wins over the one that reads cleanly to an outside developer.
+- **First-claim-wins, not bidding.** Serves *the simplest mechanism that serves the vision wins* — bidding asks inhabitants to model their own and peers' cost; it has not earned that complexity.
+- **Ask-up hierarchical approval, not flat escalation.** Serves the *approvals bubble up the tree* invariant and matches how delegation actually works.
+- **Git-backed extension rollback, not a versioning DSL.** Serves *the world tolerates and recovers; code is cheap* — full history for almost no code.
+
 ## Process topology
 
 Each host runs one long-lived **daemon** process. Any number of **thin clients** attach to it over local IPC.
