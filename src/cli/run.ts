@@ -102,10 +102,10 @@ async function cmdRun(): Promise<void> {
 async function cmdStatus(args: string[]): Promise<void> {
   // Dashboard: composes the same observability/inbox/extension IPC calls
   // an agent reaches through its tool surface — no privileged human read
-  // path (AGENTS.md vision-check). Default window is 24h; --since lets a
+  // path (AGENTS.md vision-check). Default window is 7d; --since lets a
   // human ask the same question over a different slice.
   const sinceArg = parseFlagValue(args, "--since");
-  const sinceMs = sinceArg ? parseSinceArg(sinceArg) : Date.now() - 24 * 3_600_000;
+  const sinceMs = sinceArg ? parseSinceArg(sinceArg) : Date.now() - 7 * 86_400_000;
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
     // All independent reads in flight at once. Each tolerates failure so
@@ -2557,7 +2557,7 @@ function printHelp(): void {
       "",
       "Commands:",
       "  run                         start foreground daemon",
-      "  status [--since 24h]        dashboard: daemon, agent, inbox, usage, runs, extensions",
+      "  status [--since 7d]         dashboard: daemon, agent, inbox, usage, runs, extensions",
       "  daemon restart              SIGTERM the daemon and wait for the supervisor to bring it back",
       "  chat                        REPL connected to the default agent",
       "  tail [type]                 stream events (default: all)",
