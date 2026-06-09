@@ -114,7 +114,7 @@ async function cmdStatus(args: string[]): Promise<void> {
     const [host, chat, rootAgent, exts, usage, runs, threads, inbox] =
       await Promise.all([
         client
-          .call<{ hostId: string; pid: number; uptimeMs: number }>("status")
+          .call<{ hostId: string; hostname: string | null; pid: number; uptimeMs: number }>("status")
           .catch(() => null),
         client
           .call<{ enabled: boolean; reason: string | null }>("status.chat")
@@ -161,7 +161,12 @@ async function cmdStatus(args: string[]): Promise<void> {
     // ─── daemon ────────────────────────────────────────────────────────
     console.log(heading("daemon"));
     if (host) {
-      console.log(`  ${label("host")}    ${host.hostId}`);
+      // Hostname is what a human recognizes; keep a short slice of the ULID
+      // for disambiguation when several hosts share a name.
+      const hostText = host.hostname
+        ? `${host.hostname}  ${color(ANSI.muted, host.hostId.slice(0, 8))}`
+        : host.hostId;
+      console.log(`  ${label("host")}    ${hostText}`);
       console.log(`  ${label("pid")}     ${host.pid}`);
       console.log(`  ${label("uptime")}  ${fmtAge(host.uptimeMs)}`);
     } else {
@@ -175,13 +180,15 @@ async function cmdStatus(args: string[]): Promise<void> {
     }
     if (self) {
       const named = self.displayName ? ` / ${self.displayName}` : "";
-      console.log(`  ${label("agent")}   ${self.name}${named}  ${color(ANSI.muted, self.agentId)}`);
-      // `tools` here is extension-registered tools only — core tools live in
-      // memory and aren't in the agents row. Label it explicitly so the
-      // count isn't read as "the agent has only N tools available".
-      const principles = `${self.principleCount} ${self.principleCount === 1 ? "principle" : "principles"}`;
-      const tools = `${self.tools.length} ext ${self.tools.length === 1 ? "tool" : "tools"}`;
-      console.log(`  ${label("        ")}${principles}  ${tools}`);
+      console.log(`  ${label("agent")}   ${self.name}${named}`);
+      // Model is what people actually want to know here; the principle/tool
+      // counts and the raw agent id live in `olle inspect agent <id>`.
+      const def = self.thinkingModelIsDefault ? color(ANSI.muted, " (default)") : "";
+      const effort =
+        self.reasoningEffort && self.reasoningEffort !== "off"
+          ? color(ANSI.muted, `  · thinking ${self.reasoningEffort}`)
+          : "";
+      console.log(`  ${label("model")}   ${self.thinkingModel}${def}${effort}`);
     }
 
     // ─── inbox ─────────────────────────────────────────────────────────
@@ -276,14 +283,14 @@ async function cmdStatus(args: string[]): Promise<void> {
       const oneHourAgo = now - 3_600_000;
       const recentlyActive = threads.filter((t) => t.lastEventAt >= oneHourAgo).length;
       console.log(
-        `  ${label("active")}      ${recentlyActive} ${color(ANSI.muted, `in last hour (of ${threads.length} recent)`)}`,
+        `  ${label("active")}      ${recentlyActive} in the last hour ${color(ANSI.muted, `· ${threads.length} recent`)}`,
       );
+      // Each thread shows the opening line of the conversation (what a human
+      // recognizes it by), its age, and how many turns it's run.
       for (const t of threads.slice(0, 5)) {
         const age = fmtAge(now - t.lastEventAt);
-        const tid = t.threadId.length > 22 ? `${t.threadId.slice(0, 19)}...` : t.threadId;
-        console.log(
-          `    ${color(ANSI.muted, tid.padEnd(22))} ${t.lastType.padEnd(20)} ${color(ANSI.muted, `${t.events} ev`)}  ${color(ANSI.muted, age)}`,
-        );
+        const turns = `${t.turns} ${t.turns === 1 ? "turn" : "turns"}`;
+        console.log(`    ${threadSnippet(t.firstUserText).padEnd(40)} ${color(ANSI.muted, `${age} · ${turns}`)}`);
       }
     }
 
@@ -2219,6 +2226,15 @@ function fmtAge(ms: number): string {
   if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
   if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
   return `${Math.round(ms / 86_400_000)}d`;
+}
+
+/** One-line opening-message snippet for the status threads list. Plain text
+ *  (no color) so padEnd aligns; threads with no user text read "(no messages
+ *  yet)". */
+function threadSnippet(firstUserText: string | null): string {
+  const raw = (firstUserText ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return "(no messages yet)";
+  return raw.length > 38 ? `${raw.slice(0, 37)}…` : raw;
 }
 
 type InboxVote = "approve" | "deny" | "modify";

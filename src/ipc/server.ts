@@ -169,17 +169,22 @@ async function dispatch(
       case "version":
         send({ id: req.id, ok: true, value: opts.version });
         return;
-      case "status":
+      case "status": {
+        const hostRow = opts.store?.raw
+          .query<{ hostname: string }, [string]>("SELECT hostname FROM hosts WHERE id = ?")
+          .get(opts.bus.hostId);
         send({
           id: req.id,
           ok: true,
           value: {
             hostId: opts.bus.hostId,
+            hostname: hostRow?.hostname ?? null,
             pid: process.pid,
             uptimeMs: Math.round(process.uptime() * 1000),
           },
         });
         return;
+      }
       case "publish": {
         const p = (req.params ?? {}) as {
           type?: string;
