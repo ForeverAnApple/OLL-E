@@ -12,6 +12,7 @@ import {
   usageStats,
 } from "../src/observability/index.ts";
 import { buildObservabilityTools } from "../src/tools/observability.ts";
+import { DEFAULT_MODEL } from "../src/llm/index.ts";
 
 function rig() {
   const store = openStore({ path: ":memory:" });
@@ -367,6 +368,81 @@ describe("observability.agentSelf", () => {
     expect(self.recentlyPricedModels).toEqual([
       { provider: "anthropic", model: "claude-opus-4-7", pricePosted: true },
     ]);
+    // No thinking-model memory → reports the host default, flagged as such.
+    expect(self.thinkingModel).toBe(DEFAULT_MODEL);
+    expect(self.thinkingModelIsDefault).toBe(true);
+    expect(self.reasoningEffort).toBe("off");
+  });
+
+  it("reports the configured thinkingModel, not the ledger's recent model (the query_self bug)", () => {
+    const { store, bus, hostId } = rig();
+    const agentId = ulid();
+    store
+      .insert(tables.agents)
+      .values({ id: agentId, name: "bocchi", hostId, createdAt: Date.now() })
+      .run();
+    // Switched to 4-8 (the configured/identity choice)...
+    store
+      .insert(tables.memories)
+      .values({
+        id: ulid(),
+        hlc: "1",
+        hostId,
+        actorId: agentId,
+        scope: "private",
+        scopeRef: agentId,
+        role: "thinking-model",
+        depth: 1,
+        title: "thinking-model",
+        bodyMd: "claude-opus-4-8\n\nfaa asked me to switch",
+        tags: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      })
+      .run();
+    // ...but the ledger is still dominated by pre-switch 4-7 spend.
+    const ledger = createLedger({ store, bus, hostId });
+    ledger.record({ actorId: agentId, provider: "anthropic", model: "claude-opus-4-7", inputTokens: 10, outputTokens: 5 });
+
+    const self = agentSelf(store, agentId)!;
+    expect(self.thinkingModel).toBe("claude-opus-4-8"); // authoritative
+    expect(self.thinkingModelIsDefault).toBe(false);
+    // recentlyPricedModels still shows history — which is exactly why it must
+    // NOT be used to answer "what model am I?".
+    expect(self.recentlyPricedModels[0]!.model).toBe("claude-opus-4-7");
+  });
+
+  it("reports reasoningEffort clamped against the agent's own model, not the default", () => {
+    const { store, hostId } = rig();
+    const agentId = ulid();
+    store
+      .insert(tables.agents)
+      .values({ id: agentId, name: "ryo", hostId, createdAt: Date.now() })
+      .run();
+    // Configured for Sonnet (no xhigh/max dial) at effort `max`.
+    const mem = (role: string, body: string) => ({
+      id: ulid(),
+      hlc: "1",
+      hostId,
+      actorId: agentId,
+      scope: "private" as const,
+      scopeRef: agentId,
+      role,
+      depth: 1,
+      title: role,
+      bodyMd: body,
+      tags: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    store.insert(tables.memories).values(mem("thinking-model", "claude-sonnet-4-6\n\ncheaper")).run();
+    store.insert(tables.memories).values(mem("reasoning-effort", "max\n\nwant depth")).run();
+
+    const self = agentSelf(store, agentId)!;
+    expect(self.thinkingModel).toBe("claude-sonnet-4-6");
+    // The daemon clamps Sonnet's `max` down to `high` at loop start; query_self
+    // must report the same effective level, not the stored `max`.
+    expect(self.reasoningEffort).toBe("high");
   });
 
   it("returns null for an unknown agent id", () => {

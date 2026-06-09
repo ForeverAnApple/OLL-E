@@ -2152,6 +2152,9 @@ async function cmdInspect(args: string[]): Promise<void> {
     console.log(`host:   ${self.hostId}`);
     console.log(`parent: ${self.parentAgentId ?? "(none)"}`);
     console.log(`principles: ${self.principleCount}`);
+    console.log(
+      `model:  ${self.thinkingModel}${self.thinkingModelIsDefault ? " (host default)" : ""}  effort=${self.reasoningEffort}`,
+    );
     if (self.scope.allowTiers) {
       console.log(`scope: tiers=${self.scope.allowTiers.join(",")}`);
     }
