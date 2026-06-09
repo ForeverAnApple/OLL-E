@@ -973,6 +973,67 @@ The pushback was correct, and the prior framing was muddled. Vision draws two ax
 
 ---
 
+## 2026-06-08 — An agent's model is a memory, not host config
+
+The ask: let the agent switch itself from opus 4.7 to 4.8 and have it persist. The obvious home — `config.toml` — is wrong. `config.toml` is the human's host-config surface (principals, budgets, secrets); for the agent to "switch *itself*" through it, we'd hand it a privileged tool that pokes a human file, which is exactly the special-cased path AGENTS.md test 3 and the "no privileged human dashboard" rule exist to kill.
+
+**The choice descends from "memory is identity" (LOG 2026-04-23).** The model an agent reasons in is a preference — part of its persistent self — so it lives on the same surface as identity and principles. Stored as a private memory with `role='thinking-model'`, body line 1 = model id, the rest = the switch's justification. `resolveThinkingModel(store, agentId)` reads the newest such row at loop start and passes it as the loop's `model`; absent or unpriced → adapter default (`DEFAULT_MODEL`). `config.toml` keeps a real but different future job — host default + payable-model allowlist (the cost-ceiling "physics") — and was deliberately *not* built now; it's dead weight for this ask.
+
+**Three design calls (with the principal, this turn):**
+- **Home: memory, via a thin validating tool.** `set_thinking_model(model, reason)` is a front door to `memory_write`, not a new home. It earns ~30 lines over a raw write by enforcing the two things that make a switch trustworthy: the model must have a posted price in `pricing.ts` (else the ledger silently falls back and lies about physics), and `reason` must be non-empty.
+- **Cost gate: none — justified, not gated.** No ask-up, no tier comparison. The agent may switch freely; it must record *why* (a human asked, or it judged the cost/intelligence trade worth it). The existing budget physics (80%/100% auto-inbox) catch a reckless choice after the fact; a pre-switch gate would be distrust dressed as safety.
+- **Apply timing: next loop start.** `model` is read once when the loop is built (static, like it's plumbed today), so a switch lands on the next daemon restart, not mid-conversation. The tool result says so.
+
+Also added `claude-opus-4-8` to `pricing.ts` explicitly (it was matching 4.7 only by FALLBACK luck) and a `postedModels()` export for the switch tool's validation + error message.
+
+---
+
+## 2026-06-08 — Reasoning effort is a memory too; "effort" is the real knob, not budget_tokens
+
+Sibling to the thinking-model decision above. The ask was "implement reasoning effort." Research (claude-api skill) corrected the shape: on the model OLL-E actually runs (`claude-opus-4-7`, and the new `4-8`), `thinking: {type:"enabled", budget_tokens:N}` **400s** — extended thinking with a fixed budget is gone. The live knob is `output_config: {effort: "low"|"medium"|"high"|"xhigh"|"max"}` (GA, no beta header) paired with adaptive thinking (`thinking: {type:"adaptive"}`). Sampling params (`temperature`/`top_p`/`top_k`) also 400 on these models.
+
+**Design — mirror the thinking-model path exactly.** Effort is identity, so it lives in memory: a private `role='reasoning-effort'` row, body line 1 = level, resolved at loop start by `resolveReasoningEffort`, passed as the loop's `effort`. The agent sets it via `set_reasoning_effort(effort, reason)` — validated level, mandatory justification, no mechanical gate (same cost-philosophy as the model switch). One bundled knob: setting an effort enables adaptive thinking at that depth; `off` (or no memory) = no thinking, which is the historical behavior. So the feature is strictly opt-in and a clean restart reverts.
+
+**The load-bearing correctness work was the thinking-block lifecycle, not the knob.** The adapter previously flattened thinking blocks to `JSON.stringify` text (`anthropic.ts:274`), discarding the `signature`. With thinking on, the API requires each thinking block (and `redacted_thinking`) echoed back verbatim on the next turn or a tool-use turn 400s — and *every* OLL-E turn is tool-use. So enabling thinking forced: a `thinking`/`redacted_thinking` ContentBlock type that preserves text+signature, round-tripped through `fromAnthropicBlock`/`toAnthropicMessage`. Also bumped the default `max_tokens` when effort is set (4096 truncates mid-thought; 32k, or 64k at xhigh/max) and dropped `temperature` from the request whenever effort is on. Thinking tokens bill as output tokens, so the ledger stays honest with no pricing change.
+
+**SDK bump.** Did this on the same turn: `@anthropic-ai/sdk` 0.38 → 0.102, which natively types `output_config.effort` (`low|medium|high|xhigh|max`), adaptive thinking, and the thinking blocks. The upgrade needed **zero** production changes — only one test helper line (`APIError`'s constructor now wants a real `Headers`). The adapter still builds the request as a loose object cast once at the call site, because the `thinking`/`output_config` fields are attached conditionally; that's an ergonomics choice now, not an SDK-version workaround.
+
+---
+
+## 2026-06-08 — Model and effort are chosen independently, so the loop must not brick on an invalid pair
+
+Follow-up review of the two decisions above caught a self-inflicted, unrecoverable failure. The model and the effort are each a self-chosen memory resolved independently at loop start. `set_thinking_model` accepted any *priced* model (Sonnet 4.6, Haiku 4.5 included), and `set_reasoning_effort` accepted any *valid* level — with no cross-check. So an agent could land on, say, Haiku + `max`. Since `output_config.effort` 400s when the model can't run that depth, **every** LLM hop would then 400 — and a 400 is non-transient, so it throws before any tool dispatches. The agent can't issue a fixing `set_reasoning_effort` call when no turn completes. The thread (and the loop) is dead until a human edits the DB. That violates the v0 success criterion "when an agent writes a broken [config], the system recovers."
+
+**Fix at altitude, not as a special case.** A new `src/llm/models.ts` holds per-model capability facts (which efforts each selectable model accepts, and its `max_tokens` ceiling) — the LLM-layer sibling of `pricing.ts`, updated alongside it. Two enforcement points: (1) **runtime safety net** — `runAgent` resolves `(model, effort, maxTokens)` together, `clampEffort`s an unsupported level down to the highest the model runs (or off), and caps `max_tokens` at the model ceiling, so a bad pair *degrades* instead of bricking; (2) **set-time feedback** — `set_reasoning_effort` rejects a level the agent's current model can't run (clear physics-feel error listing the valid levels), and `set_thinking_model` warns when a switch will clamp the agent's existing effort. The clamp also subsumes the earlier `max_tokens` concern: with effort correctly gated, the 32k/64k defaults are always within the chosen model's cap. Also added a `"default"` sentinel to `set_thinking_model` so the agent can stop overriding and fall back to the host default (symmetry with effort's `off`).
+
+**Simplify.** `thinking-model` and `reasoning-effort` were two copies of the same "single canonical private memory, body line 1 = value" pattern across four files. Folded the duplicated query/publish boilerplate into `src/memory/scalar-pref.ts` (`resolveScalarPref` / `findScalarPrefId` / `writeScalarPref`); `model.ts`/`reasoning.ts` keep only their role constant + validator, and the two tools keep only their distinct validation. A third such knob is now a few lines, not a fifth copy.
+
+---
+
+## 2026-06-08 — Switching models safely: smoke test on switch + OLLE_MODEL rescue hatch
+
+Two safety properties added to the model-switch path, prompted by "the agent can't verify 4-8 is real, and can we go back?"
+
+**The agent never had to verify — the host does.** `set_thinking_model` gates on `hasPostedPrice`, and `resolveThinkingModel` re-checks it at read time, so a typo/hallucinated name is rejected and a corrupt memory row falls back to `DEFAULT_MODEL` rather than bricking boot. The one residual hole: "priced" proves the host can *bill* a model, not that the API *serves* it. Closed it two ways.
+
+1. **Smoke test on switch.** `set_thinking_model` now takes an optional `probe(model)` (wired in the daemon from the LLM adapter as a 1-token `complete` call). It runs after the posted-price gate and before the memory write; if the provider rejects the model, the switch throws and nothing is written. A priced-but-unserved model can no longer reach loop start, so a switch can't brick the turn loop. This is the extension-loop's propose→smoke→activate pattern applied to model choice — verification by *calling*, not by belief. `default` skips the probe (can't be wrong). Probe is optional so unit tests skip it; production always wires it.
+
+2. **`OLLE_MODEL` rescue hatch.** `resolveBootModel` reads an `OLLE_MODEL` env override at boot, ahead of the memory: priced override wins, `default` forces the host default ignoring the memory, an unpriced override is ignored (a typo can't brick the rescue). This is the human off-ramp for the otherwise-unreachable case where a muted agent can't run a turn to fix its own model — set the env and restart, no SQLite, no agent. Honors the "env = behavior toggle, not secret" rule. Set via `systemctl --user set-environment OLLE_MODEL=claude-opus-4-7 && olle daemon restart` (or `OLLE_MODEL=… olle run` in foreground).
+
+Rollback layers now: change is staged (not live until restart) → `set_thinking_model("default")` → explicit model → `OLLE_MODEL` boot override → delete the one canonical memory row. The daemon process never fails to boot on a bad model; at worst chat turns 400, and now even that can't happen through the blessed switch path.
+
+---
+
+## 2026-06-08 — Model/effort apply per-thread, not per-restart (supersedes "restart to apply")
+
+The earlier thinking-model / reasoning-effort entries resolved `(model, effort)` **once at loop start** and passed static values to the single agent loop, so a self-switch needed a daemon restart. Replaced with **per-thread freeze**: `AgentLoopOptions` now takes `resolveModel` / `resolveEffort` thunks; the chat loop calls them once when a `Thread` is first created and freezes the result onto the thread for its life. A `set_thinking_model` / `set_reasoning_effort` switch is therefore picked up by the next **new** thread (a fresh `olle chat`, `/new`, `/clear`, or a new channel thread); active conversations keep what they started with. No restart.
+
+Why per-thread freeze rather than per-turn: switching a live conversation's model mid-stream would (a) feel like the agent's mind changed mid-thought, and (b) invalidate the prompt cache (model is part of the cache key — see `prompt-caching.md`). Freezing per thread keeps active threads' caches warm and only pays the cold-start on a genuinely new thread, which starts cold anyway. So this is both the more intuitive UX *and* the cheaper one — the restart-to-apply compromise was leaving that on the table.
+
+Static `model` / `effort` options are retained as the fallback for child loops (`agent/manager.ts`) and tests; only the daemon's root loop wires the live resolvers. `OLLE_MODEL` rescue hatch and the switch smoke-test are unchanged and still apply (resolver calls `resolveBootModel`).
+
+---
+
 ## How to use this log
 
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.

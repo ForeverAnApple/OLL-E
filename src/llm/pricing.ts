@@ -36,7 +36,13 @@ export interface PricedUsage {
 const PRICES: Record<string, Record<string, ModelPrice>> = {
   anthropic: {
     // Opus 4.5+ priced 3x cheaper than the original Opus 4 / 4.1 tier.
-    // (Opus 4.0/4.1 were $15/$75; Opus 4.5/4.6/4.7 are $5/$25.)
+    // (Opus 4.0/4.1 were $15/$75; Opus 4.5/4.6/4.7/4.8 are $5/$25.)
+    "claude-opus-4-8": {
+      inMicros: 5_000_000,
+      outMicros: 25_000_000,
+      cacheReadMicros: 500_000,
+      cacheCreationMicros: 6_250_000,
+    },
     "claude-opus-4-7": {
       inMicros: 5_000_000,
       outMicros: 25_000_000,
@@ -85,4 +91,11 @@ export function priceTokens(provider: string, model: string, usage: PricedUsage)
 /** True iff the model has a posted price. Useful for "is this fallback?" UI. */
 export function hasPostedPrice(provider: string, model: string): boolean {
   return PRICES[provider]?.[model] !== undefined;
+}
+
+/** Models with posted prices for a provider. The set an agent may switch
+ *  itself to — picking one without a posted price would make the ledger
+ *  lie (silent FALLBACK), so the switch tool validates against this. */
+export function postedModels(provider: string): string[] {
+  return Object.keys(PRICES[provider] ?? {});
 }

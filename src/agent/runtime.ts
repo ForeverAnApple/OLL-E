@@ -12,11 +12,13 @@ import type {
   ContentBlock,
   Llm,
   Message,
+  ReasoningEffort,
   RetryInfo,
   SystemSegment,
   ToolSpec,
   Usage,
 } from "../llm/index.ts";
+import { clampEffort, maxOutputTokens } from "../llm/index.ts";
 import {
   enforceMessageBudget,
   maybeTruncateOne,
@@ -26,6 +28,10 @@ import {
 export interface AgentRunOptions {
   llm: Llm;
   model?: string;
+  /** Reasoning effort. When set, enables adaptive thinking at this depth
+   *  (see CompletionRequest.effort) and raises the default max_tokens so
+   *  thinking + output don't truncate. */
+  effort?: ReasoningEffort;
   /** A plain string is sent as a single cached system block. A
    *  SystemSegment[] lets the caller place the cache breakpoint between
    *  stable and volatile content (chat loop uses this for the mailbox
@@ -112,6 +118,22 @@ export interface AgentResult {
 export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   const model = opts.model ?? opts.llm.defaultModel;
   const maxTurns = opts.maxTurns ?? 10;
+  // Clamp the requested effort to what this model accepts. The model and
+  // effort are independently-chosen memories; an unsupported pair (e.g.
+  // `max` on Sonnet, any effort on Haiku) would 400 every turn and the
+  // agent couldn't recover. clampEffort degrades to the highest supported
+  // level, or undefined (no thinking) when the model has no effort dial.
+  const effort = opts.effort ? clampEffort(model, opts.effort) : undefined;
+  // Thinking + output share the response budget. 4096 (the no-thinking
+  // default) truncates mid-thought once reasoning is on; high/xhigh/max
+  // can spend a lot of tokens thinking, so give the bigger dials more room.
+  // Never exceed the model's own output ceiling, or the call 400s.
+  const effortDefault = effort
+    ? effort === "xhigh" || effort === "max"
+      ? 64_000
+      : 32_000
+    : 4096;
+  const defaultMaxTokens = Math.min(effortDefault, maxOutputTokens(model));
 
   // Resolve the tool surface for the next round-trip. `getTools` (when
   // supplied) is re-read each call so a mid-turn register/unload becomes
@@ -166,9 +188,11 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
       model,
       messages,
       system: opts.system,
-      maxTokens: opts.maxTokens ?? 4096,
+      // An explicit maxTokens still can't exceed the model's ceiling.
+      maxTokens: Math.min(opts.maxTokens ?? defaultMaxTokens, maxOutputTokens(model)),
       temperature: opts.temperature,
     };
+    if (effort) req.effort = effort;
     if (toolSpecs && toolSpecs.length > 0) req.tools = toolSpecs;
     req.onRetry = (info) => opts.onStep?.({ kind: "retry", info });
     req.onTextDelta = (delta) => opts.onStep?.({ kind: "assistant_delta", text: delta });

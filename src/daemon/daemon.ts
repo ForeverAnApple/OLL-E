@@ -16,6 +16,8 @@ import { buildMetaTools } from "../tools/meta.ts";
 import { buildObservabilityTools } from "../tools/observability.ts";
 import { buildInboxTools } from "../tools/inbox.ts";
 import { buildToolResultTools } from "../tools/tool-results.ts";
+import { buildModelTools } from "../tools/model.ts";
+import { buildReasoningTools } from "../tools/reasoning.ts";
 import { createToolResultStore } from "../store/tool-results.ts";
 import { checkCoreInvariants, formatFailures } from "../boot/invariants.ts";
 import { startChatHealthMonitor, type ChatHealthMonitor } from "./chat-health.ts";
@@ -23,6 +25,8 @@ import { installFaultIsolation, type FaultIsolation } from "./fault-isolation.ts
 import {
   buildMemoryTools,
   loadIdentity,
+  resolveBootModel,
+  resolveReasoningEffort,
   startMemoryProjector,
   type MemoryProjector,
 } from "../memory/index.ts";
@@ -249,6 +253,8 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         ownerAgentId: humanAgentId,
         threadsDir: paths.threadsDir,
         hostContext: buildHostContextPrompt(paths, hostId),
+        resolveModel: (agentId) => resolveBootModel(store, agentId),
+        resolveEffort: (agentId, model) => resolveReasoningEffort(store, agentId, model),
         toolTruncate,
       });
       const coreTools = [
@@ -262,6 +268,28 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
           paths,
         }),
         ...buildMemoryTools({ bus, store, hostId }),
+        // Self-modification of the model the agent thinks with. Writes a
+        // private thinking-model memory; resolveThinkingModel reads it back
+        // at loop start (see `model:` on startAgentLoop below).
+        ...buildModelTools({
+          bus,
+          store,
+          hostId,
+          // Smoke-test a candidate model with a 1-token call before the
+          // switch commits — see set_thinking_model. Invalid/unserved
+          // models throw here and the switch is rejected.
+          probe: async (model) => {
+            await llm.complete({
+              model,
+              messages: [{ role: "user", content: "ok" }],
+              maxTokens: 1,
+            });
+          },
+        }),
+        // Self-modification of how hard the agent thinks. Writes a private
+        // reasoning-effort memory; resolveReasoningEffort reads it back at
+        // loop start (see `effort:` on startAgentLoop below).
+        ...buildReasoningTools({ bus, store, hostId }),
         // World legibility — agents read their own ledger, runs, threads,
         // budget, and self-state through these. Same query layer the CLI
         // uses (no privileged human read surface).
@@ -322,6 +350,12 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       // Children inherit the same tool set so they can themselves spawn,
       // read extension files, etc. Scope still gates what they get to use.
       localManager.setCoreTools(coreTools);
+      if (process.env.OLLE_MODEL && !opts.quiet) {
+        const resolved = resolveBootModel(store, rootLoopAgentId);
+        console.log(
+          `olle: OLLE_MODEL=${process.env.OLLE_MODEL} rescue override → boot model ${resolved ?? "(host default)"}`,
+        );
+      }
       localChat = startAgentLoop({
         bus,
         store,
@@ -335,6 +369,17 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         ownerAgentId: humanAgentId,
         threadsDir: paths.threadsDir,
         toolTruncate,
+        // The agent's self-chosen model + effort (private memories), resolved
+        // per-thread at thread creation rather than once at loop start, so a
+        // `set_thinking_model` / `set_reasoning_effort` switch applies on the
+        // next NEW thread without a daemon restart; active threads keep what
+        // they started with. The `OLLE_MODEL` env override (rescue hatch)
+        // takes precedence — see resolveBootModel.
+        resolveModel: () => resolveBootModel(store, rootLoopAgentId),
+        resolveEffort: () => {
+          const model = resolveBootModel(store, rootLoopAgentId) ?? llm.defaultModel;
+          return resolveReasoningEffort(store, rootLoopAgentId, model);
+        },
         // Boot prompt branches on whether identity has been seeded yet
         // (LOG 2026-04-28). Resolve at turn-time, not daemon-start-time:
         // fresh installs can seed identity during the first conversation,

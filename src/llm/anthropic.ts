@@ -131,15 +131,27 @@ async function runStream(
   client: Anthropic,
   req: CompletionRequest,
 ): Promise<Anthropic.Messages.Message> {
+  // Built as a loose object so the conditional `thinking`/`output_config`
+  // fields are easy to attach; cast once to the SDK param type at the call.
+  // Both are GA on the request surface (no beta header).
+  const params: Record<string, unknown> = {
+    model: req.model,
+    max_tokens: req.maxTokens,
+    system: buildSystem(req.system),
+    messages: buildMessages(req.messages),
+  };
+  if (req.tools?.length) params.tools = buildTools(req.tools);
+  if (req.effort) {
+    // Reasoning effort ⇒ adaptive thinking + effort dial. Opus 4.7/4.8
+    // reject temperature/top_p/top_k, so we never send sampling params
+    // alongside effort.
+    params.thinking = { type: "adaptive" };
+    params.output_config = { effort: req.effort };
+  } else if (req.temperature !== undefined) {
+    params.temperature = req.temperature;
+  }
   const stream = client.messages.stream(
-    {
-      model: req.model,
-      max_tokens: req.maxTokens,
-      temperature: req.temperature,
-      system: buildSystem(req.system),
-      messages: buildMessages(req.messages),
-      tools: req.tools?.length ? buildTools(req.tools) : undefined,
-    } as Anthropic.Messages.MessageCreateParamsStreaming,
+    params as unknown as Anthropic.Messages.MessageCreateParamsStreaming,
     req.signal ? { signal: req.signal } : undefined,
   );
   if (req.onTextDelta) {
@@ -252,6 +264,12 @@ function toAnthropicMessage(m: Message): Anthropic.Messages.MessageParam {
       : (m.content.map((b) => {
           if (b.type === "text") return { type: "text" as const, text: b.text };
           if (b.type === "tool_use") return { type: "tool_use" as const, id: b.id, name: b.name, input: b.input };
+          // Echo thinking blocks back verbatim — the API matches the
+          // signature against the assistant turn it accompanies.
+          if (b.type === "thinking")
+            return { type: "thinking" as const, thinking: b.thinking, signature: b.signature };
+          if (b.type === "redacted_thinking")
+            return { type: "redacted_thinking" as const, data: b.data };
           return {
             type: "tool_result" as const,
             tool_use_id: b.tool_use_id,
@@ -271,7 +289,13 @@ function fromAnthropicBlock(b: Anthropic.Messages.ContentBlock): ContentBlock {
       name: b.name,
       input: b.input as Record<string, unknown>,
     };
-  // thinking blocks etc — represent as text for v0
+  // Preserve thinking blocks verbatim (text + signature). The signature is
+  // load-bearing: the API requires it echoed back on the next turn, so we
+  // must keep the block intact rather than flatten it to text.
+  if (b.type === "thinking")
+    return { type: "thinking", thinking: b.thinking, signature: b.signature };
+  if (b.type === "redacted_thinking") return { type: "redacted_thinking", data: b.data };
+  // Unknown future block types — represent as text so the loop keeps moving.
   return { type: "text", text: JSON.stringify(b) };
 }
 
