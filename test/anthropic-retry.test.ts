@@ -13,7 +13,7 @@ import { createAnthropicAdapter } from "../src/llm/anthropic.ts";
 import type { CompletionRequest, RetryInfo } from "../src/llm/types.ts";
 
 function makeApiError(status: number, message = "boom"): InstanceType<typeof Anthropic.APIError> {
-  return new Anthropic.APIError(status, undefined, message, {});
+  return new Anthropic.APIError(status, undefined, message, new Headers());
 }
 
 /**
