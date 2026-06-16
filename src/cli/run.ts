@@ -358,7 +358,7 @@ async function cmdStatus(args: string[]): Promise<void> {
         const age = fmtAge(now - t.lastEventAt);
         const turns = `${t.turns} ${t.turns === 1 ? "turn" : "turns"}`;
         console.log(
-          `    ${threadSnippet(t.firstUserText).padEnd(40)} ${color(ANSI.muted, `${turns} · ${t.events} ev · ${age}`)}`,
+          `    ${threadSnippet(t.firstUserText).padEnd(40)} ${color(ANSI.muted, `${turns} · ${age}`)}`,
         );
       }
     }
