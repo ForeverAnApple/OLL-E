@@ -28,7 +28,7 @@ import type { Event } from "../bus/types.ts";
 import type { Store } from "../store/db.ts";
 import type { Ledger } from "../ledger/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
-import type { Llm, Message, SystemSegment } from "../llm/index.ts";
+import type { Llm, Message, ReasoningEffort, SystemSegment } from "../llm/index.ts";
 import type { ToolDef } from "../extensions/types.ts";
 import { askUp, type Inbox } from "../inbox/index.ts";
 import { checkTool } from "../permissions/index.ts";
@@ -68,8 +68,22 @@ export interface AgentLoopOptions {
   /** Inbox used when a tool call is denied by scope — we auto-propose a
    *  grant_scope via askUp. */
   inbox?: Inbox;
-  /** Model override. */
+  /** Static model override — used as the fallback when `resolveModel` is
+   *  absent (child loops, tests). Prefer `resolveModel` for the live,
+   *  per-thread path. */
   model?: string;
+  /** Static reasoning-effort fallback — see `resolveEffort`. */
+  effort?: ReasoningEffort;
+  /** Live model resolver, called once per thread when that thread is first
+   *  created, and frozen onto the thread for its life. This is what makes a
+   *  `set_thinking_model` switch apply without a daemon restart: active
+   *  threads keep the model they started with (cache stays warm, no
+   *  mid-conversation swap), and the next NEW thread resolves the freshly
+   *  written preference. Falls back to `model` when omitted. */
+  resolveModel?: () => string | undefined;
+  /** Live reasoning-effort resolver — same per-thread-freeze semantics as
+   *  `resolveModel`. Falls back to `effort` when omitted. */
+  resolveEffort?: () => ReasoningEffort | undefined;
   /** Root directory for per-thread message snapshots. Per agent, per
    *  thread. Omit to disable persistence. */
   threadsDir?: string;
@@ -126,6 +140,13 @@ interface Thread {
    *  own HWM does not ack the resolution for the user-facing chat thread.
    *  Initialized to the loop's start time on first touch; restart resets. */
   mailHwm: number;
+  /** Model + reasoning-effort frozen at thread creation. A live
+   *  `set_thinking_model` / `set_reasoning_effort` switch is picked up by the
+   *  next NEW thread; this thread keeps what it started with for its whole
+   *  life (no mid-conversation model swap, prompt cache stays warm). Per-
+   *  thread runtime state, re-resolved on restart. */
+  model?: string;
+  effort?: ReasoningEffort;
 }
 
 export interface AgentLoop {
@@ -183,6 +204,10 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
       loadedTools: new Set<string>(),
       truncationState: createTruncationState(),
       mailHwm: loopStartMs,
+      // Freeze model + effort at thread birth. New threads created after a
+      // self-switch resolve the new values; existing threads are untouched.
+      model: opts.resolveModel ? opts.resolveModel() : opts.model,
+      effort: opts.resolveEffort ? opts.resolveEffort() : opts.effort,
     };
     threads.set(id, t);
     return t;
@@ -401,7 +426,8 @@ async function runTurn(
     }
     const result = await runAgent({
       llm: opts.llm,
-      model: opts.model,
+      model: thread.model,
+      effort: thread.effort,
       system: systemSegments,
       getTools,
       isLoaded: (name) => thread.loadedTools.has(name),
@@ -557,7 +583,7 @@ async function runTurn(
         threadId: thread.id,
         ownerAgentId: opts.ownerAgentId,
         provider: opts.llm.provider,
-        model: opts.model ?? opts.llm.defaultModel,
+        model: thread.model ?? opts.llm.defaultModel,
         inputTokens: result.totalUsage.inputTokens,
         outputTokens: result.totalUsage.outputTokens,
         cacheReadTokens: result.totalUsage.cacheReadInputTokens,
@@ -578,7 +604,7 @@ async function runTurn(
       durable: true,
       payload: {
         stopReason: result.stopReason,
-        model: opts.model ?? opts.llm.defaultModel,
+        model: thread.model ?? opts.llm.defaultModel,
         inputTokens: result.totalUsage.inputTokens,
         outputTokens: result.totalUsage.outputTokens,
         cacheReadTokens: result.totalUsage.cacheReadInputTokens,

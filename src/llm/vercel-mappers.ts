@@ -132,6 +132,21 @@ function toAssistantMessage(m: Message): ModelMessage {
         input: b.input,
       };
       parts.push(call);
+    } else if (b.type === "thinking") {
+      // Echo the thinking block back with its signature so Anthropic
+      // accepts the next (tool-use) turn. The provider reads the signature
+      // from providerOptions.anthropic and re-emits the wire `thinking` block.
+      parts.push({
+        type: "reasoning",
+        text: b.thinking,
+        providerOptions: { anthropic: { signature: b.signature } },
+      });
+    } else if (b.type === "redacted_thinking") {
+      parts.push({
+        type: "reasoning",
+        text: "",
+        providerOptions: { anthropic: { redactedData: b.data } },
+      });
     }
   }
   return { role: "assistant", content: parts };
@@ -152,6 +167,20 @@ export function contentPartsToBlocks(
         name: p.toolName,
         input: parseToolInput(p.input),
       });
+    } else if (p.type === "reasoning") {
+      // Extended-thinking output. The Anthropic provider carries the
+      // signature (or redacted blob) in providerMetadata.anthropic; we
+      // preserve it on OLL-E's block so the next turn can echo it back
+      // verbatim — a tool-use turn 400s otherwise (every OLL-E turn is one).
+      const meta = (p.providerMetadata?.anthropic ?? {}) as {
+        signature?: string;
+        redactedData?: string;
+      };
+      if (meta.redactedData != null) {
+        out.push({ type: "redacted_thinking", data: meta.redactedData });
+      } else {
+        out.push({ type: "thinking", thinking: p.text, signature: meta.signature ?? "" });
+      }
     }
   }
   return out;

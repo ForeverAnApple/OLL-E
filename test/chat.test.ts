@@ -228,6 +228,58 @@ describe("agent loop over the mailbox", () => {
     expect(secondSystem).toContain("I am OLL-E.");
   });
 
+  it("freezes the model per thread — active threads keep it, new threads pick up a switch", async () => {
+    const r = rig();
+    const requests: CompletionRequest[] = [];
+    const llm: Llm = {
+      provider: "mock",
+      defaultModel: "mock-1",
+      async complete(req) {
+        requests.push(req);
+        return endTurn("ok");
+      },
+    };
+    let current: string | undefined = "model-A";
+    startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      // Live resolver — what set_thinking_model drives in production.
+      resolveModel: () => current,
+    });
+
+    async function send(threadId: string, text: string): Promise<void> {
+      const done = new Promise<void>((resolve) => {
+        const unsub = r.bus.subscribe("chat.turn-end", () => {
+          unsub();
+          resolve();
+        });
+      });
+      r.bus.publish({
+        type: "chat.input",
+        hostId: r.hostId,
+        actorId: "cli",
+        durable: true,
+        toAgentId: r.agentId,
+        threadId,
+        payload: { text },
+      });
+      await done;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    await send("tA", "1"); // thread A born while resolver says model-A
+    current = "model-B"; // self-switch lands (no restart)
+    await send("tA", "2"); // same thread → frozen on model-A
+    await send("tB", "1"); // brand-new thread → picks up model-B
+
+    expect(requests[0]!.model).toBe("model-A");
+    expect(requests[1]!.model).toBe("model-A"); // active thread unchanged
+    expect(requests[2]!.model).toBe("model-B"); // new thread takes the switch
+  });
+
   it("ignores chat.input that isn't addressed to this agent's mailbox", async () => {
     const r = rig();
     const llm = mockLlm([endTurn("should not fire")]);

@@ -33,6 +33,23 @@ function mockLlm(script: Completion[]): Llm {
   };
 }
 
+function captureLlm(script: Completion[]): { llm: Llm; requests: CompletionRequest[] } {
+  const requests: CompletionRequest[] = [];
+  return {
+    requests,
+    llm: {
+      provider: "mock",
+      defaultModel: "mock-default",
+      async complete(req: CompletionRequest): Promise<Completion> {
+        requests.push(req);
+        const c = script.shift();
+        if (!c) throw new Error("mockLlm exhausted");
+        return c;
+      },
+    },
+  };
+}
+
 function rig(parentScope?: Record<string, unknown>) {
   const store = openStore({ path: ":memory:" });
   const hostId = ulid();
@@ -128,6 +145,37 @@ describe("agent manager — spawn", () => {
     });
     const ev = await spawnSeen;
     expect((ev.payload as { childId: string }).childId).toBe(result.agentId);
+    mgr.shutdown();
+  });
+
+  it("applies child self-config resolvers when the child thread starts", async () => {
+    const r = rig();
+    const { llm, requests } = captureLlm([endTurn("ack")]);
+    const mgr = createAgentManager({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      resolveModel: (agentId) => `model-for-${agentId}`,
+      resolveEffort: (agentId, model) =>
+        model === `model-for-${agentId}` ? "high" : undefined,
+    });
+    const done = new Promise<void>((resolve) => {
+      const unsub = r.bus.subscribe("chat.turn-end", () => {
+        unsub();
+        resolve();
+      });
+    });
+
+    const result = await mgr.spawn({
+      name: "worker",
+      mission: "m",
+      parentAgentId: r.parentId,
+    });
+    await done;
+
+    expect(requests[0]!.model).toBe(`model-for-${result.agentId}`);
+    expect(requests[0]!.effort).toBe("high");
     mgr.shutdown();
   });
 });

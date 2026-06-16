@@ -192,7 +192,7 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
     shortClause: "your identity, scope, and tools",
     alwaysLoaded: true,
     description:
-      "Read your own identity surface: name, parent, system prompt, scope (allowed tools/tiers), principle count, registered tools, and which models you've recently used. Use this to introspect before self-modifying — knowing your own current state beats guessing.",
+      "Read your own identity surface: name, parent, system prompt, scope (allowed tools/tiers), principle count, registered tools, and your thinking config. The authoritative answer to \"what model am I thinking with?\" is `thinkingModel` (and `reasoningEffort`) — the model you're configured to use; `thinkingModelIsDefault` says whether that's the host default or your own choice. Do NOT read `recentlyPricedModels` for that — it's ledger spend history (what you've recently been billed for), which lags a just-made switch. Use this to introspect before self-modifying — knowing your own current state beats guessing.",
     inputSchema: {
       type: "object",
       properties: {

@@ -17,6 +17,8 @@ import type { Store } from "../store/db.ts";
 import { tables } from "../store/index.ts";
 import type { AgentScope } from "../store/schema.ts";
 import { hasPostedPrice, lookupPrice, priceTokens } from "../llm/pricing.ts";
+import { ANTHROPIC_DEFAULT_MODEL } from "../llm/index.ts";
+import { resolveBootModel, resolveReasoningEffort } from "../memory/index.ts";
 
 // -------- usageStats --------
 
@@ -426,6 +428,16 @@ export interface AgentSelf {
    *  price recently; helps the agent know if its USD numbers are real
    *  or fallback. */
   recentlyPricedModels: Array<{ provider: string; model: string; pricePosted: boolean }>;
+  /** The model this agent thinks in — its self-chosen `role=thinking-model`
+   *  memory, or the host default when it hasn't chosen. Reports the
+   *  configured choice, not whatever the ledger last billed. */
+  thinkingModel: string;
+  /** True when no explicit choice is set and `thinkingModel` is the host
+   *  default rather than a deliberate selection. */
+  thinkingModelIsDefault: boolean;
+  /** How hard this agent thinks — its `role=reasoning-effort` memory, or
+   *  "off" when unset. */
+  reasoningEffort: string;
 }
 
 export function agentSelf(store: Store, agentId: string): AgentSelf | null {
@@ -479,6 +491,13 @@ export function agentSelf(store: Store, agentId: string): AgentSelf | null {
     });
   }
 
+  // The agent's self-chosen model + effort (private memories), reported as
+  // the configured choice rather than ledger history. Absent choice → host
+  // default model / "off" effort.
+  const chosenModel = resolveBootModel(store, agentId);
+  const thinkingModel = chosenModel ?? ANTHROPIC_DEFAULT_MODEL;
+  const reasoningEffort = resolveReasoningEffort(store, agentId, thinkingModel) ?? "off";
+
   return {
     agentId: a.id,
     name: a.name,
@@ -490,6 +509,9 @@ export function agentSelf(store: Store, agentId: string): AgentSelf | null {
     principleCount,
     tools: toolRows.map((t) => ({ name: t.name, extensionId: t.extensionId })),
     recentlyPricedModels,
+    thinkingModel,
+    thinkingModelIsDefault: chosenModel === undefined,
+    reasoningEffort,
   };
 }
 

@@ -98,13 +98,21 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
         model = sharedProvider!.chat(req.model);
       }
 
+      // Reasoning effort ⇒ adaptive thinking + effort dial, carried via the
+      // AI SDK's Anthropic providerOptions. Opus 4.7/4.8 reject sampling
+      // params when effort is set, so we drop temperature in that case.
+      const effortOptions = req.effort
+        ? { anthropic: { thinking: { type: "adaptive" as const }, effort: req.effort } }
+        : undefined;
+
       const result = streamText({
         model,
         system: buildSystem(req.system),
         messages: buildMessages(req.messages),
         tools: buildTools(req.tools),
         maxOutputTokens: req.maxTokens,
-        ...(req.temperature !== undefined && { temperature: req.temperature }),
+        ...(!req.effort && req.temperature !== undefined && { temperature: req.temperature }),
+        ...(effortOptions && { providerOptions: effortOptions }),
         maxRetries,
         ...(req.signal && { abortSignal: req.signal }),
         ...(req.onTextDelta && {

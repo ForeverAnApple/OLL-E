@@ -13,7 +13,7 @@ import type { EventBus } from "../bus/index.ts";
 import type { Store } from "../store/db.ts";
 import type { Ledger } from "../ledger/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
-import type { Llm } from "../llm/index.ts";
+import type { Llm, ReasoningEffort } from "../llm/index.ts";
 import type { Inbox } from "../inbox/index.ts";
 import type { ToolDef } from "../extensions/types.ts";
 import type { AgentScope } from "../store/schema.ts";
@@ -43,6 +43,14 @@ export interface AgentManagerDeps {
   /** Default model the manager starts children with. Omit to use the
    *  llm adapter's defaultModel. */
   model?: string;
+  /** Static reasoning-effort fallback. Prefer resolveEffort for live,
+   *  per-agent self-configuration. */
+  effort?: ReasoningEffort;
+  /** Resolve the model for an agent when a new thread starts. */
+  resolveModel?: (agentId: string) => string | undefined;
+  /** Resolve the reasoning effort for an agent when a new thread starts.
+   *  The model argument is the model the same thread will use. */
+  resolveEffort?: (agentId: string, model: string) => ReasoningEffort | undefined;
   /** Stable host coordinates injected into default child prompts. */
   hostContext?: string;
   /** Tool-result truncation hooks shared with every child loop, so a
@@ -192,6 +200,13 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
     });
 
     const threadId = opts.threadId ?? ulid();
+    const resolveChildModel = () =>
+      deps.resolveModel ? deps.resolveModel(childId) : deps.model;
+    const resolveChildEffort = () => {
+      if (!deps.resolveEffort) return deps.effort;
+      const model = resolveChildModel() ?? deps.llm.defaultModel;
+      return deps.resolveEffort(childId, model);
+    };
 
     const loop = startAgentLoop({
       bus: deps.bus,
@@ -206,6 +221,9 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
       ownerAgentId: deps.ownerAgentId,
       threadsDir: deps.threadsDir,
       model: deps.model,
+      effort: deps.effort,
+      resolveModel: resolveChildModel,
+      resolveEffort: resolveChildEffort,
       toolTruncate: deps.toolTruncate,
       system:
         opts.systemPrompt ??

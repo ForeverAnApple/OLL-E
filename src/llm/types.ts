@@ -19,8 +19,32 @@ export interface ToolResultBlock {
   content: string;
   is_error?: boolean;
 }
+/** Extended-thinking block. Carries the model's reasoning text (empty when
+ *  display is omitted) plus a `signature` the API requires echoed back
+ *  verbatim on the next turn — drop it and a tool-use turn 400s. */
+export interface ThinkingBlock {
+  type: "thinking";
+  thinking: string;
+  signature: string;
+}
+/** Encrypted thinking the API redacted. Opaque to us; must also be echoed
+ *  back verbatim across tool-use turns. */
+export interface RedactedThinkingBlock {
+  type: "redacted_thinking";
+  data: string;
+}
 
-export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock;
+export type ContentBlock =
+  | TextBlock
+  | ToolUseBlock
+  | ToolResultBlock
+  | ThinkingBlock
+  | RedactedThinkingBlock;
+
+/** Reasoning-effort level. Maps to Anthropic's `output_config.effort`
+ *  (GA on Opus 4.5+/Sonnet 4.6); paired with adaptive thinking when set.
+ *  `xhigh` is Opus 4.7+, `max` is Opus-tier only. */
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface Message {
   role: Role;
@@ -63,6 +87,12 @@ export interface CompletionRequest {
   messages: Message[];
   tools?: ToolSpec[];
   maxTokens: number;
+  /** Reasoning effort. When set, the Anthropic adapter enables adaptive
+   *  thinking and sends `output_config.effort`. undefined = no thinking
+   *  (the historical default). Mutually exclusive with `temperature` on
+   *  Opus 4.7/4.8, which reject sampling params — the adapter drops
+   *  temperature when effort is set. */
+  effort?: ReasoningEffort;
   temperature?: number;
   /** Fired by the adapter when a transient failure (overload, rate limit,
    *  5xx) triggered the SDK's retry. Fires once per retry attempt at the

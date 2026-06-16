@@ -14,4 +14,17 @@ export {
   type RouterAdapters,
   type RouterOptions,
 } from "./router.ts";
-export { priceTokens, lookupPrice, hasPostedPrice, type ModelPrice, type PricedUsage } from "./pricing.ts";
+export {
+  priceTokens,
+  lookupPrice,
+  hasPostedPrice,
+  postedModels,
+  type ModelPrice,
+  type PricedUsage,
+} from "./pricing.ts";
+export {
+  supportedEfforts,
+  supportsEffort,
+  clampEffort,
+  maxOutputTokens,
+} from "./models.ts";
