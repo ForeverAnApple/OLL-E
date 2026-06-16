@@ -298,6 +298,13 @@ export interface ThreadInventoryRow {
   /** Number of completed turns (chat.turn-end events) on this thread —
    *  the human-meaningful "how long is this conversation" count. */
   turns: number;
+  /** Prompt size of the MOST RECENT turn (input + cache read + cache
+   *  creation tokens) — the full context the model last had to read, i.e.
+   *  "how much information is in this conversation right now". NOT a sum
+   *  across turns: each turn re-sends the whole history, so summing would
+   *  inflate quadratically and measure re-reading, not size. 0 if no turn
+   *  completed in the scan window. */
+  contextTokens: number;
   lastHlc: string;
   lastEventAt: number;
   lastType: string;
@@ -352,6 +359,7 @@ export function threadInventory(
       toAgentId: string | null;
       events: number;
       turns: number;
+      contextTokens: number;
       lastHlc: string;
       lastEventAt: number;
       lastType: string;
@@ -370,6 +378,7 @@ export function threadInventory(
         toAgentId: r.toAgentId,
         events: 0,
         turns: 0,
+        contextTokens: 0,
         lastHlc: r.hlc,
         lastEventAt: r.createdAt,
         lastType: r.type,
@@ -382,6 +391,14 @@ export function threadInventory(
     g.events += 1;
     if (r.type === "chat.turn-end") {
       const p = r.payload;
+      // Rows are HLC-descending, so the first turn-end we see (turns still 0)
+      // is the MOST RECENT — snapshot its prompt size as the live context.
+      if (g.turns === 0) {
+        g.contextTokens =
+          numField(p, "inputTokens") +
+          numField(p, "cacheReadTokens") +
+          numField(p, "cacheCreationTokens");
+      }
       g.turns += 1;
       g.cacheRead += numField(p, "cacheReadTokens");
       g.input += numField(p, "inputTokens");
@@ -405,6 +422,7 @@ export function threadInventory(
       toAgentId: g.toAgentId,
       events: g.events,
       turns: g.turns,
+      contextTokens: g.contextTokens,
       lastHlc: g.lastHlc,
       lastEventAt: g.lastEventAt,
       lastType: g.lastType,

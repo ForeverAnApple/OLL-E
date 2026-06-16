@@ -211,6 +211,14 @@ async function cmdStatus(args: string[]): Promise<void> {
       const principles = `${self.principleCount} ${self.principleCount === 1 ? "principle" : "principles"}`;
       const tools = `${self.tools.length} ext ${self.tools.length === 1 ? "tool" : "tools"}`;
       console.log(`  ${label("        ")}${principles}  ${tools}`);
+      // The model the agent thinks in (its own choice, or the host default)
+      // plus its reasoning effort when it's running thinking on.
+      const modelTag = self.thinkingModelIsDefault ? color(ANSI.muted, " (default)") : "";
+      const effortTag =
+        self.reasoningEffort && self.reasoningEffort !== "off"
+          ? `  ${color(ANSI.muted, `effort: ${self.reasoningEffort}`)}`
+          : "";
+      console.log(`  ${label("model")}   ${self.thinkingModel}${modelTag}${effortTag}`);
     }
 
     // ─── teams ─────────────────────────────────────────────────────────
@@ -353,12 +361,16 @@ async function cmdStatus(args: string[]): Promise<void> {
         `  ${label("active")}      ${recentlyActive} ${color(ANSI.muted, `in last hour (of ${threads.length} recent)`)}`,
       );
       // Lead with the conversation's opening line — what a human recognizes
-      // the thread by — then the machine detail (turns, events, age).
+      // the thread by — then its current context size (the last turn's prompt
+      // tokens = how much information is in the conversation now) and age.
       for (const t of threads.slice(0, 5)) {
         const age = fmtAge(now - t.lastEventAt);
-        const turns = `${t.turns} ${t.turns === 1 ? "turn" : "turns"}`;
+        const size =
+          t.contextTokens > 0
+            ? `${formatTokens(t.contextTokens)} tokens`
+            : label("(no turns yet)");
         console.log(
-          `    ${threadSnippet(t.firstUserText).padEnd(40)} ${color(ANSI.muted, `${turns} · ${age}`)}`,
+          `    ${threadSnippet(t.firstUserText).padEnd(40)} ${color(ANSI.muted, `${size} · ${age}`)}`,
         );
       }
     }

@@ -282,6 +282,36 @@ describe("observability.threadInventory + recentEvents", () => {
     expect(t1.turns).toBe(2); // two chat.turn-end
   });
 
+  it("contextTokens = most recent turn's prompt size, not a sum across turns", () => {
+    const { store, bus, hostId } = rig();
+    const agentId = "agent-ctx";
+    const turn = (input: number, cacheRead: number) =>
+      bus.publish({
+        type: "chat.turn-end",
+        hostId,
+        actorId: agentId,
+        threadId: "t1",
+        toAgentId: agentId,
+        durable: true,
+        payload: {
+          stopReason: "end_turn",
+          inputTokens: input,
+          outputTokens: 5,
+          cacheReadTokens: cacheRead,
+          cacheCreationTokens: 0,
+          totalTokens: input + cacheRead + 5,
+        },
+      });
+
+    turn(1000, 0); // older, smaller turn
+    turn(4000, 8000); // most recent: 4000 input + 8000 cache read = 12000 context
+
+    const t1 = threadInventory(store, { toAgentId: agentId }).find((r) => r.threadId === "t1")!;
+    expect(t1.turns).toBe(2);
+    // Latest turn's prompt size — NOT 1000+4000+8000 (that would be summing).
+    expect(t1.contextTokens).toBe(12000);
+  });
+
   // Regression: chat.ts emits chat.usage with durable:false (it's a live
   // per-call stream for subscribers, not a persisted record). Earlier
   // threadInventory keyed on chat.usage and so always reported a ratio
