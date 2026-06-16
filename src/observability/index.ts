@@ -295,9 +295,15 @@ export interface ThreadInventoryRow {
    *  get retargeted mid-conversation. */
   toAgentId: string | null;
   events: number;
+  /** Number of completed turns (chat.turn-end events) on this thread —
+   *  the human-meaningful "how long is this conversation" count. */
+  turns: number;
   lastHlc: string;
   lastEventAt: number;
   lastType: string;
+  /** First (oldest) real user message on the thread, for the status snippet
+   *  label. Null when the thread has no user text in the scan window. */
+  firstUserText: string | null;
   /** Latest cache-hit ratio computed from any chat.turn-end events seen
    *  on this thread within the scan window. 0 when none observed.
    *  chat.turn-end is the durable per-turn record; chat.usage is the
@@ -345,9 +351,11 @@ export function threadInventory(
       threadId: string;
       toAgentId: string | null;
       events: number;
+      turns: number;
       lastHlc: string;
       lastEventAt: number;
       lastType: string;
+      firstUserText: string | null;
       cacheRead: number;
       input: number;
     }
@@ -361,9 +369,11 @@ export function threadInventory(
         threadId: tid,
         toAgentId: r.toAgentId,
         events: 0,
+        turns: 0,
         lastHlc: r.hlc,
         lastEventAt: r.createdAt,
         lastType: r.type,
+        firstUserText: null,
         cacheRead: 0,
         input: 0,
       };
@@ -372,8 +382,19 @@ export function threadInventory(
     g.events += 1;
     if (r.type === "chat.turn-end") {
       const p = r.payload;
+      g.turns += 1;
       g.cacheRead += numField(p, "cacheReadTokens");
       g.input += numField(p, "inputTokens");
+    }
+    // Rows arrive HLC-descending, so overwriting on every real user message
+    // leaves firstUserText holding the OLDEST one — the conversation opener,
+    // which is what the status snippet shows. Skip synthetic mail-wake inputs.
+    if (r.type === "chat.input") {
+      const p = r.payload;
+      if (!boolField(p, "mailWake")) {
+        const txt = strField(p, "text");
+        if (txt) g.firstUserText = txt;
+      }
     }
   }
 
@@ -383,9 +404,11 @@ export function threadInventory(
       threadId: g.threadId,
       toAgentId: g.toAgentId,
       events: g.events,
+      turns: g.turns,
       lastHlc: g.lastHlc,
       lastEventAt: g.lastEventAt,
       lastType: g.lastType,
+      firstUserText: g.firstUserText,
       cacheHitRatio: cacheHitRatio(g.input, g.cacheRead),
     });
   }
@@ -397,6 +420,15 @@ export function threadInventory(
 function numField(p: Record<string, unknown>, k: string): number {
   const v = p[k];
   return typeof v === "number" ? v : 0;
+}
+
+function strField(p: Record<string, unknown>, k: string): string | null {
+  const v = p[k];
+  return typeof v === "string" ? v : null;
+}
+
+function boolField(p: Record<string, unknown>, k: string): boolean {
+  return p[k] === true;
 }
 
 // -------- agentSelf --------

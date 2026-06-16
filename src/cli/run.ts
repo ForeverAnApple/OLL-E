@@ -127,10 +127,10 @@ async function cmdRun(): Promise<void> {
 async function cmdStatus(args: string[]): Promise<void> {
   // Dashboard: composes the same observability/inbox/extension IPC calls
   // an agent reaches through its tool surface — no privileged human read
-  // path (AGENTS.md vision-check). Default window is 24h; --since lets a
+  // path (AGENTS.md vision-check). Default window is 7d; --since lets a
   // human ask the same question over a different slice.
   const sinceArg = parseFlagValue(args, "--since");
-  const sinceMs = sinceArg ? parseSinceArg(sinceArg) : Date.now() - 24 * 3_600_000;
+  const sinceMs = sinceArg ? parseSinceArg(sinceArg) : Date.now() - 7 * 86_400_000;
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
     // All independent reads in flight at once. Each tolerates failure so
@@ -352,11 +352,13 @@ async function cmdStatus(args: string[]): Promise<void> {
       console.log(
         `  ${label("active")}      ${recentlyActive} ${color(ANSI.muted, `in last hour (of ${threads.length} recent)`)}`,
       );
+      // Lead with the conversation's opening line — what a human recognizes
+      // the thread by — then the machine detail (turns, events, age).
       for (const t of threads.slice(0, 5)) {
         const age = fmtAge(now - t.lastEventAt);
-        const tid = t.threadId.length > 22 ? `${t.threadId.slice(0, 19)}...` : t.threadId;
+        const turns = `${t.turns} ${t.turns === 1 ? "turn" : "turns"}`;
         console.log(
-          `    ${color(ANSI.muted, tid.padEnd(22))} ${t.lastType.padEnd(20)} ${color(ANSI.muted, `${t.events} ev`)}  ${color(ANSI.muted, age)}`,
+          `    ${threadSnippet(t.firstUserText).padEnd(40)} ${color(ANSI.muted, `${turns} · ${t.events} ev · ${age}`)}`,
         );
       }
     }
@@ -1070,6 +1072,14 @@ function fmtAge(ms: number): string {
   if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
   if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
   return `${Math.round(ms / 86_400_000)}d`;
+}
+
+/** The opening line of a thread's conversation, normalized for the status
+ *  dashboard — what a human recognizes the thread by, in place of an opaque id. */
+function threadSnippet(firstUserText: string | null): string {
+  const raw = (firstUserText ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return "(no messages yet)";
+  return raw.length > 38 ? `${raw.slice(0, 37)}…` : raw;
 }
 
 type InboxVote = "approve" | "deny" | "modify";

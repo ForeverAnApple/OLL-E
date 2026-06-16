@@ -239,9 +239,47 @@ describe("observability.threadInventory + recentEvents", () => {
     // 900 / (900 + 100) = 0.9
     expect(t1.cacheHitRatio).toBeCloseTo(0.9, 5);
     expect(t2.cacheHitRatio).toBe(0);
+    // One completed turn each; no user text yet.
+    expect(t1.turns).toBe(1);
+    expect(t1.firstUserText).toBeNull();
 
     const recent = recentEvents(store, { threadId: "t1" });
     expect(recent.length).toBe(1);
+  });
+
+  it("snippet = oldest real user message; counts turns; skips mail-wake inputs", () => {
+    const { store, bus, hostId } = rig();
+    const agentId = "agent-snip";
+    const turn = () =>
+      bus.publish({
+        type: "chat.turn-end",
+        hostId,
+        actorId: agentId,
+        threadId: "t1",
+        toAgentId: agentId,
+        durable: true,
+        payload: { stopReason: "end_turn", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 2 },
+      });
+    const userMsg = (text: string, extra: Record<string, unknown> = {}) =>
+      bus.publish({
+        type: "chat.input",
+        hostId,
+        actorId: "cli",
+        threadId: "t1",
+        toAgentId: agentId,
+        durable: true,
+        payload: { text, ...extra },
+      });
+
+    userMsg("hi");
+    turn();
+    userMsg("help me debug the auth flow");
+    turn();
+    userMsg("keep going", { mailWake: true }); // synthetic wake — must be ignored
+
+    const t1 = threadInventory(store, { toAgentId: agentId }).find((r) => r.threadId === "t1")!;
+    expect(t1.firstUserText).toBe("hi"); // oldest real user message
+    expect(t1.turns).toBe(2); // two chat.turn-end
   });
 
   // Regression: chat.ts emits chat.usage with durable:false (it's a live
