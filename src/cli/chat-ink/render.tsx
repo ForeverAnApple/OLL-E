@@ -39,6 +39,12 @@ export async function runInkChat(): Promise<void> {
     .catch(() => null);
   const agentName =
     self?.displayName?.trim() || self?.name?.trim() || "agent";
+  // The header must show the model the agent actually THINKS in — its
+  // thinking-model memory (what `olle status` reports and what turns are
+  // billed on), not the host default from `model.get`. The two differ
+  // whenever the agent has run set_thinking_model. Fall back to model.get
+  // only when self is unavailable.
+  const headerModel = self?.thinkingModel?.trim() || initialModel;
   const initialThreadId = mintThreadId();
 
   const app = render(
@@ -48,7 +54,7 @@ export async function runInkChat(): Promise<void> {
       agentId={rootAgentId}
       agentName={agentName}
       initialThreadId={initialThreadId}
-      initialModel={initialModel}
+      initialModel={headerModel}
       inboxOpen={inboxOpen}
     />,
     { exitOnCtrlC: false },  // we handle Ctrl-C inside the app (two-tap quit + cancel-turn)
