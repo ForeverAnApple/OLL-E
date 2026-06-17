@@ -328,8 +328,11 @@ describe("runAgent", () => {
   });
 
   it("surfaces validate() errors as is_error tool_result blocks", async () => {
+    // A *semantic* rule the schema can't express: n is a valid number
+    // structurally, but the tool rejects odd values. Structural validation
+    // passes, so validate() runs and its throw is what surfaces.
     const llm = mockLlm([
-      toolUse("t1", "strict", { n: "nope" }),
+      toolUse("t1", "strict", { n: 3 }),
       endTurn("noted"),
     ]);
     const tool: ToolDef<{ n: number }, string> = {
@@ -341,8 +344,8 @@ describe("runAgent", () => {
         required: ["n"],
       },
       validate(input) {
-        const { n } = input as { n: unknown };
-        if (typeof n !== "number") throw new Error("n must be a number");
+        const { n } = input as { n: number };
+        if (n % 2 !== 0) throw new Error("n must be even");
         return { n };
       },
       execute: (args) => String(args.n),
@@ -357,7 +360,7 @@ describe("runAgent", () => {
         if (s.kind === "tool_result") seen.push(`${s.isError}:${s.content}`);
       },
     });
-    expect(seen).toEqual(["true:n must be a number"]);
+    expect(seen).toEqual(["true:n must be even"]);
   });
 
   it("getTools is consulted per round-trip — new tools become callable mid-turn", async () => {

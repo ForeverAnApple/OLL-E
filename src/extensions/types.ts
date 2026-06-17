@@ -52,10 +52,15 @@ export interface ToolDef<I = unknown, O = unknown> {
    *  on most turns of most threads. */
   alwaysLoaded?: boolean;
   /** JSON Schema describing the tool's input. Handed straight to the LLM
-   *  vendor's tool-use spec — the host does not introspect it. Extensions
-   *  author this as a plain object (or convert from their preferred schema
-   *  library themselves); this keeps any shared-library identity out of the
-   *  host↔extension boundary. */
+   *  vendor's tool-use spec. The host introspects it only for *minimal*
+   *  structural validation before execute() — required properties,
+   *  `additionalProperties: false`, and primitive `type` checks — so a
+   *  wrong-shaped call (notably a blind call to a deferred tool) returns a
+   *  legible, schema-carrying error instead of crashing inside execute().
+   *  Deep/semantic constraints are not enforced here; use `validate()` for
+   *  those. Extensions author this as a plain object (or convert from their
+   *  preferred schema library themselves); this keeps any shared-library
+   *  identity out of the host↔extension boundary. */
   inputSchema: Record<string, unknown>;
   /** Optional runtime validator. Called with the raw LLM-emitted input;
    *  its return value is passed to `execute`. If omitted, input flows

@@ -1181,6 +1181,22 @@ The five entries above were authored on `feat/model-effort-self-config`, a branc
 
 Verified: `tsc` clean, 433 pass / 2 skip / 0 fail, the 65 model/effort feature tests green against the Vercel mock.
 
+---
+
+## 2026-06-16 — Host does minimal structural validation of tool input before execute()
+
+A chat log surfaced the failure: an agent blind-called `read_extension_file` — a deferred tool whose schema it never loaded — guessing the param `file` when the tool wants `path`. The runtime ran no check against `inputSchema` (it only calls a tool's optional `validate()`, which `read_extension_file` lacks), so `undefined` reached `join(base, undefined)` and Node threw `The "paths[1]" property must be of type string`, leaked verbatim to the model. The agent couldn't decode it, retried the same mistake, then spent a `load_tools` round-trip to reverse-engineer the param name — three round-trips to read one file, all of which persist in thread context.
+
+Root cause is a seam, not a model quirk: the catalog (LOG 2026-04-25) lists every tool by name, and dispatch resolves the **full** registry (`toolByName`), not the visible set — so the model can call a deferred tool whose schema was never sent. Blind calls to no-arg tools (`query_host_context`, `list_starters`) succeed and train the model that catalog tools are directly callable; the first arg-bearing tool then crashes.
+
+**Decision:** the runtime now runs `validateToolInput` (`src/agent/validate-tool-input.ts`) against `tool.inputSchema` before `execute()`. On a structural miss it returns a legible, schema-carrying `is_error` result (`missing required property: path`, `unexpected property: file`, plus the schema) so the model self-corrects in one turn. A tiny JSON-Schema subset — required props, `additionalProperties:false`, primitive `type` checks — no dependency, consistent with the "plain JSON Schema, no shared schema-library at the boundary" rule.
+
+**Why this shape, not the alternatives:** forbidding dispatch of unloaded tools ("load it first") was rejected as a refusal-shaped wall — anti-vision. Making the constraint *teach the shape* rather than crash is the "constraints feel like physics" invariant; writing the error for the agent to act on is "the inhabitants are the primary audience." Same principle as auto-load-on-register (LOG 2026-04-26): the agent expressed intent by calling; the world adapts. Structural validation now pre-empts `validate()` when the input violates the declared schema (an existing `agent.test.ts` case was updated to assert `validate()` still owns *semantic* rules the schema can't express). `ToolDef.inputSchema`'s "host does not introspect it" comment was amended.
+
+**Logged for follow-up, not fixed here:** the daemon's minimal launchd/systemd PATH (`scripts/install.sh` sets only `OLLE_HOME`) makes `claude`/`codex` invisible to the daemon and everything it spawns even when installed — so "not on PATH" reads as "not installed." A separate infra slice (bake a fuller PATH into the service env, or augment PATH at spawn in the subprocess starters). Verified for this change: `tsc` clean, full suite 447 pass / 0 fail.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.
