@@ -76,11 +76,12 @@ function UserRow({ text }: { text: string }): React.ReactElement {
 }
 
 function AssistantRow({ text }: { text: string }): React.ReactElement {
-  // Symmetric L/R padding. paddingRight={1} left almost no right margin, so
-  // at wide terminals the wrap boundary lands against the edge and long lines
-  // bleed past it; matching the left indent gives the text room to wrap clean.
+  // Balanced L/R padding. paddingRight={1} left almost no right margin, so at
+  // wide terminals the wrap boundary lands against the edge and long lines
+  // bleed past it. paddingRight must match the live streaming region (app.tsx)
+  // so text doesn't reflow the instant a streaming turn commits.
   return (
-    <Box paddingLeft={3} paddingRight={3} flexDirection="column">
+    <Box paddingLeft={3} paddingRight={2} flexDirection="column">
       <Markdown source={text} />
     </Box>
   );

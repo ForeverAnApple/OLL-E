@@ -222,6 +222,20 @@ function reducer(state: ChatState, action: Action): ChatState {
   }
 }
 
+// --- Streaming smoothing ---------------------------------------------------
+// The model emits tokens in bursts (network + SDK buffering), so rendering a
+// delta the instant it arrives reveals text in lurches. Instead, deltas pool
+// in a buffer and a fixed-cadence timer eases characters onto screen at a
+// steady rate — display decoupled from arrival. The committed message is
+// unaffected (it comes from the authoritative chat.assistant-text full text);
+// this is purely the live preview's animation.
+const STREAM_FPS = 35;
+// Each tick release ~1/DIVISOR of the buffer, so a deep buffer (big burst)
+// catches up fast while a near-empty one trickles — the tail eases out.
+const STREAM_DRAIN_DIVISOR = 5;
+// ...but always at least this many, so the last few chars don't crawl.
+const STREAM_MIN_CHARS = 3;
+
 export function ChatApp({ client: initialClient, socketFile, agentId, agentName, initialThreadId, initialModel, inboxOpen }: ChatAppProps): React.ReactElement {
   const { exit } = useApp();
   const [state, dispatch] = useReducer(reducer, {
@@ -241,6 +255,9 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
   // first; suppress the other. Bounded by clear-on-turn-end since tool ids
   // are unique within a turn. Lives as a ref — never read by render.
   const toolDedupRef = useRef<Set<string>>(new Set());
+  // Pending stream chars not yet eased onto screen. A ref, never read by
+  // render — the timer below pulls from it and dispatches the actual delta.
+  const pendingRef = useRef<string>("");
   // <TextInput> is uncontrolled — force-remount on submit/clear to wipe
   // its internal buffer.
   const [inputKey, setInputKey] = useState(0);
@@ -254,6 +271,25 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
   const threadIdRef = useRef(state.threadId);
   const quitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => { threadIdRef.current = state.threadId; }, [state.threadId]);
+
+  // Streaming smoothing pump: a fixed-cadence timer eases buffered stream
+  // chars onto screen at a steady rate, decoupled from bursty token arrival.
+  // Idle ticks (empty buffer) return early — no dispatch, no re-render.
+  // `dispatch` from useReducer is stable, so this effect runs once.
+  useEffect(() => {
+    const tickMs = Math.round(1000 / STREAM_FPS);
+    const id = setInterval(() => {
+      const pending = pendingRef.current;
+      if (pending.length === 0) return;
+      const n = Math.min(
+        pending.length,
+        Math.max(STREAM_MIN_CHARS, Math.ceil(pending.length / STREAM_DRAIN_DIVISOR)),
+      );
+      pendingRef.current = pending.slice(n);
+      dispatch({ type: "delta", text: pending.slice(0, n) });
+    }, tickMs);
+    return () => clearInterval(id);
+  }, []);
 
   // Single long-lived loop: subscribe → drain events → on close, try to
   // reconnect (exponential backoff) → resubscribe. The AbortController
@@ -306,7 +342,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
           for await (const ev of sub.events) {
             if (signal.aborted) break;
             if (ev.threadId !== threadIdRef.current) continue;
-            dispatchTailEvent(ev, dispatch, toolDedupRef.current);
+            dispatchTailEvent(ev, dispatch, toolDedupRef.current, pendingRef);
           }
         } catch {
           // ipc closed mid-stream — fall through to reconnect.
@@ -397,6 +433,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
           await client.call("chat.cancel", { threadId: state.threadId }).catch(() => {});
         }
         toolDedupRef.current.clear();
+        pendingRef.current = "";
         dispatch({ type: "thread-rotated", threadId: mintThreadId() });
         return true;
       case "/cancel":
@@ -521,7 +558,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
         {(entry) => <MessageRow key={entry.id} entry={entry} />}
       </Static>
       {state.streaming.length > 0 && (
-        <Box paddingLeft={3} paddingRight={1} flexDirection="column">
+        <Box paddingLeft={3} paddingRight={2} flexDirection="column">
           {state.streaming.split("\n").map((line, i) => <Text key={i}>{line}</Text>)}
         </Box>
       )}
@@ -593,14 +630,24 @@ function formatInboxOne(r: InboxRow): string {
   ].filter(Boolean).join("\n");
 }
 
-function dispatchTailEvent(ev: Event, dispatch: React.Dispatch<Action>, toolDedup: Set<string>): void {
+function dispatchTailEvent(
+  ev: Event,
+  dispatch: React.Dispatch<Action>,
+  toolDedup: Set<string>,
+  pending: { current: string },
+): void {
   const p = (ev.payload ?? {}) as Record<string, unknown>;
   const numFrom = (v: unknown): number => (typeof v === "number" ? v : 0);
   switch (ev.type) {
     case "chat.assistant-delta":
-      dispatch({ type: "delta", text: String(p.text ?? "") });
+      // Pool the delta; the smoothing timer eases it onto screen. No dispatch
+      // here, so bursty arrival doesn't drive bursty rendering.
+      pending.current += String(p.text ?? "");
       return;
     case "chat.assistant-text":
+      // Turn's text is final and authoritative — drop any unrevealed buffer
+      // (it's all in this full text) and commit.
+      pending.current = "";
       dispatch({ type: "assistant-text", text: String(p.text ?? "") });
       return;
     case "chat.tool-call":
@@ -633,6 +680,7 @@ function dispatchTailEvent(ev: Event, dispatch: React.Dispatch<Action>, toolDedu
       return;
     case "chat.turn-end":
       toolDedup.clear();
+      pending.current = "";
       dispatch({
         type: "turn-end",
         model: typeof p.model === "string" ? p.model : "",
@@ -645,10 +693,12 @@ function dispatchTailEvent(ev: Event, dispatch: React.Dispatch<Action>, toolDedu
       });
       return;
     case "chat.error":
+      pending.current = "";
       dispatch({ type: "error", text: String(p.error ?? "") });
       return;
     case "chat.cancelled":
       toolDedup.clear();
+      pending.current = "";
       dispatch({ type: "cancelled" });
       return;
   }
