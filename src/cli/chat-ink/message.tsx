@@ -76,8 +76,11 @@ function UserRow({ text }: { text: string }): React.ReactElement {
 }
 
 function AssistantRow({ text }: { text: string }): React.ReactElement {
+  // Symmetric L/R padding. paddingRight={1} left almost no right margin, so
+  // at wide terminals the wrap boundary lands against the edge and long lines
+  // bleed past it; matching the left indent gives the text room to wrap clean.
   return (
-    <Box paddingLeft={3} paddingRight={1} flexDirection="column">
+    <Box paddingLeft={3} paddingRight={3} flexDirection="column">
       <Markdown source={text} />
     </Box>
   );

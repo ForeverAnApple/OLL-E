@@ -540,7 +540,6 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
           agentName={agentName}
           model={state.model}
           inboxOpen={state.inboxOpen}
-          threadId={state.threadId}
           totalBilledTokens={state.totalBilledTokens}
         />
       </Box>
