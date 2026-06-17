@@ -408,12 +408,37 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
           // Smoke-test a candidate model with a 1-token call before the
           // switch commits — see set_thinking_model. Invalid/unserved
           // models throw here and the switch is rejected.
+          //
+          // This is a LIVENESS check, not a generation: it must fail fast.
+          // The adapter's normal request path retries transient failures up
+          // to 40× with exponential backoff (right for real turns, riding
+          // out overload windows). For the probe that's a trap — a probe to
+          // an overloaded/unserved model would grind through minutes of
+          // retries while BLOCKING the agent turn that called the switch.
+          // Bound it with a short timeout: a model that can't answer "ok" in
+          // one token within the window is rejected, the turn completes, and
+          // the agent stays on its current model (recoverable, no brick).
           probe: async (model) => {
-            await llm.complete({
-              model,
-              messages: [{ role: "user", content: "ok" }],
-              maxTokens: 1,
-            });
+            const PROBE_TIMEOUT_MS = 15_000;
+            const ctl = new AbortController();
+            const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
+            try {
+              await llm.complete({
+                model,
+                messages: [{ role: "user", content: "ok" }],
+                maxTokens: 1,
+                signal: ctl.signal,
+              });
+            } catch (err) {
+              if (ctl.signal.aborted) {
+                throw new Error(
+                  `probe timed out after ${PROBE_TIMEOUT_MS / 1000}s — the provider is slow/overloaded or "${model}" is not served on this key`,
+                );
+              }
+              throw err;
+            } finally {
+              clearTimeout(timer);
+            }
           },
         }),
         // Self-modification of how hard the agent thinks. Writes a private
