@@ -1221,6 +1221,16 @@ Also (data, not code): the earlier confabulated `knowledge` memory (`query_host_
 
 ---
 
+## 2026-06-17 — A fresh thread seeds its loaded set from active extensions
+
+Symptom from a live `olle chat`: the agent called the `claude_code` extension tool with a guessed input shape (`{prompt}`), missing the required `cwd`, and ate a validation-error round-trip — *every session*. The guess itself is not the bug: the `fix/tool-input-validation` branch is built for blind calls (the catalog lists tool names, a wrong guess returns the schema, the agent self-corrects in one turn, deterministically — `validate-tool-input.ts`). The bug is that the per-thread loaded set is in-memory and a fresh thread started **empty** (`loadedTools: new Set()`), so an already-installed, *active* extension's tool was back to a name-only catalog line with its schema deferred. Auto-load-on-register fires only at the register *moment*; across a restart that intent evaporated and the agent re-guessed (or re-`load_tools`ed) the same installed capability every session.
+
+**Decision:** seed each new thread's loaded set with every currently-active extension's contributed tools (`seedExtensionTools`, `src/agent/chat.ts`), always-loaded tools excluded. Same reasoning as auto-load-on-register, extended across the process boundary: a registered extension is a capability the agent chose with intent to use, and that intent outlives a restart. Chosen over the broader per-agent *durable* loadout (persist whatever was `load_tools`ed, rehydrate on new threads), which stays `[DEFERRED-to-v0.1]` — this slice fixes the actual papercut (installed-capability re-guessing) without a store + restore path. Cheap because extension schemas live in the separately-cached **tools block**, not the identity/catalog prefix: a bigger active set costs a marginally larger cache-read per turn and never invalidates the expensive prefix; size is bounded by active-extension count, which specialist-delegation keeps small at scale. Core deferred tools (delegation, secrets, observability beyond `query_self`) are deliberately *not* seeded — occasional reaches, not installed capabilities. Vision check: "the simplest mechanism that serves the vision wins" and "ask less of the inhabitants." Verified: `tsc` clean, full suite + new `seed-extension-tools.test.ts` green (462 files-worth, 0 fail).
+
+Noted, not fixed here: `config.toml` is a dead coordinate — `paths.ts` defines it and `buildHostContextPrompt` advertises it, but nothing writes or reads it (config comes from a hard-coded boot default, `paths.ts:21`). The boot preamble disclaims existence, so `query_host_context` reporting `exists: false` is honest — but advertising a by-design-absent file in the stable prefix invites the confusion the agent flagged. Left for a follow-up.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.
