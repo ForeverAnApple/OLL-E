@@ -119,6 +119,11 @@ async function cmdRun(): Promise<void> {
   const enriched = enrichPathFromLoginShell();
   if (enriched.changed) {
     console.log(`olle: PATH enriched from login shell (+${enriched.added.length} dirs)`);
+  } else if (!enriched.probed) {
+    // The probe failed (no login shell, timeout, or a shell that didn't honor
+    // -lc). Don't fail boot, but say so — otherwise "claude not on PATH" later
+    // looks like the tool is missing rather than the daemon being blind to it.
+    console.warn("olle: could not read login-shell PATH; tools installed outside the service PATH may be invisible to the agent");
   }
   const daemon = await startDaemon({ version: "0.0.0" });
   const stop = async (sig: NodeJS.Signals) => {

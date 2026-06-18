@@ -35,20 +35,38 @@ export function mergeLoginPath(
   return { path: merged.join(":"), added };
 }
 
-/** Resolve the login shell's PATH via `<shell> -lc 'printf %s "$PATH"'`.
- *  Returns null on any failure (missing shell, timeout, non-zero exit) so the
- *  caller falls back to the inherited PATH rather than breaking boot. */
+// Login shells routinely print to stdout from their profiles (nvm banners,
+// oh-my-zsh, a bare `echo` in .zshrc, MOTD). We can't suppress that, so we
+// fence the PATH behind a sentinel and read only what follows the *last* one.
+// `$PATH` can't contain this string, so the fence is unambiguous; if it's
+// absent the output is untrustworthy and we fail closed rather than splice
+// profile noise into PATH.
+const PATH_SENTINEL = "@@OLLE_PATH@@";
+
+/** Extract the PATH from a probe's raw stdout, discarding any profile noise
+ *  printed before the sentinel. Returns null if the sentinel is missing (the
+ *  printf never ran, or output is unusable) or the PATH is empty. */
+export function parseProbeOutput(stdout: string): string | null {
+  const idx = stdout.lastIndexOf(PATH_SENTINEL);
+  if (idx === -1) return null;
+  const p = stdout.slice(idx + PATH_SENTINEL.length).trim();
+  return p.length > 0 ? p : null;
+}
+
+/** Resolve the login shell's PATH via `<shell> -lc 'printf %s "<sentinel>$PATH"'`.
+ *  Returns null on any failure (missing shell, timeout, non-zero exit, sentinel
+ *  absent) so the caller falls back to the inherited PATH rather than breaking
+ *  boot or corrupting PATH with profile output. */
 function probeLoginPath(
   shell: string,
 ): string | null {
   try {
-    const r = spawnSync(shell, ["-lc", 'printf %s "$PATH"'], {
+    const r = spawnSync(shell, ["-lc", `printf %s "${PATH_SENTINEL}$PATH"`], {
       encoding: "utf8",
       timeout: 2000,
     });
     if (r.status !== 0 || !r.stdout) return null;
-    const p = r.stdout.trim();
-    return p.length > 0 ? p : null;
+    return parseProbeOutput(r.stdout);
   } catch {
     return null;
   }
@@ -63,10 +81,13 @@ export interface EnrichPathOptions {
 
 /** Enrich `env.PATH` in place from the login shell. Idempotent: a second call
  *  (or a daemon already started from a full-PATH shell) adds nothing. Returns
- *  the dirs that were newly added, for logging/observability. */
+ *  the dirs newly added plus `probed` — false when the shell probe itself
+ *  failed (missing shell, timeout, sentinel absent), so a caller can tell a
+ *  genuine no-op (`probed:true, changed:false`) from a defeated probe and log
+ *  the latter instead of silently leaving PATH stripped. */
 export function enrichPathFromLoginShell(
   opts: EnrichPathOptions = {},
-): { changed: boolean; added: string[] } {
+): { changed: boolean; added: string[]; probed: boolean } {
   const env = opts.env ?? process.env;
   const platform = opts.platform ?? process.platform;
   const probe = opts.probe ?? probeLoginPath;
@@ -80,10 +101,10 @@ export function enrichPathFromLoginShell(
         : "/bin/sh";
 
   const loginPath = probe(shell);
-  if (!loginPath) return { changed: false, added: [] };
+  if (!loginPath) return { changed: false, added: [], probed: false };
 
   const { path, added } = mergeLoginPath(env.PATH ?? "", loginPath);
-  if (added.length === 0) return { changed: false, added: [] };
+  if (added.length === 0) return { changed: false, added: [], probed: true };
   env.PATH = path;
-  return { changed: true, added };
+  return { changed: true, added, probed: true };
 }
