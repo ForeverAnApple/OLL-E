@@ -558,7 +558,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
         {(entry) => <MessageRow key={entry.id} entry={entry} />}
       </Static>
       {state.streaming.length > 0 && (
-        <Box paddingLeft={3} paddingRight={2} flexDirection="column">
+        <Box marginTop={1} paddingLeft={3} paddingRight={2} flexDirection="column">
           {state.streaming.split("\n").map((line, i) => <Text key={i}>{line}</Text>)}
         </Box>
       )}
@@ -578,6 +578,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
           model={state.model}
           inboxOpen={state.inboxOpen}
           totalBilledTokens={state.totalBilledTokens}
+          totalUsdMicros={state.totalUsdMicros}
         />
       </Box>
     </Box>

@@ -10,16 +10,20 @@ export function StatusFooter({
   model,
   inboxOpen,
   totalBilledTokens,
+  totalUsdMicros,
 }: {
   agentName: string;
   model: string;
   inboxOpen: number;
   /** Cumulative billed tokens for the thread (in + out + cache read + cache write). */
   totalBilledTokens: number;
+  /** Cumulative spend for the thread, in micro-USD. */
+  totalUsdMicros: number;
 }): React.ReactElement {
   // KISS: identity on the left, situational indicators on the right.
-  // Cost lives on each turn-end line as a running total. The footer
-  // carries a single token counter — total throughput across the thread.
+  // The right cluster is the running cost of the thread — tokens spent
+  // and what they cost — so the price is always in view, not only on the
+  // turn-end lines that scroll away.
   // (The thread id was dropped — an opaque hash means nothing to a human.)
   return (
     <Box justifyContent="space-between" paddingX={1}>
@@ -34,7 +38,10 @@ export function StatusFooter({
           </Text>
         )}
         {totalBilledTokens > 0 && (
-          <Text color={theme.muted}>{formatTokens(totalBilledTokens)} tok</Text>
+          <Text color={theme.muted}>
+            {formatTokens(totalBilledTokens)} tok
+            {totalUsdMicros > 0 ? ` ${sym.sep} ${formatCost(totalUsdMicros)}` : ""}
+          </Text>
         )}
       </Box>
     </Box>
@@ -44,4 +51,11 @@ export function StatusFooter({
 function formatTokens(n: number): string {
   // Thousands separator so big counts read at a glance.
   return n.toLocaleString("en-US");
+}
+
+function formatCost(usdMicros: number): string {
+  // Sub-dollar threads need the extra digits; past $1 the cents are
+  // what matter. Mirrors the turn-end line's formatter.
+  const usd = usdMicros / 1_000_000;
+  return usd < 1 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
 }
