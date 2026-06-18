@@ -65,8 +65,10 @@ export function TrayList({ items }: { items: string[] }): React.ReactElement {
 }
 
 function UserRow({ text }: { text: string }): React.ReactElement {
+  // A blank line above each user turn is the strongest single cue that a
+  // new exchange started — turns stop running together in the scrollback.
   return (
-    <Box paddingX={1}>
+    <Box marginTop={1} paddingX={1}>
       <Text color={theme.user}>{sym.bar} </Text>
       <Box flexDirection="column" flexGrow={1}>
         {text.split("\n").map((line, i) => <Text key={i}>{line}</Text>)}
@@ -89,8 +91,10 @@ function AssistantRow({ text }: { text: string }): React.ReactElement {
 
 function ToolCallRow({ name, input }: { name: string; input: unknown }): React.ReactElement {
   const args = formatCallArgs(input);
+  // Each call gets air above it; its result (ToolResultRow) stays glued
+  // below with no margin, so a call+result reads as one unit.
   return (
-    <Box paddingLeft={3} paddingRight={1}>
+    <Box marginTop={1} paddingLeft={3} paddingRight={1}>
       <Text color={theme.tool}>{sym.tool} </Text>
       <Text>{name}</Text>
       {args && <Text color={theme.muted}>({args})</Text>}
