@@ -55,7 +55,14 @@ function Heading({ token }: { token: Tokens.Heading }): React.ReactElement {
 }
 
 function Paragraph({ token }: { token: Tokens.Paragraph }): React.ReactElement {
-  return <Text><Inline tokens={token.tokens} /></Text>;
+  // marginTop opens a blank line above each paragraph so consecutive ones
+  // read as separate blocks instead of running together — same separation
+  // Heading already uses.
+  return (
+    <Box marginTop={1}>
+      <Text><Inline tokens={token.tokens} /></Text>
+    </Box>
+  );
 }
 
 function BlockText({ token }: { token: Tokens.Text }): React.ReactElement {
