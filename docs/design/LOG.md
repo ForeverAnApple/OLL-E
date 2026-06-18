@@ -1207,6 +1207,20 @@ The PATH gap from the entry above bit concretely on a nix-darwin host: `which cl
 
 ---
 
+---
+
+## 2026-06-17 — Compiled-Bun child spawns inherit the exec-time PATH, not runtime mutations (the real Nix bug)
+
+The 2026-06-16 PATH-enrichment entry was half a fix. Symptom that exposed it: on the Nix host, `query_host_context` reported a full `process.path` (including `/etc/profiles/per-user/<u>/bin`) yet its `commands` probe said `claude` not-found — while `git` (in `/usr/bin`) resolved. Reproduced under a **compiled** binary launched with a stripped env: mutating `process.env.PATH` at runtime (what `enrichPathFromLoginShell` does) is **invisible to child processes** — a compiled Bun binary spawns children with the *exec-time* environment, and no in-process method (`process.env.PATH=`, `Bun.env.PATH=`, full-object reassign) changes that. So the enrichment only ever fixed JS reads; `query_host_context`'s `spawnSync("which", ...)` — a child — kept searching the stripped exec PATH and false-negatived on anything outside `/usr/bin`. `process.path` and `commands` were reading two different PATHs in the same process. (The earlier "the resolver works" repro was wrong because it ran from a shell that already had the full PATH at exec time, hiding the divergence entirely. Lesson logged: reproduce under the *deployed* conditions, not a convenient shell.)
+
+**Two-faced fix:**
+- **Probe honesty (`src/tools/meta.ts`):** `resolveCommand` no longer shells out to `which`. It walks `process.env.PATH` in-process (`statSync` + `accessSync(X_OK)`), the same value `process.path` reports — so the two can never disagree again, and it reads the enriched PATH that runtime mutation *does* fix for in-process code. Proven: under a stripped-exec compiled binary with runtime-enriched PATH, the in-process walk resolves `claude`/`bun`/`git` where the old `which` child found only `git`.
+- **Subprocess reality (`scripts/install.sh`):** child spawns can only be fixed at the *launcher*, so the login-shell PATH is now baked into the launchd plist (`EnvironmentVariables/PATH`) and systemd unit (`Environment=PATH=`). That makes the daemon's exec-time PATH correct, which every subprocess extension (claude-code, codex) inherits natively. This reverses the 2026-06-16 reasoning that rejected baking PATH into the service definition as "snapshots and rots": runtime enrichment provably *cannot* reach children in compiled Bun, so the exec-time PATH is mandatory. Staleness is the accepted tradeoff (existing dirs keep working; a brand-new PATH dir needs a reinstall), and `enrichPathFromLoginShell` stays as the in-process half plus the rescue for `olle run` from a stripped shell. Comments in `run.ts` corrected to stop claiming the runtime pass fixes spawns. The install-side probe mirrors `path-env.ts`'s sentinel (login shells print profile noise to stdout; a leaked banner — or its newline — would otherwise be baked into the service PATH and break the systemd unit), and `$SERVICE_PATH` is XML-escaped into the plist and shell-quoted in the systemd `Environment=` line so a dir with `& < >` or spaces can't malform the config.
+
+Also (data, not code): the earlier confabulated `knowledge` memory (`query_host_context can false-negative on PATH`) was a *symptom* of this real bug, not pure hallucination — the agent observed a true divergence and guessed the wrong mechanism. It was retired via a `memory.forgotten` tombstone once the real cause was found. Verified: `tsc` clean, full suite 461 pass / 0 fail.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.

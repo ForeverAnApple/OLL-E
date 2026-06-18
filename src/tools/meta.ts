@@ -9,6 +9,8 @@
 // revert-extension   — revert the ext subtree to the given sha.
 
 import {
+  accessSync,
+  constants as fsConstants,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -18,8 +20,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { delimiter, join } from "node:path";
 import type { EventBus } from "../bus/index.ts";
 import type { ExtensionHost, ExtensionInventoryEntry, ToolDef } from "../extensions/index.ts";
 import type { AgentManager } from "../agent/index.ts";
@@ -86,15 +87,29 @@ function resolveCommand(command: string): {
   if (!/^[A-Za-z0-9._+-]+$/.test(command)) {
     return { command, path: null, ok: false, error: "invalid executable name" };
   }
-  const r = spawnSync("which", [command], { encoding: "utf8" });
-  if (r.status === 0 && r.stdout.trim()) {
-    return { command, path: r.stdout.trim().split(/\r?\n/)[0]!, ok: true };
+  // Resolve in-process against process.env.PATH — the same value the
+  // `process.path` field reports — so the two can never disagree. We
+  // deliberately do NOT shell out to `which`: in a compiled Bun binary a child
+  // process inherits the *exec-time* environment, so a spawned `which` searches
+  // a stale, narrower PATH and false-negatives on tools the daemon can actually
+  // see once enrichPathFromLoginShell has run (LOG 2026-06-17). Walk the dirs
+  // ourselves and return the first executable match, the way `which` would.
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const full = join(dir, command);
+    try {
+      if (!statSync(full).isFile()) continue;
+      accessSync(full, fsConstants.X_OK);
+      return { command, path: full, ok: true };
+    } catch {
+      // not here, not a file, or not executable — keep looking
+    }
   }
   return {
     command,
     path: null,
     ok: false,
-    error: r.stderr.trim() || `${command} not found on PATH`,
+    error: `${command} not found on the daemon's PATH`,
   };
 }
 
@@ -313,6 +328,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
       extensions: Array<{ name: string; status: string; path: string; tools: string[] }>;
       files: Array<{ path: string; exists: boolean; kind: "file" | "dir" | "missing" | "other"; realpath?: string }>;
       commands: Array<{ command: string; path: string | null; ok: boolean; error?: string }>;
+      note?: string;
     }
   > = {
     name: "query_host_context",
@@ -343,6 +359,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
         opts.paths?.secretsDir ?? opts.secretsDir,
         opts.paths?.threadsDir,
       ].filter((p): p is string => Boolean(p));
+      const resolved = requested.map(resolveCommand);
       return {
         process: {
           cwd: process.cwd(),
@@ -361,7 +378,18 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
             .sort(),
         })),
         files: pathsToCheck.map(describePath),
-        commands: requested.map(resolveCommand),
+        commands: resolved,
+        // Only surface the caveat when it can actually mislead — a resolved
+        // command needs no framing, and an unconditional note would bloat
+        // every call. `commands`/`path` reflect the daemon's PATH at this
+        // instant, which a tool that augments its own env (or a binary added
+        // since the daemon started) can exceed — so a not-found here is not
+        // authoritative for whether the binary will actually run.
+        ...(resolved.some((c) => !c.ok)
+          ? {
+              note: "A 'not found' above means not on the daemon's PATH at this instant — not absolute absence. A tool that augments its own env before spawning may still run it. Confirm with a live exec before concluding a command is missing.",
+            }
+          : {}),
       };
     },
   };
