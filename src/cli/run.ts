@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { startDaemon } from "../daemon/daemon.ts";
+import { enrichPathFromLoginShell } from "../daemon/path-env.ts";
 import { resolvePaths } from "../paths.ts";
 import { connectIpc, type IpcClient } from "../ipc/client.ts";
 import { connectOrExit, withIpc } from "./ipc-helper.ts";
@@ -112,6 +113,13 @@ async function cmdModel(args: string[]): Promise<void> {
 }
 
 async function cmdRun(): Promise<void> {
+  // launchd/systemd start the daemon with a stripped PATH. Pull the user's
+  // real PATH from their login shell so the agent (and the subprocesses it
+  // spawns) can find tools installed via Nix/Homebrew/asdf/etc. See path-env.ts.
+  const enriched = enrichPathFromLoginShell();
+  if (enriched.changed) {
+    console.log(`olle: PATH enriched from login shell (+${enriched.added.length} dirs)`);
+  }
   const daemon = await startDaemon({ version: "0.0.0" });
   const stop = async (sig: NodeJS.Signals) => {
     console.log(`\nolle: received ${sig}, shutting down`);

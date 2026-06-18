@@ -1197,6 +1197,16 @@ Root cause is a seam, not a model quirk: the catalog (LOG 2026-04-25) lists ever
 
 ---
 
+## 2026-06-16 — Daemon recovers the user's real PATH from the login shell (the follow-up above)
+
+The PATH gap from the entry above bit concretely on a nix-darwin host: `which claude` → `/etc/profiles/per-user/<u>/bin/claude`, but the daemon's PATH was the launchd-stripped `/usr/bin:/bin:/usr/sbin:/sbin`, so `query_host_context` reported "claude not on PATH" and the agent concluded "not installed on this machine." The tool was there; the daemon was blind to it. A false constraint — VISION says limits should be real (cost, safety), not artifacts of a stripped environment.
+
+**Decision:** at the daemon *process* entry points (`cmdRun` in `src/cli/run.ts`, `main` in `src/daemon/main.ts`), call `enrichPathFromLoginShell()` (`src/daemon/path-env.ts`) before `startDaemon`. It runs `<shell> -lc 'printf %s "$PATH"'` (SHELL or platform default; 2s timeout; failure → no-op), then merges the login dirs into `process.env.PATH`, login order first, deduped. Everything downstream inherits it unchanged — `query_host_context`'s `which`, the starter templates' `resolveCommand`, and the spawned subprocess — so a single enrichment fixes the whole class. No starter-template change needed.
+
+**Why this shape, not the alternatives:** baking PATH into the launchd plist / systemd unit at install time was rejected — it snapshots the install-time environment and rots (the same failure the plist's own comment flags about embedding `ANTHROPIC_API_KEY`), and it doesn't cover `olle run` from a fresh shell. Hardcoding Nix/Homebrew/asdf candidate dirs (what the on-disk smoke test did) is a guess that misses the next ecosystem; asking the *login shell* is robust because that's exactly where every ecosystem registers its bin dir. Placed at the process entry, not inside `startDaemon`, so the reusable core stays free of shell-spawning and the 5 daemon-booting tests don't shell out. The on-disk agent-authored `claude-code/smoke.ts` still hardcodes three dirs and replaces `env.PATH` for its `which` fallback — that's the inhabitant's artifact to refresh; the platform fix is making `query_host_context` honest so the agent reasons from a true PATH. Verified: probe surfaces `/etc/profiles/per-user/<u>/bin` on the affected host; `tsc` clean, full suite 456 pass / 0 fail.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.
