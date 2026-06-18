@@ -10,7 +10,7 @@
 import { Box, Text } from "ink";
 import { theme, sym } from "./theme.ts";
 import { Markdown } from "./markdown.tsx";
-import { clipString } from "./format.ts";
+import { clipString, formatCost } from "./format.ts";
 
 export type ScrollbackEntry =
   | { kind: "user"; id: string; text: string }
@@ -203,11 +203,6 @@ function TurnEndRow(props: Extract<ScrollbackEntry, { kind: "turn-end" }>): Reac
       </Text>
     </Box>
   );
-}
-
-function formatCost(usdMicros: number): string {
-  const usd = usdMicros / 1_000_000;
-  return usd < 1 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
 }
 
 function formatCallArgs(input: unknown): string {

@@ -29,6 +29,13 @@ export function clipString(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
+/** Cost from micro-USD: sub-dollar threads need the extra digits, past $1
+ *  the cents are what matter. Shared by the turn-end line and the footer. */
+export function formatCost(usdMicros: number): string {
+  const usd = usdMicros / 1_000_000;
+  return usd < 1 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
+}
+
 /** Single-char glyph encoding the inbox row's resolution state. */
 export function statusGlyph(status: string): string {
   switch (status) {

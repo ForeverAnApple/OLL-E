@@ -4,6 +4,7 @@
 
 import { Box, Text } from "ink";
 import { theme, sym } from "./theme.ts";
+import { formatCost } from "./format.ts";
 
 export function StatusFooter({
   agentName,
@@ -51,11 +52,4 @@ export function StatusFooter({
 function formatTokens(n: number): string {
   // Thousands separator so big counts read at a glance.
   return n.toLocaleString("en-US");
-}
-
-function formatCost(usdMicros: number): string {
-  // Sub-dollar threads need the extra digits; past $1 the cents are
-  // what matter. Mirrors the turn-end line's formatter.
-  const usd = usdMicros / 1_000_000;
-  return usd < 1 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
 }
