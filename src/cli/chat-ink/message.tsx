@@ -26,6 +26,23 @@ export type ScrollbackEntry =
    *  from the previous turn-end entry. */
   | { kind: "turn-end"; id: string; model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; cumulativeUsdMicros: number; stopReason: string };
 
+/** One committed scrollback item as it sits inside `<Static>`. The `width`
+ *  pin is load-bearing, not cosmetic: `<Static>` mounts each item as a
+ *  detached root that does NOT inherit the terminal-width constraint Ink
+ *  applies to the live tree. Without a width budget, flex rows inside the
+ *  markdown (list items, blockquotes) and the gutter rows (user, tool) all
+ *  measure their text at max-content and bleed past the right edge on wide
+ *  terminals. Pass the terminal column count; the row carves its text column
+ *  out of it. Frozen at render time, which matches Static — committed
+ *  scrollback never reflows on resize anyway. */
+export function ScrollbackItem({ entry, width }: { entry: ScrollbackEntry; width: number }): React.ReactElement {
+  return (
+    <Box flexDirection="column" width={width}>
+      <MessageRow entry={entry} />
+    </Box>
+  );
+}
+
 export function MessageRow({ entry }: { entry: ScrollbackEntry }): React.ReactElement {
   switch (entry.kind) {
     case "user":          return <UserRow text={entry.text} />;
@@ -78,10 +95,12 @@ function UserRow({ text }: { text: string }): React.ReactElement {
 }
 
 function AssistantRow({ text }: { text: string }): React.ReactElement {
-  // Balanced L/R padding. paddingRight={1} left almost no right margin, so at
-  // wide terminals the wrap boundary lands against the edge and long lines
-  // bleed past it. paddingRight must match the live streaming region (app.tsx)
-  // so text doesn't reflow the instant a streaming turn commits.
+  // L/R padding is breathing room, not the wrap guarantee. The wrap budget
+  // comes from the width pinned on the Static item in app.tsx — without it,
+  // markdown list items and blockquotes bleed past the right edge on wide
+  // terminals (Static drops the terminal-width constraint). paddingRight
+  // matches the live streaming region (app.tsx) so text doesn't reflow the
+  // instant a streaming turn commits.
   return (
     <Box paddingLeft={3} paddingRight={2} flexDirection="column">
       <Markdown source={text} />

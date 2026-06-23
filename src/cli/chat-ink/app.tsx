@@ -9,13 +9,13 @@
 // exponential backoff and resubscribe on the same threadId. Chat
 // survives daemon restarts without losing scrollback.
 
-import { Box, Static, Text, useApp, useInput } from "ink";
+import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
 import { useEffect, useReducer, useRef, useState } from "react";
 import type * as React from "react";
 import type { IpcClient } from "../../ipc/client.ts";
 import { connectIpc } from "../../ipc/client.ts";
 import type { Event } from "../../bus/types.ts";
-import { MessageRow, TrayList, type ScrollbackEntry } from "./message.tsx";
+import { ScrollbackItem, TrayList, type ScrollbackEntry } from "./message.tsx";
 import { InputFrame, StatusLine, type BarState } from "./input-bar.tsx";
 import { StatusFooter } from "./status-footer.tsx";
 import { mintEntryId, mintThreadId, mintToolId } from "./ids.ts";
@@ -238,6 +238,15 @@ const STREAM_MIN_CHARS = 3;
 
 export function ChatApp({ client: initialClient, socketFile, agentId, agentName, initialThreadId, initialModel, inboxOpen }: ChatAppProps): React.ReactElement {
   const { exit } = useApp();
+  const { stdout } = useStdout();
+  // Width budget for scrollback rows. <Static> mounts each item as a detached
+  // root that does NOT inherit the terminal-width constraint Ink applies to the
+  // live tree, so flex rows inside a row (list items, blockquotes, the user/
+  // tool gutters all use flexGrow) get no width to distribute, measure at
+  // max-content, and bleed past the right edge on wide terminals. Pinning each
+  // Static item to the terminal width restores the budget. Frozen at render
+  // time, which matches Static semantics — committed scrollback never reflows.
+  const cols = stdout?.columns ?? 80;
   const [state, dispatch] = useReducer(reducer, {
     scrollback: [],
     streaming: "",
@@ -555,7 +564,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
   return (
     <Box flexDirection="column">
       <Static items={state.scrollback}>
-        {(entry) => <MessageRow key={entry.id} entry={entry} />}
+        {(entry) => <ScrollbackItem key={entry.id} entry={entry} width={cols} />}
       </Static>
       {state.streaming.length > 0 && (
         <Box marginTop={1} paddingLeft={3} paddingRight={2} flexDirection="column">
