@@ -19,21 +19,25 @@ interface ModelCaps {
   efforts: readonly ReasoningEffort[];
   /** Hard ceiling for `max_tokens` (output + thinking share this budget). */
   maxOutputTokens: number;
+  /** Input context-window size, in tokens. Drives the chat REPL's context
+   *  gauge — not a hard clamp (the API rejects overflow), just the denominator
+   *  for "how full is the window." */
+  contextWindow: number;
 }
 
 const CAPS: Record<string, ModelCaps> = {
-  // Opus tier: full effort range, 64k output.
-  "claude-opus-4-8": { efforts: EFFORT_ORDER, maxOutputTokens: 64_000 },
-  "claude-opus-4-7": { efforts: EFFORT_ORDER, maxOutputTokens: 64_000 },
+  // Opus tier: full effort range, 64k output, 200k window.
+  "claude-opus-4-8": { efforts: EFFORT_ORDER, maxOutputTokens: 64_000, contextWindow: 200_000 },
+  "claude-opus-4-7": { efforts: EFFORT_ORDER, maxOutputTokens: 64_000, contextWindow: 200_000 },
   // Sonnet 4.6: effort dial GA, but xhigh/max are Opus-only.
-  "claude-sonnet-4-6": { efforts: ["low", "medium", "high"], maxOutputTokens: 64_000 },
+  "claude-sonnet-4-6": { efforts: ["low", "medium", "high"], maxOutputTokens: 64_000, contextWindow: 200_000 },
   // Haiku 4.5: no effort dial — any effort 400s.
-  "claude-haiku-4-5-20251001": { efforts: [], maxOutputTokens: 32_000 },
+  "claude-haiku-4-5-20251001": { efforts: [], maxOutputTokens: 32_000, contextWindow: 200_000 },
 };
 
 // Unknown/future model: assume the broad GA baseline (low/medium/high) and a
 // conservative output cap. The API stays the final backstop.
-const DEFAULT_CAPS: ModelCaps = { efforts: ["low", "medium", "high"], maxOutputTokens: 32_000 };
+const DEFAULT_CAPS: ModelCaps = { efforts: ["low", "medium", "high"], maxOutputTokens: 32_000, contextWindow: 200_000 };
 
 function capsFor(model: string): ModelCaps {
   return CAPS[model] ?? DEFAULT_CAPS;
@@ -71,4 +75,10 @@ export function clampEffort(
 /** Hard ceiling for `max_tokens` on this model. */
 export function maxOutputTokens(model: string): number {
   return capsFor(model).maxOutputTokens;
+}
+
+/** Input context-window size in tokens — the denominator for the chat
+ *  REPL's context-fullness gauge. Unknown models fall back to the baseline. */
+export function contextWindow(model: string): number {
+  return capsFor(model).contextWindow;
 }

@@ -60,6 +60,7 @@ type Action =
   | { type: "error"; text: string }
   | { type: "retry"; attempt: number; status?: number; message?: string }
   | { type: "turn-end"; model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; usdMicros: number; stopReason: string }
+  | { type: "context-usage"; contextTokens: number }
   | { type: "cancel-requested" }
   | { type: "cancelled" }
   | { type: "thread-rotated"; threadId: string }
@@ -85,10 +86,12 @@ interface ChatState {
   tray: string[];
   /** Cumulative spend on this thread since REPL start (or last /clear). */
   totalUsdMicros: number;
-  /** Cumulative billed tokens — in + out + cache_read + cache_write.
-   *  Single number on purpose: separate breakdowns mislead more than
-   *  they inform; the per-turn line still shows the breakdown. */
-  totalBilledTokens: number;
+  /** Context-window occupancy after the last round-trip — the full prompt
+   *  the model saw (uncached in + cache_read + cache_write) plus what it
+   *  just generated (out), which the next turn carries forward. A snapshot,
+   *  not a running total: it answers "how full is the window now," not "how
+   *  much has this thread cost." Cost lives in totalUsdMicros. */
+  contextTokens: number;
 }
 
 function reducer(state: ChatState, action: Action): ChatState {
@@ -165,8 +168,6 @@ function reducer(state: ChatState, action: Action): ChatState {
       // the question the user actually asks. Per-turn cost is still
       // derivable as the delta from the previous turn entry.
       const cumulative = state.totalUsdMicros + action.usdMicros;
-      const turnBilled =
-        action.inputTokens + action.outputTokens + action.cacheReadTokens + action.cacheCreationTokens;
       return {
         ...state,
         scrollback: [...state.scrollback, {
@@ -184,9 +185,15 @@ function reducer(state: ChatState, action: Action): ChatState {
         turnBusy: false,
         cancelling: false,
         totalUsdMicros: cumulative,
-        totalBilledTokens: state.totalBilledTokens + turnBilled,
       };
     }
+    case "context-usage":
+      // Live window gauge. Each chat.usage carries one round-trip's real
+      // prompt size; the latest overwrites, so a multi-tool turn settles on
+      // the final round's prompt — the true window — instead of turn-end's
+      // sum-across-round-trips (which overcounts). Updates as the turn runs,
+      // so the footer stops lagging a turn behind.
+      return { ...state, contextTokens: action.contextTokens };
     case "cancel-requested":
       // Idempotent — repeated Ctrl-C taps within the cancel window
       // shouldn't keep cloning state.
@@ -209,7 +216,7 @@ function reducer(state: ChatState, action: Action): ChatState {
         cancelling: false,
         tray: [],
         totalUsdMicros: 0,
-        totalBilledTokens: 0,
+        contextTokens: 0,
       };
     case "model-changed":
       return { ...state, model: action.model };
@@ -257,7 +264,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
     inboxOpen,
     tray: [],
     totalUsdMicros: 0,
-    totalBilledTokens: 0,
+    contextTokens: 0,
   });
   // Tool-result dedup: both chat.tool-result-live (UX) and chat.tool-result
   // (canonical/durable) carry the same tool_use id. Render whichever lands
@@ -587,8 +594,8 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
           agentName={agentName}
           model={state.model}
           inboxOpen={state.inboxOpen}
-          totalBilledTokens={state.totalBilledTokens}
           totalUsdMicros={state.totalUsdMicros}
+          contextTokens={state.contextTokens}
         />
       </Box>
     </Box>
@@ -687,6 +694,19 @@ function dispatchTailEvent(
         attempt: numFrom(p.attempt),
         ...(typeof p.status === "number" && { status: p.status }),
         ...(typeof p.message === "string" && { message: p.message }),
+      });
+      return;
+    case "chat.usage":
+      // Per-round-trip usage. The input-side total (uncached + cache_read +
+      // cache_write) is exactly the prompt the model was just handed; the
+      // output rides on top because the next round-trip carries it forward.
+      // Note the field names differ from turn-end: the raw Usage shape uses
+      // cache*InputTokens.
+      dispatch({
+        type: "context-usage",
+        contextTokens:
+          numFrom(p.inputTokens) + numFrom(p.cacheReadInputTokens) + numFrom(p.cacheCreationInputTokens) +
+          numFrom(p.outputTokens),
       });
       return;
     case "chat.turn-end":
