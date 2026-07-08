@@ -21,7 +21,15 @@ afterEach(() => {
 describe("starter templates", () => {
   it("ships the expected starters with valid manifests", () => {
     const names = listStarters().map((s) => s.name).sort();
-    expect(names).toEqual(["claude-code", "cron-trigger", "discord", "discord-communication", "github"]);
+    expect(names).toEqual([
+      "claude-code",
+      "cron-trigger",
+      "discord",
+      "discord-communication",
+      "github",
+      "telegram",
+      "telegram-communication",
+    ]);
     for (const s of listStarters()) {
       const mfRaw = s.files["manifest.json"];
       expect(mfRaw).toBeDefined();
@@ -82,6 +90,18 @@ describe("starter templates", () => {
     expect(bridge).toContain("DISCORD_THREAD_RE");
     expect(bridge).toContain("derivedRoutes");
     expect(bridge).toContain("evictDerived");
+  });
+
+  it("telegram-communication derives standing-job routes at all three outbound sites", () => {
+    const bridge = getStarter("telegram-communication")!.files["index.ts"]!;
+    expect(bridge).toContain("function getOrDeriveRoute");
+    const uses = bridge.match(/getOrDeriveRoute\(/g) ?? [];
+    expect(uses.length).toBeGreaterThanOrEqual(4);
+    expect(bridge).toContain("TELEGRAM_THREAD_RE");
+    expect(bridge).toContain("derivedRoutes");
+    expect(bridge).toContain("evictDerived");
+    // Must ignore non-telegram channel-message traffic sharing the bus.
+    expect(bridge).toContain('msg.source !== "telegram"');
   });
 
   it("cron-trigger unload clears its interval", async () => {

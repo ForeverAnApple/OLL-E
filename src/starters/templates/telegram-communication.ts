@@ -1,16 +1,16 @@
 import type { StarterTemplate } from "./types.ts";
 
-export const discordCommunication: StarterTemplate = {
-  name: "discord-communication",
-  description: "Bridges Discord to/from the chat agent. DMs always active; guild channels require the channel to be in watchedChannels AND (wake-word match OR @mention). Accumulates assistant text until chat.turn-end, then posts one reply. Standing-job threads deliver channel-only.",
+export const telegramCommunication: StarterTemplate = {
+  name: "telegram-communication",
+  description: "Bridges Telegram to/from the chat agent. DMs always active; group chats require the chat to be in watchedChats AND (wake-word match OR @mention). Accumulates assistant text until chat.turn-end, then posts one reply. Standing-job threads deliver chat-only.",
   files: {
     "manifest.json": JSON.stringify(
       {
-        name: "discord-communication",
+        name: "telegram-communication",
         version: "0.1.0",
-        description: "Wake-word + DM bridge between Discord and the chat agent.",
-        capabilities: ["bridge:discord-chat"],
-        callsTools: ["discord_send"],
+        description: "Wake-word + DM bridge between Telegram and the chat agent.",
+        capabilities: ["bridge:telegram-chat"],
+        callsTools: ["telegram_send"],
         eventReads: [
           "channel-message",
           "chat.assistant-text",
@@ -21,39 +21,37 @@ export const discordCommunication: StarterTemplate = {
         eventWrites: ["chat.input"],
         config: {
           wakeWord: "olle",
-          watchedChannels: [] as string[],
+          watchedChats: [] as string[],
         },
       },
       null,
       2,
     ) + "\n",
     "index.ts":
-`// discord-communication: the inbound/outbound relay that makes chatting
-// with olle on Discord feel like chatting with olle on the CLI.
+`// telegram-communication: inbound/outbound relay between Telegram and the
+// chat agent. Structural twin of discord-communication — same accumulate-
+// then-send-one-reply shape, keyed on telegram threadIds.
 //
 // Inbound (channel-message -> chat.input):
-//   - DMs: always pumped in.
-//   - Guild channels: only if the channel is in watchedChannels AND
-//     (the bot is mentioned OR the wake-word matches content).
-//   - Thread id: discord:<channel_id>:<author_id> — one correlation per
-//     user per channel.
-//   - toAgentId: api.rootAgentId so the event lands in root's mailbox.
+//   - Only telegram-sourced messages (payload.source === "telegram"); the
+//     discord adapter emits channel-message too, and we must not relay its
+//     traffic into Telegram.
+//   - DMs (private chats): always pumped in.
+//   - Group chats: only if the chat is in watchedChats AND (the bot is
+//     @mentioned OR the wake-word matches content).
+//   - Thread id: telegram:<chat_id>:<user_id> — one correlation per user
+//     per chat.
 //
-// Outbound (chat.turn-end -> discord_send):
-//   - Accumulates chat.assistant-text chunks through the turn, filtered
-//     by threadId (not payload.sessionId — threading is a bus-level tag).
+// Outbound (chat.turn-end -> telegram_send):
+//   - Accumulates chat.assistant-text chunks through the turn.
 //   - On chat.turn-end, posts the accumulated text as one message.
-//   - asAgent is threaded so the call passes the same permission gate.
 //
-// Standing jobs (schedule_task deliver:{kind:"discord",channelId}):
-//   - The scheduler drives a turn on threadId discord:<channelId>:job:<jobId>
-//     with no prior inbound message. There is no stored route for that
-//     thread, so getOrDeriveRoute() lazily derives {channelId, originMessageId:
-//     null} straight from the threadId prefix. Deriving must happen at ALL
-//     THREE outbound sites — if we only derived at turn-end the accumulator
-//     would never have filled and the reply would be empty. Derived routes
-//     are per-turn: they're evicted at turn-end/error so they never shadow a
-//     real inbound conversation on the same channel later.
+// Standing jobs (schedule_task deliver:{kind:"telegram",chatId}):
+//   - The scheduler drives a turn on threadId telegram:<chatId>:job:<jobId>
+//     with no prior inbound message. getOrDeriveRoute() derives {chatId,
+//     originMessageId:null} from the threadId prefix — applied at ALL THREE
+//     outbound sites, or the accumulator never fills. Derived routes are
+//     per-turn and evicted at turn-end/error.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -74,30 +72,24 @@ interface ChannelMessage {
 
 interface Config {
   wakeWord: string;
-  watchedChannels: string[];
+  watchedChats: string[];
 }
 
 interface Route {
-  channelId: string;
-  // null when the route was derived from a standing-job threadId (no human
-  // message to reply to) — send to the channel with no reply reference.
+  chatId: string;
+  // null when derived from a standing-job threadId (no message to reply to).
   originMessageId: string | null;
 }
 
 const routes = new Map<string, Route>();
-// Threads whose route was lazily derived (standing jobs). Evicted per-turn so
-// a derived route never outlives its turn and shadows a real conversation.
 const derivedRoutes = new Set<string>();
 const accumulators = new Map<string, string[]>();
 const turnActors = new Map<string, string>();
-// Tracks threads where discord_send was called explicitly to the current
-// route during the turn. Other Discord sends must not suppress the reply.
 const turnExplicitSend = new Set<string>();
 
-// Loose bridge parse contract (shared shape with the scheduler's job-thread
-// ids): any discord:<channelId>:... threadId with no stored route delivers
-// channel-only, no reply_to.
-const DISCORD_THREAD_RE = /^discord:([^:]+):/;
+// Loose bridge parse contract: any telegram:<chatId>:... threadId with no
+// stored route delivers chat-only, no reply_to.
+const TELEGRAM_THREAD_RE = /^telegram:([^:]+):/;
 
 let cfg: Config | null = null;
 let wakeRe: RegExp | null = null;
@@ -109,18 +101,15 @@ function loadConfig(): Config {
 }
 
 function threadKey(msg: ChannelMessage): string {
-  return \`discord:\${msg.channel_id}:\${msg.author.id}\`;
+  return \`telegram:\${msg.channel_id}:\${msg.author.id}\`;
 }
 
-// Return the stored route, or lazily derive one from the threadId prefix for
-// standing-job / uncorrelated threads. Derived routes are tracked so they can
-// be evicted at end of turn.
 function getOrDeriveRoute(threadId: string): Route | null {
   const existing = routes.get(threadId);
   if (existing) return existing;
-  const m = DISCORD_THREAD_RE.exec(threadId);
+  const m = TELEGRAM_THREAD_RE.exec(threadId);
   if (!m) return null;
-  const route: Route = { channelId: m[1]!, originMessageId: null };
+  const route: Route = { chatId: m[1]!, originMessageId: null };
   routes.set(threadId, route);
   derivedRoutes.add(threadId);
   return route;
@@ -133,16 +122,16 @@ function evictDerived(threadId: string): void {
 function shouldAnswer(msg: ChannelMessage, c: Config, re: RegExp): boolean {
   if (msg.author.bot) return false;
   if (msg.is_dm) return true;
-  if (!c.watchedChannels.includes(msg.channel_id)) return false;
+  if (!c.watchedChats.includes(msg.channel_id)) return false;
   if (msg.is_mention) return true;
   return re.test(msg.content);
 }
 
 function cleanContent(raw: string, re: RegExp, isDm: boolean): string {
-  // Always strip @mentions of the bot — they're markdown noise to the
-  // LLM. Only strip the wake-word in channel messages where it was the
-  // trigger; in DMs the wake-word is conversational and stays.
-  let stripped = raw.replace(/<@!?[0-9]+>/g, "");
+  // Strip @bot mentions (Telegram sends them as @username text). Strip the
+  // wake-word only in group messages where it was the trigger; in DMs it's
+  // conversational and stays.
+  let stripped = raw.replace(/@[A-Za-z0-9_]+/g, "");
   if (!isDm) stripped = stripped.replace(re, "");
   stripped = stripped.trim();
   return stripped || raw;
@@ -165,16 +154,13 @@ export function register(api: any) {
 
   api.on("channel-message", (ev: any) => {
     const msg = ev.payload as ChannelMessage;
-    // Ignore other channels' traffic (telegram etc.) sharing the bus.
-    if (msg.source && msg.source !== "discord") return;
+    // Ignore other channels' traffic (discord etc.) sharing the bus.
+    if (msg.source && msg.source !== "telegram") return;
     if (!shouldAnswer(msg, cfg!, wakeRe!)) return;
     const threadId = threadKey(msg);
-    // A real inbound message: store (not derive) a route with a reply target.
-    routes.set(threadId, { channelId: msg.channel_id, originMessageId: msg.message_id });
+    routes.set(threadId, { chatId: msg.channel_id, originMessageId: msg.message_id });
     derivedRoutes.delete(threadId);
     const text = cleanContent(msg.content, wakeRe!, msg.is_dm);
-    // Retargeted threads (e.g. a secretary child taking over DMs) win
-    // over the default root mailbox.
     const target = api.resolveMailbox?.(threadId) ?? api.rootAgentId;
     api.publish(
       "chat.input",
@@ -194,18 +180,16 @@ export function register(api: any) {
     if (ev.actorId) turnActors.set(threadId, ev.actorId as string);
   });
 
-  // When discord_send is called explicitly to this conversation's route, mark
-  // the thread so the auto-relay at turn-end doesn't send a duplicate message.
   api.on("chat.tool-call", (ev: any) => {
     const threadId = ev.threadId;
     if (!threadId) return;
     const route = getOrDeriveRoute(threadId);
     if (!route) return;
     const p = ev.payload as { name?: string; input?: unknown };
-    if (p.name !== "discord_send") return;
+    if (p.name !== "telegram_send") return;
     const input = p.input && typeof p.input === "object" ? p.input as Record<string, unknown> : {};
     const replyTo = (input.reply_to as string | undefined) ?? null;
-    if (input.channel_id === route.channelId && replyTo === route.originMessageId) {
+    if (input.chat_id === route.chatId && replyTo === route.originMessageId) {
       turnExplicitSend.add(threadId);
     }
   });
@@ -220,20 +204,17 @@ export function register(api: any) {
     turnActors.delete(threadId);
     const explicit = turnExplicitSend.delete(threadId);
     try {
-      // If the agent already called discord_send explicitly this turn, the
-      // prose was already delivered (or intentionally omitted). Don't
-      // double-send.
       if (text && !explicit) {
-        const sendArgs: Record<string, unknown> = { channel_id: route.channelId, content: text };
+        const sendArgs: Record<string, unknown> = { chat_id: route.chatId, text };
         if (route.originMessageId) sendArgs.reply_to = route.originMessageId;
         await api.callTool(
-          "discord_send",
+          "telegram_send",
           sendArgs,
           actor ? { asAgent: actor } : undefined,
         );
       }
     } catch (err) {
-      console.error("[discord-communication] discord_send failed:", (err as Error).message);
+      console.error("[telegram-communication] telegram_send failed:", (err as Error).message);
     } finally {
       evictDerived(threadId);
     }
@@ -261,8 +242,8 @@ export function unload() {
 `,
     "smoke.ts":
 `// Smoke: validate the manifest has the config we expect. No network,
-// no event side effects — this bridge only makes sense once the
-// discord extension is loaded and actively emitting channel-message.
+// no event side effects — this bridge only makes sense once the telegram
+// extension is loaded and actively emitting channel-message.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -270,17 +251,17 @@ import { dirname, join } from "node:path";
 export async function smokeTest() {
   const here = dirname(new URL(import.meta.url).pathname);
   const m = JSON.parse(readFileSync(join(here, "manifest.json"), "utf8")) as {
-    config?: { wakeWord?: unknown; watchedChannels?: unknown };
+    config?: { wakeWord?: unknown; watchedChats?: unknown };
     callsTools?: unknown;
   };
   if (!m.config || typeof m.config.wakeWord !== "string" || m.config.wakeWord.length === 0) {
-    throw new Error("discord-communication: manifest.config.wakeWord must be a non-empty string");
+    throw new Error("telegram-communication: manifest.config.wakeWord must be a non-empty string");
   }
-  if (!Array.isArray(m.config.watchedChannels)) {
-    throw new Error("discord-communication: manifest.config.watchedChannels must be an array");
+  if (!Array.isArray(m.config.watchedChats)) {
+    throw new Error("telegram-communication: manifest.config.watchedChats must be an array");
   }
-  if (!Array.isArray(m.callsTools) || !m.callsTools.includes("discord_send")) {
-    throw new Error("discord-communication: manifest.callsTools must include \\"discord_send\\"");
+  if (!Array.isArray(m.callsTools) || !m.callsTools.includes("telegram_send")) {
+    throw new Error("telegram-communication: manifest.callsTools must include \\"telegram_send\\"");
   }
 }
 `,

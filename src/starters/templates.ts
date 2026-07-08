@@ -13,6 +13,8 @@ import { claudeCode } from "./templates/claude-code.ts";
 import { discord } from "./templates/discord.ts";
 import { discordCommunication } from "./templates/discord-communication.ts";
 import { github } from "./templates/github.ts";
+import { telegram } from "./templates/telegram.ts";
+import { telegramCommunication } from "./templates/telegram-communication.ts";
 
 export type { StarterTemplate };
 
@@ -22,6 +24,8 @@ const STARTERS: Record<string, StarterTemplate> = {
   discord,
   "discord-communication": discordCommunication,
   github,
+  telegram,
+  "telegram-communication": telegramCommunication,
 };
 
 export function listStarters(): StarterTemplate[] {

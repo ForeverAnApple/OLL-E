@@ -52,6 +52,9 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 interface ChannelMessage {
+  // source tags the emitting channel so a bridge can ignore other channels'
+  // messages when several adapters share the bus.
+  source: "discord";
   message_id: string;
   guild_id: string | null;
   channel_id: string;
@@ -250,6 +253,7 @@ function handleDispatch(type: string, data: any, config: DiscordConfig): void {
     if (!config.includeBotMessages && data.author?.bot) return;
     const mentions: string[] = (data.mentions ?? []).map((m: any) => m.id);
     const payload: ChannelMessage = {
+      source: "discord",
       message_id: data.id,
       guild_id: data.guild_id ?? null,
       channel_id: data.channel_id,
