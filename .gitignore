@@ -153,6 +153,7 @@ docs/plans/
 docs/design/*
 !docs/design/VISION.md
 !docs/design/ARCHITECTURE.md
+!docs/design/ROADMAP.md
 
 # Build output and local state
 .artifacts/
