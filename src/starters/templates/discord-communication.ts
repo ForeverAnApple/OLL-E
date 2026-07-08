@@ -2,7 +2,7 @@ import type { StarterTemplate } from "./types.ts";
 
 export const discordCommunication: StarterTemplate = {
   name: "discord-communication",
-  description: "Bridges Discord to/from the chat agent. DMs always active; guild channels require the channel to be in watchedChannels AND (wake-word match OR @mention). Accumulates assistant text until chat.turn-end, then posts one reply.",
+  description: "Bridges Discord to/from the chat agent. DMs always active; guild channels require the channel to be in watchedChannels AND (wake-word match OR @mention). Accumulates assistant text until chat.turn-end, then posts one reply. Standing-job threads deliver channel-only.",
   files: {
     "manifest.json": JSON.stringify(
       {
@@ -36,19 +36,24 @@ export const discordCommunication: StarterTemplate = {
 //   - Guild channels: only if the channel is in watchedChannels AND
 //     (the bot is mentioned OR the wake-word matches content).
 //   - Thread id: discord:<channel_id>:<author_id> — one correlation per
-//     user per channel. Channel-keyed sends land in the right place for
-//     MESSAGE_CREATE from threads too, so separate thread handling isn't
-//     needed.
+//     user per channel.
 //   - toAgentId: api.rootAgentId so the event lands in root's mailbox.
-//     Retargeting (a secretary taking over a thread, say) will be the
-//     agent's own job via retarget_thread.
 //
 // Outbound (chat.turn-end -> discord_send):
 //   - Accumulates chat.assistant-text chunks through the turn, filtered
 //     by threadId (not payload.sessionId — threading is a bus-level tag).
 //   - On chat.turn-end, posts the accumulated text as one message.
-//   - asAgent is threaded so the call passes the same permission gate
-//     the agent applies to its own tool dispatch.
+//   - asAgent is threaded so the call passes the same permission gate.
+//
+// Standing jobs (schedule_task deliver:{kind:"discord",channelId}):
+//   - The scheduler drives a turn on threadId discord:<channelId>:job:<jobId>
+//     with no prior inbound message. There is no stored route for that
+//     thread, so getOrDeriveRoute() lazily derives {channelId, originMessageId:
+//     null} straight from the threadId prefix. Deriving must happen at ALL
+//     THREE outbound sites — if we only derived at turn-end the accumulator
+//     would never have filled and the reply would be empty. Derived routes
+//     are per-turn: they're evicted at turn-end/error so they never shadow a
+//     real inbound conversation on the same channel later.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -73,15 +78,25 @@ interface Config {
 
 interface Route {
   channelId: string;
-  originMessageId: string;
+  // null when the route was derived from a standing-job threadId (no human
+  // message to reply to) — send to the channel with no reply reference.
+  originMessageId: string | null;
 }
 
 const routes = new Map<string, Route>();
+// Threads whose route was lazily derived (standing jobs). Evicted per-turn so
+// a derived route never outlives its turn and shadows a real conversation.
+const derivedRoutes = new Set<string>();
 const accumulators = new Map<string, string[]>();
 const turnActors = new Map<string, string>();
 // Tracks threads where discord_send was called explicitly to the current
 // route during the turn. Other Discord sends must not suppress the reply.
 const turnExplicitSend = new Set<string>();
+
+// Loose bridge parse contract (shared shape with the scheduler's job-thread
+// ids): any discord:<channelId>:... threadId with no stored route delivers
+// channel-only, no reply_to.
+const DISCORD_THREAD_RE = /^discord:([^:]+):/;
 
 let cfg: Config | null = null;
 let wakeRe: RegExp | null = null;
@@ -94,6 +109,24 @@ function loadConfig(): Config {
 
 function threadKey(msg: ChannelMessage): string {
   return \`discord:\${msg.channel_id}:\${msg.author.id}\`;
+}
+
+// Return the stored route, or lazily derive one from the threadId prefix for
+// standing-job / uncorrelated threads. Derived routes are tracked so they can
+// be evicted at end of turn.
+function getOrDeriveRoute(threadId: string): Route | null {
+  const existing = routes.get(threadId);
+  if (existing) return existing;
+  const m = DISCORD_THREAD_RE.exec(threadId);
+  if (!m) return null;
+  const route: Route = { channelId: m[1]!, originMessageId: null };
+  routes.set(threadId, route);
+  derivedRoutes.add(threadId);
+  return route;
+}
+
+function evictDerived(threadId: string): void {
+  if (derivedRoutes.delete(threadId)) routes.delete(threadId);
 }
 
 function shouldAnswer(msg: ChannelMessage, c: Config, re: RegExp): boolean {
@@ -133,7 +166,9 @@ export function register(api: any) {
     const msg = ev.payload as ChannelMessage;
     if (!shouldAnswer(msg, cfg!, wakeRe!)) return;
     const threadId = threadKey(msg);
+    // A real inbound message: store (not derive) a route with a reply target.
     routes.set(threadId, { channelId: msg.channel_id, originMessageId: msg.message_id });
+    derivedRoutes.delete(threadId);
     const text = cleanContent(msg.content, wakeRe!, msg.is_dm);
     // Retargeted threads (e.g. a secretary child taking over DMs) win
     // over the default root mailbox.
@@ -147,7 +182,8 @@ export function register(api: any) {
 
   api.on("chat.assistant-text", (ev: any) => {
     const threadId = ev.threadId;
-    if (!threadId || !routes.has(threadId)) return;
+    if (!threadId) return;
+    if (!getOrDeriveRoute(threadId)) return;
     const p = ev.payload as { text: string };
     const acc = accumulators.get(threadId) ?? [];
     acc.push(p.text);
@@ -159,12 +195,14 @@ export function register(api: any) {
   // the thread so the auto-relay at turn-end doesn't send a duplicate message.
   api.on("chat.tool-call", (ev: any) => {
     const threadId = ev.threadId;
-    if (!threadId || !routes.has(threadId)) return;
-    const route = routes.get(threadId)!;
+    if (!threadId) return;
+    const route = getOrDeriveRoute(threadId);
+    if (!route) return;
     const p = ev.payload as { name?: string; input?: unknown };
     if (p.name !== "discord_send") return;
     const input = p.input && typeof p.input === "object" ? p.input as Record<string, unknown> : {};
-    if (input.channel_id === route.channelId && input.reply_to === route.originMessageId) {
+    const replyTo = (input.reply_to as string | undefined) ?? null;
+    if (input.channel_id === route.channelId && replyTo === route.originMessageId) {
       turnExplicitSend.add(threadId);
     }
   });
@@ -172,23 +210,29 @@ export function register(api: any) {
   api.on("chat.turn-end", async (ev: any) => {
     const threadId = ev.threadId;
     if (!threadId) return;
-    const route = routes.get(threadId);
+    const route = getOrDeriveRoute(threadId);
     if (!route) return;
     const text = finalize(threadId);
     const actor = turnActors.get(threadId);
     turnActors.delete(threadId);
     const explicit = turnExplicitSend.delete(threadId);
-    // If the agent already called discord_send explicitly this turn, the prose
-    // was already delivered (or intentionally omitted). Don't double-send.
-    if (!text || explicit) return;
     try {
-      await api.callTool(
-        "discord_send",
-        { channel_id: route.channelId, content: text, reply_to: route.originMessageId },
-        actor ? { asAgent: actor } : undefined,
-      );
+      // If the agent already called discord_send explicitly this turn, the
+      // prose was already delivered (or intentionally omitted). Don't
+      // double-send.
+      if (text && !explicit) {
+        const sendArgs: Record<string, unknown> = { channel_id: route.channelId, content: text };
+        if (route.originMessageId) sendArgs.reply_to = route.originMessageId;
+        await api.callTool(
+          "discord_send",
+          sendArgs,
+          actor ? { asAgent: actor } : undefined,
+        );
+      }
     } catch (err) {
       console.error("[discord-communication] discord_send failed:", (err as Error).message);
+    } finally {
+      evictDerived(threadId);
     }
   });
 
@@ -198,11 +242,13 @@ export function register(api: any) {
     accumulators.delete(threadId);
     turnActors.delete(threadId);
     turnExplicitSend.delete(threadId);
+    evictDerived(threadId);
   });
 }
 
 export function unload() {
   routes.clear();
+  derivedRoutes.clear();
   accumulators.clear();
   turnActors.clear();
   turnExplicitSend.clear();

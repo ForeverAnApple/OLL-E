@@ -65,6 +65,25 @@ describe("starter templates", () => {
     expect(discord).not.toContain("TODO(agent): on 429");
   });
 
+  it("discord-communication derives standing-job routes at all three outbound sites", () => {
+    // No fake-ExtensionApi harness exists in test/, and hand-rolling one that
+    // loads the bridge module + a fake discord_send is disproportionate for a
+    // string-template starter. String-level assertion instead: the critical
+    // correctness point is that getOrDeriveRoute is applied at all three
+    // outbound sites (assistant-text accumulator, tool-call dedup, turn-end
+    // send) — deriving only at turn-end silently no-ops because the
+    // accumulator never fills.
+    const bridge = getStarter("discord-communication")!.files["index.ts"]!;
+    expect(bridge).toContain("function getOrDeriveRoute");
+    // Once at each of the three handlers plus the definition = 4 references.
+    const uses = bridge.match(/getOrDeriveRoute\(/g) ?? [];
+    expect(uses.length).toBeGreaterThanOrEqual(4);
+    // Loose prefix contract + derived-route eviction.
+    expect(bridge).toContain("DISCORD_THREAD_RE");
+    expect(bridge).toContain("derivedRoutes");
+    expect(bridge).toContain("evictDerived");
+  });
+
   it("cron-trigger unload clears its interval", async () => {
     installStarter({ name: "cron-trigger", extensionsDir: tmp, authorName: "a" });
     const manifestPath = join(tmp, "cron-trigger", "manifest.json");
