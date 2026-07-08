@@ -34,7 +34,7 @@ Each host runs one long-lived **daemon** process. Any number of **thin clients**
 │  │ scheduler (resource caps, token ledger)    │  │
 │  │ extension runtime (hot-reloaded from fs)   │  │
 │  │ decision inbox router                      │  │
-│  │ peer protocol (v1+ mesh; stub in v0)       │  │
+│  │ peer protocol (LAN mesh; see Cross-host)   │  │
 │  └────────────────────────────────────────────┘  │
 │  IPC socket: ~/.olle/run/olle.sock               │
 └──────────────────────────────────────────────────┘
@@ -90,10 +90,10 @@ A named logical identity. Has its own memory, tasks, tool access, budget allocat
 
 A source of events. Types in v0:
 
-- `cron` — fires on schedule
+- `cron` — fires on schedule. **Live** (LOG 2026-07-08): the standing-jobs subsystem persists `type='cron'` rows in the `triggers` table — the first real reader/writer of that schema, which had held zero rows ever — and arms them with `croner` timers. See "Standing jobs" below.
 - `poll` — fires when a polled endpoint changes (github issues, RSS, etc)
 - `webhook` — HTTP endpoint listens for inbound
-- `channel-message` — inbound from a chat adapter (Discord, CLI, future Slack)
+- `channel-message` — inbound from a chat adapter (Discord, Telegram, CLI, future Slack)
 - `internal-emit` — another task emitted an event
 
 ### Task
@@ -171,6 +171,24 @@ All action originates from events. The lifecycle:
 
 The bus is in-process within a host. Cross-host event propagation (v0 mesh) is handled by a **bridge** that mirrors events to peer hosts over a stable wire protocol. See "Mesh" below.
 
+## Standing jobs
+
+A standing job is a cron'd natural-language instruction — how the agent makes itself useful without being prompted (LOG 2026-07-08, the push-first program). It is the first live use of the `cron` trigger type and the `triggers` table.
+
+**Determinism in the substrate, cognition only inside the turn.** The cron fires in code; the *only* stochastic part is the agent turn the fire wakes. `src/schedule/` (`createCronScheduler`) arms `croner` timers — at boot via `loadAndArm()` (reads every `type='cron'` row) and live via the `schedule.armed` / `schedule.cancelled` bus events the `schedule_*` tools publish, so a job scheduled mid-run starts firing without a restart. The tool and the scheduler couple through the bus, not a shared handle. This shape is a deliberate rejection of LLM-turn "heartbeats," which hallucinate actions and make the schedule itself nondeterministic; the schedule is a fact in the substrate, and the agent reasons only about *what to do* when woken.
+
+**Fire path and delivery contract.** `fireJob` publishes a durable `chat.input` `{ text: instruction, standingJob: true, jobId }` addressed to the job's agent on a deterministic thread id (reusing the mail-wake seam in `src/agent/chat.ts`), plus a durable `schedule.fired` audit event. The thread id encodes the destination so a channel bridge can route the resulting turn's output with no prior inbound message on the thread (`src/schedule/thread.ts`):
+
+- `cli` → `cron:<jobId>` (local terminal thread)
+- `discord` → `discord:<channelId>:job:<jobId>`
+- `telegram` → `telegram:<chatId>:job:<jobId>`
+
+Bridges parse any `^(discord|telegram):<id>:` thread they hold no stored inbound route for and deliver channel-only (no `reply_to`) — one parse contract (`CHANNEL_THREAD_PREFIX_RE`) shared by tool, scheduler, and bridges.
+
+**Misfire policy: skip missed-while-down.** Arming computes the next *future* fire; a daemon asleep across a scheduled time does not replay it on boot. A standing job's value is fresh-at-fire-time, so a missed fire is dropped rather than replayed stale — no catch-up burst.
+
+New durable events: `schedule.armed`, `schedule.cancelled`, `schedule.fired`.
+
 ## Hierarchical authorization (ask-up)
 
 Every strategic/vision action goes through approval. The protocol:
@@ -214,6 +232,8 @@ Agents never block waiting. Every inbox-originated task continues other work whi
 
 Two surfaces close the loop after resolution. The **from-idle wake** (LOG 2026-04-26) fires a synthetic `chat.input` on the proposing agent's `mailbox:<agentId>` thread when `decision.resolved` lands — a small, bounded thread the agent processes cheaply. The **on-next-turn sidebar** (LOG 2026-04-27) renders unread resolutions in the per-turn system prompt for whichever thread the proposer next runs in, so the close-loop reply lands where the user is watching without forcing a turn on the originating thread when the resolution itself arrives — important when that thread is large. The high-water mark for "unread" is in-memory and initialized to loop start on restart, so pre-restart resolutions are not automatically re-rendered. Pull-side `mail_list({direction:"out", includeResolved:true})` is the durable audit.
 
+**Resolution executes, it isn't just a doorbell.** `respond()` flips the decision status and emits `decision.resolved`; that alone wakes the proposer but mutates no state. For `grant_scope` — the auto-proposal a denied tool call files (LOG 2026-04-22 permissions) — a dedicated executor (`src/permissions/grant.ts`, LOG 2026-07-08) subscribes to `decision.resolved` and, on `approved` / `modified`, merges the `{tool, tier}` into the target agent's `agents.scope`, gated by `narrowsScope` against the approver (you can't grant authority you don't hold). It publishes `scope.granted` or `scope.grant-rejected`. Before this executor, approving a `grant_scope` did nothing and the retried call was denied identically — the "approve-hang" bug. `denied` / `stale` / freeform resolutions stay wake-only; only `grant_scope` has a concrete action to execute (the 2026-04-27 rejection of generic decision-resumption still holds for everything else).
+
 ## Budget and token ledger
 
 Budget is owned by **principals**. Principals allocate portions to **agents**. Every LLM call (and, eventually, paid tool operation) writes a `ledger` row carrying token counts. Thresholds (80%, 100%) auto-post inbox items. Exceeding cap → agent pauses spending, continues non-paid work.
@@ -255,7 +275,7 @@ Tool schemas (name + description + JSON Schema) cost LLM context every turn. Wit
 
 **Always-loaded core (`alwaysLoaded: true` on `ToolDef`):** five tools, in the LLM's tool list every turn — `load_tools`, `query_self`, `mail_list`, `memory_search`, `memory_write`. The orientation + mailbox + memory primitives most strategic turns need; `memory_write` joins the read-half so any turn worth remembering can record without a `load_tools` round-trip first (LOG 2026-04-28 — the soul-seeding bootstrap interview makes this load-bearing). `unload_tools` is also always-loaded but isn't conceptually "core" — it's the partner to `load_tools`. Everything else (extension authoring, observability beyond `query_self`, delegation, secrets, scratch, memory lineage, host context, extension-registered tools) is deferred.
 
-**The catalog** lives in the stable system segment alongside principles. It's a pure function of the registered tool set: rich category prose ("when to reach for these") + minimal `name — short clause` per tool, grouped by category. Categories: `loadout`, `observability`, `memory`, `delegation`, `mailbox`, `extension authoring`, `secrets`, `host context`, `scratch`. Extension-contributed categories render with a default blurb until the core registry learns them. The catalog does NOT include "loaded right now" markers — that state lives in the tools block (cached separately) and would otherwise invalidate the catalog inside the cached identity prefix.
+**The catalog** lives in the stable system segment alongside principles. It's a pure function of the registered tool set: rich category prose ("when to reach for these") + minimal `name — short clause` per tool, grouped by category. Categories: `loadout`, `observability`, `memory`, `delegation`, `mailbox`, `scheduling`, `extension authoring`, `secrets`, `host context`, `scratch`. Extension-contributed categories render with a default blurb until the core registry learns them. The catalog does NOT include "loaded right now" markers — that state lives in the tools block (cached separately) and would otherwise invalidate the catalog inside the cached identity prefix.
 
 **Loading and unloading:**
 
@@ -350,17 +370,24 @@ Trigger declarations are themselves authority statements for their `type` field 
 - Loadout meta-tools: `load_tools`, `unload_tools` — bring deferred tool schemas into / out of a thread's context (see "Tool catalog and lazy loading")
 - Observability tools: `query_my_usage`, `query_my_budget`, `query_my_runs`, `query_my_threads`, `query_self`, `query_events` — agents read their own world; CLI uses the same query layer
 - Tool-result recovery: `read_tool_result` — fetch a slice of a spilled tool output by handle (see "Tool-result truncation")
+- Scheduling: `schedule_task` / `schedule_list` / `schedule_cancel` — the agent's front door to the cron subsystem; register/list/cancel standing jobs (category `scheduling`, tier `operational`, self-only target, ~50/agent cap). See "Standing jobs"
 - Self-config: `set_thinking_model` / `set_reasoning_effort` — the agent picks the model it reasons in and how hard it thinks; persist as `thinking-model` / `reasoning-effort` memories, resolved per-thread and frozen at thread creation (a switch applies to the next new thread, no restart). The two are chosen independently, so `src/llm/models.ts` holds per-model capability facts (supported effort levels, output ceiling) and `runAgent` clamps the resolved `(model, effort, max_tokens)` together — an unsupported pair degrades instead of bricking the loop. A model switch smoke-tests the candidate (1-token probe via the adapter) before committing, so a priced-but-unserved model can never be stored; the `OLLE_MODEL` env override (`resolveBootModel`) is the human rescue hatch that outranks the memory at boot for a muted agent (LOG 2026-06-08)
 
 ### Starter templates (shipped read-only; agents clone and modify)
 
-- `discord` — bot gateway + message send/receive
-- `github` — webhook receiver + API calls (issues, PRs, comments)
-- `slack` (v0.1)
+Eight ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting what it does, the exact secrets and how to acquire them, and an install→set-secret→register→smoke walkthrough written for the agent to narrate conversationally. `install_starter` / `list_starters` return `hasSetupGuide` and nudge reading it before asking for secrets — so onboarding a channel is a conversation, not a guess.
+
+- `discord` — bot gateway + message send/receive; hardened with RESUME + backoff, heartbeat-ACK zombie detection, 429 retry
+- `discord-communication` — wake-word chat behavior over the discord gateway; standing-job channel routing (lazy `getOrDeriveRoute`)
+- `telegram` — long-poll `getUpdates` adapter; `telegram_send` (HTML-escaped, 4096-char chunked), `telegram_fetch_context`
+- `telegram-communication` — structural port of `discord-communication` for Telegram
+- `github` — webhook receiver + API calls (issues, PRs, comments); `github_activity` since-based delta tool
+- `freshrss` — Google Reader API (ClientLogin); `freshrss_unread` / `freshrss_feeds` (operational), `freshrss_mark_read` (strategic)
 - `cron-trigger`
-- `http-webhook-trigger`
 - `claude-code` — subprocess invocation
-- `codex` (v0.1)
+- `http-webhook-trigger` (v0.1), `slack` (v0.1), `codex` (v0.1)
+
+`channel-message` payloads carry `source: "discord"|"telegram"` and each bridge filters on it, so a two-bridge host never relays its own cross-channel echoes. The generic RSS starter was cut — FreshRSS subsumes it.
 
 ### Rollback
 
@@ -510,7 +537,6 @@ All commands are thin RPC wrappers over the daemon's IPC endpoint. Every observa
 
 ## Seams intentionally unbuilt in v0
 
-- Peer wire protocol (bridge code is stubbed; team mesh in v0 is single-host reachable)
 - Quorum-of-principals flow (pathway exists in schema; v0 treats all decisions as single-principal)
 - Web UI (IPC socket is ready for it)
 - Sandbox beyond process boundary

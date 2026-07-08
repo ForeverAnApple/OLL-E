@@ -1181,6 +1181,39 @@ The five entries above were authored on `feat/model-effort-self-config`, a branc
 
 Verified: `tsc` clean, 433 pass / 2 skip / 0 fail, the 65 model/effort feature tests green against the Vercel mock.
 
+---
+
+## 2026-07-08 — Agent-direct task authoring, unparked: standing jobs land as `schedule_*` + the `triggers` table
+
+Three prior entries parked agent-direct task authoring behind extension packaging. LOG 2026-04-22 (Discord/GitHub architecture) blessed `register_task` in the self-mod vocabulary but left it unbuilt ("task-only authoring still goes through extension packaging for v0", line 150). LOG 2026-04-22 (scheduler) parked the `register_task` meta-tool explicitly: "Revisit when an agent actually wants to author a task file without wrapping it in an extension" (line 180). LOG 2026-04-23 (dream) re-parked it a third time (line 280). The resurrect-when has now fired — but not as `register_task`.
+
+**The condition was met by the push-first program, not by an agent wanting to hand-write a handler.** The real want turned out narrower and sharper: the agent needs to make *itself* fire on a schedule — a morning digest, a recurring check — with no human at the keyboard. That doesn't need arbitrary task-file authoring; it needs one specific behavior (cron → wake a turn) exposed as a tool. So the unpark takes the shape of `schedule_task` / `schedule_list` / `schedule_cancel` core tools writing `type='cron'` rows into the previously-dead `triggers` table — the first live reader/writer of a schema that shipped in 0001 and had held zero rows ever. No new primitive, no migration, no `register_task`.
+
+**The locked rule: determinism in the substrate, cognition only inside the turn.** A standing job is a cron'd natural-language instruction. The cron fires in code (`croner` in `src/schedule/`), the delivery route is computed deterministically from the job's config, and the *only* stochastic part is the agent turn the fire wakes. This is a direct correction of the owner's OpenClaw experience, where "heartbeat" prompts — waking the LLM every N minutes to decide whether to act — hallucinated messages that were never sent and made the schedule itself nondeterministic (the agent would sometimes skip its own job, sometimes fire twice). **Heartbeat is explicitly rejected.** The schedule is a fact in the substrate; the agent reasons about *what to do* when woken, never about *whether it is time*.
+
+**Operational tier, self-only target.** `schedule_*` are `operational` — scheduling yourself to post a digest is not a strategic act, and gating it behind the inbox would defeat the whole point (push without a human in the loop). The guard that keeps this safe is target-scoping: a job always runs as its creator, on its creator's budget and tools; `schedule_cancel` enforces `agentId === ctx.actorId`. Cross-agent scheduling — "schedule *that* agent to do X" — is a different act with a real authority question, and it would be strategic. `[DEFERRED-to-v0.1]` Cross-agent standing jobs. **Resurrect when:** an agent has a concrete need to schedule a peer or child, at which point the target check becomes an ask-up rather than an ownership reject.
+
+**Misfire policy: skip missed-while-down.** Arming computes the next *future* fire; a daemon asleep across a scheduled time does not replay it on boot. The alternative — catch-up bursts — is worse for a natural-language job: a laptop closed over a weekend would wake to three days of stale "post yesterday's digest" turns, each now wrong. A standing job's value is fresh-at-fire-time; a missed fire is better dropped than replayed stale.
+
+---
+
+## 2026-07-08 — Push-first: OLL-E was pull-only and therefore unused; making it push
+
+**The diagnosis.** A forensic pass on the owner's own install turned up the damning fact: the `tasks`, `triggers`, and `decisions` tables had zero real rows, ever. Every capability the system had grown — the extension loop, the scheduler, the inbox, the ask-up chain — was reachable only by a human first typing into `olle chat`. OLL-E was pull-only. The owner had built a substrate for proactive agents and then never used it, because using it required him to initiate every single time. A world agents are supposed to "love to live in" that only moves when poked is a chat client with extra steps.
+
+**The fix is to make the system push**, along four fronts landed in this program (9 commits):
+
+- **Standing jobs** (entry above) — the agent schedules itself to fire, so useful work lands unprompted. This is the load-bearing piece; everything else serves it.
+- **Channel starters that reach the human where they already are** — `telegram` (long-poll `getUpdates` adapter + `telegram_send`) and `telegram-communication`, alongside the existing Discord pair, so a digest can land in the app the owner actually checks. `freshrss` (Google Reader API) and a new `github_activity` delta tool give the digest something worth saying.
+- **SETUP.md on all eight starters** + an `install_starter` nudge (`hasSetupGuide` in the tool return), so the agent walks a human through BotFather / a GitHub PAT / FreshRSS API creds conversationally instead of guessing at secrets or asking for tokens in chat.
+- **Deterministic bridge routing with source disambiguation** — a fired job's turn runs on a channel-encoded thread id (`discord:<channelId>:job:<jobId>`) the bridge routes from the id alone, with no prior inbound message on the thread; `channel-message` payloads now carry `source: "discord"|"telegram"` and each bridge filters on it, so a two-bridge host doesn't relay its own cross-channel echoes.
+
+**grant_scope executor — the approve-hang gap.** Adjacent bug, fixed in the same program. When a denied tool call auto-proposed `grant_scope` to the inbox (LOG 2026-04-22 permissions), approving it did *nothing*: `inbox.respond()` flipped the decision status and emitted `decision.resolved`, but no code ever mutated `agents.scope`. Approve was a doorbell — the next call was denied again, identically. `src/permissions/grant.ts` is the missing executor: on an approved/modified `grant_scope` resolution it merges `{tool, tier}` into the target's scope, gated by `narrowsScope` against the approver (you can't grant authority you don't hold), and publishes `scope.granted` / `scope.grant-rejected`. `denied` / `stale` / freeform resolutions stay wake-only — consistent with the 2026-04-27 rejection of generic decision-resumption (only `grant_scope` has a concrete thing to execute).
+
+**The phase gate.** No Phase-2 capability work — email, calendar, more data sources — until the loop proves itself: an unprompted, useful digest lands in a channel on **5 separate days**. The gate is deliberately behavioral, not a feature checklist. The failure mode this whole program corrects was building capability nobody used; the discipline is to not build more until the existing loop demonstrates it earns a human's attention day after day. Counting starts from the first real 8am digest job.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.
