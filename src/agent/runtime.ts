@@ -77,6 +77,14 @@ export interface AgentRunOptions {
    *  TruncationState across turns of one thread to keep the prompt cache
    *  prefix stable. */
   truncate?: TruncateOptions;
+  /** Value-level secret scrubbing. When supplied, applied to each tool
+   *  result's rendered string BEFORE truncation/spill, so previews, spilled
+   *  `tool_results` rows, message history, and the derived `tool_result`
+   *  step events (→ chat.tool-result) all carry the redacted form. This is
+   *  the single choke point: everything downstream reads the scrubbed
+   *  string. Distinct from `redactToolResult` (input-declared sensitive
+   *  fields) — this catches raw secret bytes a tool surfaced by itself. */
+  scrubResult?: (content: string) => string;
   /** Cancel the in-flight turn. Forwarded to the LLM call so streaming
    *  aborts at network level; also checked between rounds so a fired
    *  abort during a tool call ends the turn before the next LLM hop. */
@@ -286,12 +294,16 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
         const result = await tool.execute(args, opts.toolCtx);
         const safeResult = redactToolResult(tool, result);
         const rendered = typeof safeResult === "string" ? safeResult : JSON.stringify(safeResult);
-        let final = rendered;
+        // Scrub known secret values first, so the redaction rides into the
+        // spill preview / persisted row and every event derived from this
+        // content — not just the live message.
+        const scrubbed = opts.scrubResult ? opts.scrubResult(rendered) : rendered;
+        let final = scrubbed;
         if (opts.truncate && !tool.sensitiveOutput) {
           final = maybeTruncateOne({
             id: block.id,
             toolName: block.name,
-            content: rendered,
+            content: scrubbed,
             perToolMaxBytes: tool.maxResultBytes,
             options: opts.truncate,
           });

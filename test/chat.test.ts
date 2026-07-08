@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBus, persistToStore } from "../src/bus/index.ts";
@@ -698,6 +698,77 @@ describe("agent loop over the mailbox", () => {
       expect(snapshot).toContain("[redacted]");
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("scrubs known secret values from tool results (history, snapshot, event)", async () => {
+    const r = rig();
+    const dir = mkdtempSync(join(tmpdir(), "olle-threads-"));
+    const secretsDir = mkdtempSync(join(tmpdir(), "olle-secrets-"));
+    try {
+      // Planted secrets: one long enough to scrub, one under the 8-char floor.
+      writeFileSync(join(secretsDir, "LONGSECRET"), "s3cr3t-token-value");
+      writeFileSync(join(secretsDir, "SHORTONE"), "pass1");
+
+      const loaded = new Set<string>(["leak-ext"]);
+      const leakTool: ToolDef<Record<string, unknown>, string> = {
+        name: "leak_tool",
+        description: "returns raw secret bytes",
+        inputSchema: { type: "object", properties: {} },
+        execute: () => "dump: s3cr3t-token-value and pass1",
+      };
+      const extensions = fakeLiveExtensionHost({
+        loaded,
+        extensionName: "leak-ext",
+        tool: leakTool,
+      });
+      const llm = mockLlm([toolUseTurn("leak_tool", {}), endTurn("done")]);
+
+      const results: string[] = [];
+      r.bus.subscribe("chat.tool-result", (e) => {
+        results.push((e.payload as { content: string }).content);
+      });
+
+      startAgentLoop({
+        bus: r.bus,
+        store: r.store,
+        hostId: r.hostId,
+        llm,
+        agentId: r.agentId,
+        extensions,
+        threadsDir: dir,
+        secretsDir,
+      });
+
+      const done = new Promise<void>((resolve) => {
+        r.bus.subscribe("chat.turn-end", () => resolve());
+      });
+      r.bus.publish({
+        type: "chat.input",
+        hostId: r.hostId,
+        actorId: "cli",
+        durable: true,
+        toAgentId: r.agentId,
+        threadId: "leak",
+        payload: { text: "leak it" },
+      });
+      await done;
+
+      // Event payload: long value redacted, short value left intact.
+      const event = results.find((c) => c.startsWith("dump:"));
+      expect(event).toBeDefined();
+      expect(event).not.toContain("s3cr3t-token-value");
+      expect(event).toContain("[redacted:LONGSECRET]");
+      expect(event).toContain("pass1");
+
+      // Persisted snapshot (history) mirrors the event.
+      const snapshot = readFileSync(join(dir, "root", "leak.json"), "utf8");
+      expect(snapshot).not.toContain("s3cr3t-token-value");
+      expect(snapshot).toContain("[redacted:LONGSECRET]");
+      expect(snapshot).toContain("pass1");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(secretsDir, { recursive: true, force: true });
     }
   });
 

@@ -30,6 +30,33 @@ export function redactInput(input: unknown, fields: string[]): Record<string, un
   return out;
 }
 
+/** Minimum secret-value length eligible for value-level scrubbing. A
+ *  floor keeps a short token (e.g. "1234") from redacting every incidental
+ *  substring in a tool result. Eight chars is well below any real API key
+ *  and above the noise. */
+export const MIN_SECRET_SCRUB_LEN = 8;
+
+/** Replace every exact occurrence of a known secret VALUE in `content` with
+ *  `[redacted:<NAME>]`. This is distinct from the input-field redaction
+ *  above: that hides declared `sensitiveInputFields` on a tool's *input*;
+ *  this catches a secret's raw bytes surfacing in a tool *result* — e.g. an
+ *  agent that reads `~/.olle/secrets/FOO` through a shell tool. Applied
+ *  before a result enters message history / thread snapshots / the
+ *  `chat.tool-result` event, so the value never lands in a durable
+ *  transcript. Assistant text and user input are deliberately left alone:
+ *  by induction the model can't repeat a value it never saw. */
+export function scrubSecrets(content: string, secrets: Map<string, string>): string {
+  if (!content) return content;
+  let out = content;
+  for (const [name, value] of secrets) {
+    if (value.length < MIN_SECRET_SCRUB_LEN) continue;
+    if (!out.includes(value)) continue;
+    // split/join is a literal, all-occurrences replace (no regex escaping).
+    out = out.split(value).join(`[redacted:${name}]`);
+  }
+  return out;
+}
+
 export function redactMessages(
   messages: Message[],
   redactions: Map<string, string[]>,

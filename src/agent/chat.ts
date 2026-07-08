@@ -45,7 +45,14 @@ import {
   type TruncationState,
 } from "./tool-truncate.ts";
 import { runAgent, type AgentStep } from "./runtime.ts";
-import { buildRedactionMap, mergeRedactionMap, redactInput, redactMessages } from "./redaction.ts";
+import {
+  buildRedactionMap,
+  mergeRedactionMap,
+  redactInput,
+  redactMessages,
+  scrubSecrets,
+} from "./redaction.ts";
+import { getSecretsProvider } from "./secrets-provider.ts";
 import { listStarters } from "../starters/index.ts";
 
 export interface AgentLoopOptions {
@@ -88,6 +95,11 @@ export interface AgentLoopOptions {
   /** Root directory for per-thread message snapshots. Per agent, per
    *  thread. Omit to disable persistence. */
   threadsDir?: string;
+  /** Host secrets dir. When set, tool results are scrubbed of any exact
+   *  secret VALUE before they enter history / snapshots / the
+   *  chat.tool-result event (see scrubSecrets). Omit to disable scrubbing
+   *  (tests that don't touch secrets). */
+  secretsDir?: string;
   /** Debounce window for mail wake (ms). Override in tests; default
    *  MAIL_WAKE_DEBOUNCE_MS. Set to 0 to fire synchronously per event
    *  (useful in tests that don't want to await timers). */
@@ -490,6 +502,12 @@ async function runTurn(
                 content,
               }),
           }
+        : undefined,
+      // Value-level secret scrubbing. Reads the live secret set (mtime-
+      // cached) each result so a mid-session set_secret is honored; runs
+      // before truncation in the runtime so spilled rows are scrubbed too.
+      scrubResult: opts.secretsDir
+        ? (content) => scrubSecrets(content, getSecretsProvider(opts.secretsDir!)())
         : undefined,
       onStep: (step) => emitStep(opts, thread.id, origin, step, redactToolInput),
       authorize: (tool) =>

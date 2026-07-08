@@ -40,6 +40,9 @@ export interface AgentManagerDeps {
   ownerAgentId?: string;
   /** Where per-thread snapshots live. */
   threadsDir?: string;
+  /** Host secrets dir, forwarded to every child loop so their tool results
+   *  are scrubbed of secret values the same way the root loop's are. */
+  secretsDir?: string;
   /** Default model the manager starts children with. Omit to use the
    *  llm adapter's defaultModel. */
   model?: string;
@@ -220,6 +223,7 @@ export function createAgentManager(deps: AgentManagerDeps): AgentManager {
       inbox: deps.inbox,
       ownerAgentId: deps.ownerAgentId,
       threadsDir: deps.threadsDir,
+      secretsDir: deps.secretsDir,
       model: deps.model,
       effort: deps.effort,
       resolveModel: resolveChildModel,

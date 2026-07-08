@@ -396,6 +396,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         inbox,
         ownerAgentId: humanAgentId,
         threadsDir: paths.threadsDir,
+        secretsDir: paths.secretsDir,
         hostContext: buildHostContextPrompt(paths, hostId),
         resolveModel: (agentId) => resolveBootModel(store, agentId),
         resolveEffort: (agentId, model) => resolveReasoningEffort(store, agentId, model),
@@ -546,6 +547,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         inbox,
         ownerAgentId: humanAgentId,
         threadsDir: paths.threadsDir,
+        secretsDir: paths.secretsDir,
         toolTruncate,
         // The agent's self-chosen model + effort (private memories), resolved
         // per-thread at thread creation rather than once at loop start, so a
