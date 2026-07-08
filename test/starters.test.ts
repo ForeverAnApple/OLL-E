@@ -26,6 +26,7 @@ describe("starter templates", () => {
       "cron-trigger",
       "discord",
       "discord-communication",
+      "freshrss",
       "github",
       "telegram",
       "telegram-communication",
@@ -57,6 +58,9 @@ describe("starter templates", () => {
     for (const name of ["github_create_issue", "github_add_comment", "github_close_issue"]) {
       expect(github).toMatch(new RegExp(`name: "${name}"[\\s\\S]*?tier: "strategic"`));
     }
+
+    const freshrss = getStarter("freshrss")!.files["index.ts"]!;
+    expect(freshrss).toMatch(/name: "freshrss_mark_read"[\s\S]*?tier: "strategic"/);
   });
 
   it("discord template ships hardened reconnect/resume + 429 handling", () => {
