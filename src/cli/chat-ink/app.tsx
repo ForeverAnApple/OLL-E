@@ -498,8 +498,9 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
   async function onSubmit(text: string): Promise<void> {
     const trimmed = text.replace(/\s+$/, "");
     if (!trimmed) return;
-    // @inkjs/ui's <TextInput> reducer has no submit case — bump the
-    // remount key and clear the mirror so the next render is fresh.
+    // <TextInput> keeps its own buffer and doesn't self-clear on
+    // submit — bump the remount key to reset it and clear the mirror
+    // so the next render is fresh.
     setInputKey((k) => k + 1);
     setInputText("");
     if (trimmed.startsWith("/")) {

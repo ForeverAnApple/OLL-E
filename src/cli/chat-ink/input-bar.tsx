@@ -4,7 +4,8 @@
 // footer info below the bottom divider.
 
 import { Box, Text } from "ink";
-import { Spinner, TextInput } from "@inkjs/ui";
+import { Spinner } from "@inkjs/ui";
+import { TextInput } from "./text-input.tsx";
 import { theme, sym } from "./theme.ts";
 import { matchSlash, exactCommand, splitSlash, type SlashCommand } from "./commands.ts";
 
