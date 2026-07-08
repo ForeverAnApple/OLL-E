@@ -289,13 +289,14 @@ export function register(api: any) {
     async execute({ chat_id, text, reply_to }: { chat_id: string; text: string; reply_to?: string }) {
       const chunks = chunkText(htmlEscape(text));
       const messageIds: number[] = [];
-      for (const chunk of chunks) {
+      for (const [i, chunk] of chunks.entries()) {
         const body: Record<string, unknown> = {
           chat_id,
           text: chunk,
           parse_mode: cfg?.parseMode ?? "HTML",
         };
-        if (reply_to) body.reply_to_message_id = Number(reply_to);
+        // Attach the reply only to the first chunk; the rest continue the thread.
+        if (reply_to && i === 0) body.reply_to_message_id = Number(reply_to);
         const res = await tg("sendMessage", { body });
         messageIds.push(res.message_id);
       }
