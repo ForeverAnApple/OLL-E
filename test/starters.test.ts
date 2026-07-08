@@ -51,6 +51,20 @@ describe("starter templates", () => {
     }
   });
 
+  it("discord template ships hardened reconnect/resume + 429 handling", () => {
+    const discord = getStarter("discord")!.files["index.ts"]!;
+    // RESUME support: capture the resume gateway url and send op-6 RESUME.
+    expect(discord).toContain("resume_gateway_url");
+    expect(discord).toContain("UNRESUMABLE_CLOSE_CODES");
+    // Heartbeat-ACK zombie detection.
+    expect(discord).toContain("awaitingAck");
+    // Bounded 429 retry reading retry_after.
+    expect(discord).toContain("retry_after");
+    // The old TODO markers must be gone — the gaps are closed.
+    expect(discord).not.toContain("TODO(agent): exponential backoff");
+    expect(discord).not.toContain("TODO(agent): on 429");
+  });
+
   it("cron-trigger unload clears its interval", async () => {
     installStarter({ name: "cron-trigger", extensionsDir: tmp, authorName: "a" });
     const manifestPath = join(tmp, "cron-trigger", "manifest.json");

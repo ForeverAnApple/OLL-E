@@ -2,7 +2,7 @@ import type { StarterTemplate } from "./types.ts";
 
 export const discord: StarterTemplate = {
   name: "discord",
-  description: "Discord gateway adapter. Opens the v10 gateway WS, emits channel-message + member-join triggers, exposes send/react/fetch-context/list-channels tools. Near-working skeleton — agent fills in reconnect/resume/rate-limit handling.",
+  description: "Discord gateway adapter. Opens the v10 gateway WS, emits channel-message + member-join triggers, exposes send/react/fetch-context/list-channels tools. Handles reconnect/resume, heartbeat-ACK zombie detection, and 429 backoff.",
   files: {
     "manifest.json": JSON.stringify(
       {
@@ -31,9 +31,12 @@ export const discord: StarterTemplate = {
     "index.ts":
 `// discord: gateway adapter. Opens a single Discord Gateway v10 connection
 // per host, fans dispatch events into two triggers (channel-message,
-// member-join), and exposes four REST tools. Designed as a skeleton —
-// reconnect/resume, rate-limit handling, and richer dispatch coverage are
-// left as the agent's job to flesh out on first activation.
+// member-join), and exposes four REST tools.
+//
+// This version closes the three skeleton gaps: reconnect with RESUME +
+// exponential backoff, heartbeat-ACK zombie detection, and 429 backoff in
+// the REST path. Dispatch coverage is still deliberately narrow — extend
+// handleDispatch as tasks need more event types.
 //
 // Shape rules (don't break these without a logged decision):
 //   - One gateway connection per extension load. Triggers share it via
@@ -76,15 +79,29 @@ interface DiscordConfig {
   includeBotMessages: boolean;
 }
 
+// Close codes that can't be resumed — the session is gone, so we must
+// re-IDENTIFY on the next connect rather than op-6 RESUME.
+// 4004 auth failed, 4010 invalid shard, 4011 sharding required,
+// 4012 invalid api version, 4013 invalid intents, 4014 disallowed intents.
+const UNRESUMABLE_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
+
 // Module-scoped gateway state. One connection per extension load.
 let ws: WebSocket | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let lastSeq: number | null = null;
 let sessionId: string | null = null;
+let resumeGatewayUrl: string | null = null;
 let botUserId: string | null = null;
 let closing = false;
 let cfg: DiscordConfig | null = null;
 let authHeader = "";
+// true = send op-6 RESUME on the next HELLO (and dial resumeGatewayUrl).
+let resuming = false;
+// Exponential-backoff counter; reset to 0 on a clean READY/RESUMED.
+let reconnectAttempts = 0;
+// Set when we send a heartbeat, cleared on op-11 ACK. If still set when the
+// next beat is due, the connection is a zombie — force-close to reconnect.
+let awaitingAck = false;
 
 const channelMessageSubscribers: Array<(p: ChannelMessage) => void> = [];
 const memberJoinSubscribers: Array<(p: MemberJoin) => void> = [];
@@ -101,10 +118,43 @@ function sendOp(op: number, d: unknown): void {
   }
 }
 
+function startHeartbeat(interval: number): void {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  awaitingAck = false;
+  heartbeatTimer = setInterval(() => {
+    if (awaitingAck) {
+      // Prior beat was never ACKed — zombie connection. Force-close with a
+      // resumable code so the reconnect path fires a RESUME.
+      try { ws?.close(4000); } catch {}
+      return;
+    }
+    awaitingAck = true;
+    sendOp(1, lastSeq);
+  }, interval);
+}
+
+function scheduleReconnect(token: string, config: DiscordConfig, code: number): void {
+  if (UNRESUMABLE_CLOSE_CODES.has(code)) {
+    // Session is unrecoverable — drop it and IDENTIFY fresh next time.
+    resuming = false;
+    sessionId = null;
+    resumeGatewayUrl = null;
+  } else if (sessionId) {
+    // We have a session — try to resume on reconnect.
+    resuming = true;
+  }
+  const delay = Math.min(30_000, 1000 * 2 ** reconnectAttempts) + Math.floor(Math.random() * 1000);
+  reconnectAttempts += 1;
+  setTimeout(() => openGateway(token, config), delay);
+}
+
 function openGateway(token: string, config: DiscordConfig): void {
   if (ws) return; // already open
   authHeader = \`Bot \${token}\`;
-  ws = new WebSocket(config.gatewayUrl);
+  const url = resuming && resumeGatewayUrl
+    ? \`\${resumeGatewayUrl}/?v=10&encoding=json\`
+    : config.gatewayUrl;
+  ws = new WebSocket(url);
   ws.addEventListener("message", (ev) => {
     try {
       const msg = JSON.parse(String((ev as MessageEvent).data));
@@ -113,13 +163,13 @@ function openGateway(token: string, config: DiscordConfig): void {
       console.error("[discord] dispatch parse error:", err);
     }
   });
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (ev) => {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     heartbeatTimer = null;
+    awaitingAck = false;
     ws = null;
     if (!closing) {
-      // TODO(agent): exponential backoff + resume via session_id/resume_gateway_url.
-      setTimeout(() => openGateway(token, config), 5000);
+      scheduleReconnect(token, config, (ev as CloseEvent).code ?? 0);
     }
   });
   ws.addEventListener("error", (err) => {
@@ -134,27 +184,47 @@ function handleGatewayMessage(
 ): void {
   switch (msg.op) {
     case 10: {
-      // HELLO — start heartbeat, send IDENTIFY.
+      // HELLO — start heartbeat, then RESUME or IDENTIFY.
       const interval = msg.d.heartbeat_interval as number;
-      heartbeatTimer = setInterval(() => sendOp(1, lastSeq), interval);
-      sendOp(2, {
-        token,
-        intents: config.intents,
-        properties: { os: process.platform, browser: "olle", device: "olle" },
-      });
+      startHeartbeat(interval);
+      if (resuming && sessionId) {
+        sendOp(6, { token, session_id: sessionId, seq: lastSeq });
+      } else {
+        resuming = false;
+        sendOp(2, {
+          token,
+          intents: config.intents,
+          properties: { os: process.platform, browser: "olle", device: "olle" },
+        });
+      }
       break;
     }
+    case 1:
+      // Server asked for an immediate heartbeat.
+      sendOp(1, lastSeq);
+      break;
     case 11:
-      // HEARTBEAT_ACK — TODO(agent): track to detect zombie connection.
+      // HEARTBEAT_ACK — connection is alive.
+      awaitingAck = false;
       break;
     case 0: {
       if (typeof msg.s === "number") lastSeq = msg.s;
       handleDispatch(msg.t ?? "", msg.d, config);
       break;
     }
-    case 7: // RECONNECT
-    case 9: // INVALID_SESSION
-      try { ws?.close(); } catch {}
+    case 7: // RECONNECT — resume on the reconnect.
+      if (sessionId) resuming = true;
+      try { ws?.close(4000); } catch {}
+      break;
+    case 9: // INVALID_SESSION — d is a boolean: resumable?
+      if (msg.d === true && sessionId) {
+        resuming = true;
+      } else {
+        resuming = false;
+        sessionId = null;
+        resumeGatewayUrl = null;
+      }
+      try { ws?.close(4000); } catch {}
       break;
     default:
       break;
@@ -164,7 +234,16 @@ function handleGatewayMessage(
 function handleDispatch(type: string, data: any, config: DiscordConfig): void {
   if (type === "READY") {
     sessionId = data.session_id;
+    resumeGatewayUrl = data.resume_gateway_url ?? null;
     botUserId = data.user?.id ?? null;
+    resuming = false;
+    reconnectAttempts = 0;
+    return;
+  }
+  if (type === "RESUMED") {
+    // Resume succeeded — the backoff cycle is over.
+    resuming = false;
+    reconnectAttempts = 0;
     return;
   }
   if (type === "MESSAGE_CREATE") {
@@ -204,13 +283,24 @@ function handleDispatch(type: string, data: any, config: DiscordConfig): void {
   // INTERACTION_CREATE, etc., as tasks need them.
 }
 
-async function discordFetch(path: string, init: RequestInit = {}): Promise<Response> {
+async function discordFetch(path: string, init: RequestInit = {}, attempt = 0): Promise<Response> {
   const base = cfg?.apiBase ?? "https://discord.com/api/v10";
   const headers = new Headers(init.headers ?? {});
   headers.set("Authorization", authHeader);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const r = await fetch(\`\${base}\${path}\`, { ...init, headers });
-  // TODO(agent): on 429, read retry_after and back off instead of throwing.
+  if (r.status === 429 && attempt < 5) {
+    // Rate limited. Discord returns retry_after (seconds) in the JSON body.
+    let retryMs = 1000;
+    try {
+      const body = (await r.clone().json()) as { retry_after?: number };
+      if (typeof body.retry_after === "number") retryMs = Math.ceil(body.retry_after * 1000);
+    } catch {
+      /* fall back to the 1s default */
+    }
+    await new Promise((res) => setTimeout(res, retryMs));
+    return discordFetch(path, init, attempt + 1);
+  }
   if (!r.ok) throw new Error(\`discord \${path}: \${r.status} \${await r.text()}\`);
   return r;
 }
@@ -220,6 +310,8 @@ export function register(api: any) {
   if (!token) throw new Error("discord: DISCORD_TOKEN not injected; approve the extension proposal and set the secret.");
   cfg = loadConfig();
   closing = false;
+  resuming = false;
+  reconnectAttempts = 0;
   openGateway(token, cfg);
 
   api.registerTrigger({
@@ -332,9 +424,13 @@ export function unload() {
   closing = true;
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   heartbeatTimer = null;
+  awaitingAck = false;
   try { ws?.close(); } catch {}
   ws = null;
   sessionId = null;
+  resumeGatewayUrl = null;
+  resuming = false;
+  reconnectAttempts = 0;
   botUserId = null;
   channelMessageSubscribers.length = 0;
   memberJoinSubscribers.length = 0;
