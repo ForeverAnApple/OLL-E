@@ -92,6 +92,16 @@ const CATEGORY_PROSE: Record<string, { tagline: string; body: string }> = {
       "`team_status` is the read-only roster. Strategic tier on create/\n" +
       "invite/join — entering or expanding a trust relationship.",
   },
+  scheduling: {
+    tagline: "making yourself useful unprompted",
+    body:
+      "Standing jobs are cron'd natural-language instructions the substrate\n" +
+      "fires for you on a schedule — a fresh turn each time, no one prompting\n" +
+      "you. Reach here to set up a morning digest, a periodic check, a\n" +
+      "recurring nudge. `schedule_task` registers one; `schedule_list` shows\n" +
+      "yours; `schedule_cancel` stops one. The job runs as you, on your\n" +
+      "budget and tools.",
+  },
   scratch: {
     tagline: "task-ephemeral working files",
     body:

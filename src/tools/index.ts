@@ -4,3 +4,4 @@ export { buildObservabilityTools, type ObservabilityToolsOptions } from "./obser
 export { buildInboxTools, type InboxToolsOptions } from "./inbox.ts";
 export { buildToolResultTools, type ToolResultToolsOptions } from "./tool-results.ts";
 export { buildTeamTools, type TeamToolsOptions } from "./team.ts";
+export { buildScheduleTools, type ScheduleToolsOptions } from "./schedule.ts";

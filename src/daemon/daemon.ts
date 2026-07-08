@@ -29,6 +29,9 @@ import { buildObservabilityTools } from "../tools/observability.ts";
 import { buildInboxTools } from "../tools/inbox.ts";
 import { buildToolResultTools } from "../tools/tool-results.ts";
 import { buildTeamTools } from "../tools/team.ts";
+import { buildScheduleTools } from "../tools/schedule.ts";
+import { createCronScheduler, type CronScheduler } from "../schedule/index.ts";
+import { installGrantScopeExecutor, type GrantScopeExecutor } from "../permissions/index.ts";
 import { startRealMeshBridge, type RealMeshBridge } from "../mesh/bridge.ts";
 import { wireBridgeToBus } from "../mesh/wire.ts";
 import type { ToolDef } from "../extensions/types.ts";
@@ -109,6 +112,17 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   const scheduler = createScheduler({ bus, store, hostId });
   scheduler.recoverLost();
   const inbox = createInbox({ bus, store, hostId });
+  // Cron subsystem — arms standing jobs (type='cron' triggers rows) and
+  // fires them deterministically. Coupled to the schedule_* tools through
+  // the schedule.armed/schedule.cancelled events, so a job scheduled mid-run
+  // starts firing without a restart. loadAndArm re-arms persisted jobs on
+  // boot; skip-missed-while-down means no catch-up burst for missed fires.
+  const cron: CronScheduler = createCronScheduler({ bus, store, hostId });
+  cron.loadAndArm();
+  // grant_scope executor — turns an approved permission proposal into an
+  // actual agents.scope mutation (closes the "approve appears to hang" gap).
+  // Event-driven cousin of the inbox staleness sweep.
+  const grantExec: GrantScopeExecutor = installGrantScopeExecutor({ bus, store, hostId });
   // Staleness sweeper. Each decision carries a wall-clock deadline; nothing
   // moves it from `open` → `stale` unless someone calls sweepStale(). Run
   // it on a timer so async-by-default actually means async — agents that
@@ -463,6 +477,10 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         // catalog reflects "team category absent" rather than offering
         // tools that would always fail.
         ...teamTools,
+        // Standing jobs — the agent schedules cron'd natural-language
+        // instructions for itself (the push-first surface). Deferred by
+        // default; discovered through the catalog's "scheduling" category.
+        ...buildScheduleTools({ bus, store, hostId }),
       ];
       // Boot invariants — last gate before chat goes live. Tool-name
       // duplication, malformed schemas, etc. surface here as a named
@@ -757,6 +775,8 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     chat?.stop();
     clearInterval(sweepTimer);
     memoryProjector.stop();
+    cron.close();
+    grantExec.stop();
     scheduler.close();
     for (const ext of extensions.list()) {
       try {

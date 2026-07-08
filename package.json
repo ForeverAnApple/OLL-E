@@ -21,6 +21,7 @@
     "@ai-sdk/openai": "^3.0.64",
     "@inkjs/ui": "^2.0.0",
     "ai": "^6.0.188",
+    "croner": "^10.0.1",
     "drizzle-orm": "^0.45.2",
     "ink": "^7.0.3",
     "ink-spinner": "^5.0.0",
