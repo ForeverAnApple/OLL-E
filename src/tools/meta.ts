@@ -59,6 +59,71 @@ export interface MetaToolsOptions {
 
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
+/** Coerce the `files` argument into the canonical `path → content` map.
+ *
+ *  The LLM does not always emit the documented object form. Two malformations
+ *  are common and both used to corrupt the extension dir silently:
+ *    - the whole argument double-encoded as a JSON *string*
+ *      (`"[{\"path\":...}]"`) — `Object.entries` on a string iterates it
+ *      character-by-character, spraying files named `0`, `1`, `2`, … each one
+ *      byte long, while leaving the intended file untouched;
+ *    - the array-of-`{path, content}` form the model reaches for naturally.
+ *
+ *  Be liberal in what we accept (map, array form, or a JSON string of either),
+ *  strict in what we reject: anything that can't be resolved to a
+ *  `Record<string,string>` throws before a single byte is written, so the tool
+ *  never reports a commit for a write the observable world didn't get.
+ *  `depth` bounds recovery of multiply-encoded strings. */
+export function normalizeFiles(files: unknown, depth = 0): Record<string, string> {
+  if (typeof files === "string") {
+    if (depth >= 3) {
+      throw new Error("write_extension: files is a string that never resolves to a file map");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(files);
+    } catch {
+      throw new Error(
+        "write_extension: files must be an object mapping path→content (or an array of {path, content}); got a non-JSON string",
+      );
+    }
+    return normalizeFiles(parsed, depth + 1);
+  }
+
+  if (Array.isArray(files)) {
+    const out: Record<string, string> = {};
+    for (const [i, entry] of files.entries()) {
+      if (typeof entry !== "object" || entry === null) {
+        throw new Error(`write_extension: files[${i}] is not a {path, content} object`);
+      }
+      const { path, content } = entry as { path?: unknown; content?: unknown };
+      if (typeof path !== "string" || path.length === 0) {
+        throw new Error(`write_extension: files[${i}].path must be a non-empty string`);
+      }
+      if (typeof content !== "string") {
+        throw new Error(`write_extension: files[${i}].content must be a string`);
+      }
+      out[path] = content;
+    }
+    return out;
+  }
+
+  if (typeof files === "object" && files !== null) {
+    const out: Record<string, string> = {};
+    for (const [path, content] of Object.entries(files)) {
+      if (typeof content !== "string") {
+        throw new Error(
+          `write_extension: files[${JSON.stringify(path)}] must be a string; got ${typeof content}`,
+        );
+      }
+      out[path] = content;
+    }
+    return out;
+  }
+
+  throw new Error("write_extension: files must be an object mapping path→content");
+}
+
 function describePath(path: string): {
   path: string;
   exists: boolean;
@@ -102,7 +167,14 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
   const { extensions, extensionsDir, authorName } = opts;
 
   const writeExt: ToolDef<
-    { name: string; files: Record<string, string>; commitMessage?: string },
+    {
+      name: string;
+      // Runtime input is unnormalized: the LLM may emit the object map, an
+      // array of {path, content}, or a JSON string of either. normalizeFiles
+      // narrows it before use.
+      files: Record<string, string> | Array<{ path: string; content: string }> | string;
+      commitMessage?: string;
+    },
     { commit: string | null }
   > = {
     name: "write_extension",
@@ -110,7 +182,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     category: "extension authoring",
     shortClause: "write files into an extension dir + git-commit",
     description:
-      "Write files into an extension directory and git-commit the subtree. Files is a map of relative path → content. Creates the extension dir if needed.",
+      "Write files into an extension directory and git-commit the subtree. `files` is a map of relative path → string content (an array of {path, content} is also accepted). Creates the extension dir if needed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -128,10 +200,14 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
       if (!/^[a-z0-9][a-z0-9-_]*$/.test(name)) {
         throw new Error(`write_extension: invalid name "${name}"`);
       }
+      const normalized = normalizeFiles(files);
+      if (Object.keys(normalized).length === 0) {
+        throw new Error("write_extension: files is empty — nothing to write");
+      }
       ensureRepo(extensionsDir);
       const dir = join(extensionsDir, name);
       mkdirSync(dir, { recursive: true });
-      for (const [rel, body] of Object.entries(files)) {
+      for (const [rel, body] of Object.entries(normalized)) {
         const full = join(dir, rel);
         if (!full.startsWith(dir + "/") && full !== dir) {
           throw new Error(`write_extension: path escapes ext dir: ${rel}`);
