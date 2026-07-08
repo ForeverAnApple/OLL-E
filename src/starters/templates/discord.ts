@@ -470,5 +470,65 @@ export async function smokeTest(_bus, ctx) {
   }
 }
 `,
+    "SETUP.md":
+`# discord — setup
+
+## What it does
+Opens one Discord Gateway (v10) connection for this host and turns Discord
+into an event source: every message becomes a channel-message event, every
+member join a member-join event. It also registers four REST tools:
+discord_send, discord_react, discord_fetch_context, discord_list_channels.
+
+This adapter is only the pipe. To actually chat with olle on Discord you
+also install discord-communication, which bridges these events to and from
+the chat agent.
+
+## Secret
+- DISCORD_TOKEN — the bot token from the Developer Portal.
+
+## Getting the token (walk the human through this)
+1. Go to the Discord Developer Portal: https://discord.com/developers/applications
+2. New Application → give it a name → create.
+3. Left sidebar → Bot → Reset Token → copy the token. This is DISCORD_TOKEN.
+4. THE GOTCHA — privileged intents. Still on the Bot page, scroll to
+   "Privileged Gateway Intents" and enable:
+     - MESSAGE CONTENT INTENT  (else message.content arrives EMPTY for
+       normal channel messages — the single most common "it connects but
+       sees nothing" failure)
+     - SERVER MEMBERS INTENT   (needed for member-join events)
+   Save. The default config.intents (37379) already asks for both, so if you
+   skip these toggles the gateway will refuse the connection (close 4013/4014).
+5. Invite the bot to your server: OAuth2 → URL Generator → scopes "bot",
+   pick permissions (Send Messages, Read Message History at minimum), open
+   the generated URL, add it to your server.
+
+## Install script (narrate this to the human)
+Collect the token, store it, then register:
+
+    install_starter("discord")
+    # prefer the human hands the token over once and you store it immediately:
+    set_secret("DISCORD_TOKEN", "<the token>")
+    register_extension("discord")
+
+register runs the smoke test first (a /users/@me call). If it passes the
+gateway comes up and messages start flowing.
+
+## Config knobs (manifest.json, config object)
+- intents — bitfield. Default 37379 (guilds + members + guild messages +
+  DMs + message content). Lower it only if you dropped a privileged intent.
+- includeBotMessages — default false. Bots (including olle itself) are
+  dropped before hitting the bus. Flip true only if you truly want to see
+  bot chatter; beware feedback loops where olle answers its own messages.
+- apiBase / gatewayUrl — leave alone unless Discord changes versions.
+
+## Guardrails
+- NEVER paste the token into a normal chat message that gets logged. Route
+  it through set_secret, which redacts the value from audit + persisted
+  sessions.
+- A leaked token = full control of the bot. Reset it in the portal if it
+  ever lands in plaintext anywhere.
+- includeBotMessages=true plus a bridge that answers everything is a
+  self-reply loop. Keep it false unless you have a reason.
+`,
   },
 };

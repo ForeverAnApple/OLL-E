@@ -363,5 +363,58 @@ export async function smokeTest(_bus, ctx) {
   }
 }
 `,
+    "SETUP.md":
+`# telegram — setup
+
+## What it does
+Turns a Telegram bot into an event source for olle. It long-polls Telegram's
+getUpdates endpoint and emits a channel-message event for each text message,
+using the same payload shape as the discord adapter (so bridges are
+identical). It registers two tools: telegram_send (HTML, auto-chunked) and
+telegram_fetch_context.
+
+Like discord, this is only the pipe. To chat with olle on Telegram you also
+install telegram-communication.
+
+## Secret
+- TELEGRAM_BOT_TOKEN — the token BotFather hands you.
+
+## Getting the token (walk the human through this)
+1. In Telegram, open a chat with @BotFather.
+2. Send /newbot. Follow the prompts: give the bot a display name, then a
+   username ending in "bot".
+3. BotFather replies with a token like 123456789:ABCdef... — that is
+   TELEGRAM_BOT_TOKEN.
+4. THE GOTCHA — privacy mode. By default a bot in a GROUP only receives
+   messages that @mention it or reply to it (DMs are always delivered in
+   full). If you want the bot to see all group messages, send BotFather
+   /setprivacy, pick the bot, and Disable privacy. For DM-only use you can
+   leave it on.
+5. To DM the bot, open its username link and press Start. To use it in a
+   group, add it as a member.
+
+## Install script (narrate this to the human)
+    install_starter("telegram")
+    set_secret("TELEGRAM_BOT_TOKEN", "<the token>")
+    register_extension("telegram")
+
+register runs the smoke test first (a getMe call). If it passes, polling
+starts and messages flow.
+
+## Config knobs (manifest.json, config object)
+- pollTimeoutSec — long-poll hold time, default 30. Higher = fewer requests.
+- pollErrorBackoffMs — wait after a failed poll before retrying, default 3000.
+- parseMode — default HTML. Leave it. MarkdownV2 needs escaping that mangles
+  normal prose; HTML needs only & < > escaped, which the send tool always does.
+- apiBase — default https://api.telegram.org. Leave unless self-hosting.
+
+## Guardrails
+- NEVER paste the token into chat. Route it through set_secret so it is
+  redacted from logs and persisted sessions.
+- A leaked token = full control of the bot. Ask BotFather to /revoke and
+  reissue if it ever lands in plaintext.
+- telegram_fetch_context only knows messages seen since load — it is not a
+  history search. Don't rely on it for anything before the adapter started.
+`,
   },
 };

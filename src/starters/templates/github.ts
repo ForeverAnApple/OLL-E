@@ -245,5 +245,56 @@ export async function smokeTest(_bus, ctx) {
   }
 }
 `,
+    "SETUP.md":
+`# github — setup
+
+## What it does
+Registers read/write tools over the GitHub REST API: github_create_issue,
+github_add_comment, github_list_issues, github_close_issue, and
+github_activity (a compact issues+commits digest since a timestamp — the
+tool a daily digest reaches for). No webhook ingress; this is REST-out only.
+
+## Secret
+- GH_TOKEN — a GitHub Personal Access Token.
+
+## Getting the token (walk the human through this)
+Prefer a fine-grained PAT scoped to only the repos you need.
+1. GitHub → Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token.
+2. Resource owner: you (or the org). Repository access: select only the
+   repos olle should touch.
+3. Permissions (Repository permissions):
+     - Issues: Read and write   (create/close/comment)
+     - Contents: Read-only      (commits for github_activity)
+     - Metadata: Read-only      (auto-selected)
+   Read-only everywhere is enough if you only want digests; add Issues:
+   Read and write only when you want olle opening/closing issues.
+4. Generate, copy the token. That is GH_TOKEN.
+
+A classic PAT with the "repo" scope also works but grants far more than
+needed — reach for fine-grained unless you have a reason.
+
+## Install script (narrate this to the human)
+    install_starter("github")
+    set_secret("GH_TOKEN", "<the token>")
+    register_extension("github")
+
+register runs the smoke test first (a /user call). If it passes the tools
+are live.
+
+## Config knobs (manifest.json, config object)
+- apiBase — default https://api.github.com. Point at a GHES instance if you
+  self-host GitHub Enterprise.
+- userAgent — sent on every request; GitHub requires one. Leave as-is.
+
+## Guardrails
+- NEVER paste the token into chat. Route it through set_secret so it is
+  redacted from logs and persisted sessions.
+- create/close/comment are strategic tier — they route through the approval
+  gate. Confirm the repo and issue number before approving.
+- github_activity with a wide "since" and per_page 100 can return a lot;
+  the tool already strips to compact shapes, but keep since recent for a
+  digest.
+`,
   },
 };

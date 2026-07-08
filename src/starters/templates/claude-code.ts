@@ -151,5 +151,50 @@ export function register(api) {
   }
 }
 `,
+    "SETUP.md":
+`# claude-code — setup
+
+## What it does
+Registers a single tool, claude_code, that shells out to the local claude
+CLI in an absolute workspace directory and returns its stdout. It is how an
+agent delegates a real coding task to a headless Claude Code session on this
+host. Strategic tier — it can change files on disk, so calls route through
+the approval gate.
+
+## Secrets
+None handled here. The claude CLI carries its own auth (it uses whatever
+login the daemon's user already has). If claude is not logged in, the
+subprocess fails and you will see it in the tool error.
+
+## Prerequisite
+The claude binary must be on the daemon's PATH, or you must point
+manifest.config.command at an absolute path to it. Check with:
+
+    query_host_context({ commands: ["claude"] })
+
+If it is not found, either install the CLI for the daemon's user or set
+config.command to the full path (e.g. /usr/local/bin/claude).
+
+## Config knobs (manifest.json, config object)
+- command — the executable to run. Default "claude". Set to an absolute path
+  if the daemon's PATH differs from your shell's.
+
+## Install script (narrate this to the human)
+No secret to collect:
+
+    install_starter("claude-code")
+    # confirm the CLI is reachable
+    query_host_context({ commands: ["claude"] })
+    register_extension("claude-code")
+
+The smoke test only checks that the binary resolves; it never runs claude
+(that would spend tokens and need auth).
+
+## Guardrails
+- claude_code writes to whatever cwd you hand it. Pass a workspace you mean
+  to modify, never the OLL-E data dir.
+- Long jobs: pass timeoutMs so a stuck session is killed instead of hanging
+  the turn.
+`,
   },
 };

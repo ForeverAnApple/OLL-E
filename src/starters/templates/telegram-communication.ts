@@ -265,5 +265,50 @@ export async function smokeTest() {
   }
 }
 `,
+    "SETUP.md":
+`# telegram-communication — setup
+
+## What it does
+Bridges Telegram and the chat agent so a human on Telegram talks to olle the
+same way they do on the CLI. Inbound: DMs (private chats) always route to
+olle; a group chat routes only when the chat is in watchedChats AND the bot
+is @mentioned OR the wake-word appears. Outbound: it accumulates the agent's
+reply through the turn and posts one message at turn-end.
+
+It also carries standing-job output: a schedule_task job with
+deliver:{kind:"telegram",chatId} lands here and posts to the chat with no
+reply reference. No inbound message required.
+
+## Prerequisite
+The telegram starter must be installed, secret-set, and registered first —
+this bridge is useless without telegram emitting channel-message events and
+providing the telegram_send tool. Set up telegram (see its SETUP.md) before
+this one.
+
+## Secrets
+None of its own. It calls the telegram starter's telegram_send tool; that is
+where TELEGRAM_BOT_TOKEN lives.
+
+## Config knobs (manifest.json, config object)
+- wakeWord — default "olle". In a watched group chat, a message containing
+  this word (or an @mention of the bot) wakes olle. Case-insensitive,
+  whole-word.
+- watchedChats — array of chat ids (numeric strings). Empty means no group
+  chats are watched (DMs still work). Add chat ids to opt them in. The chat
+  id shows up in a channel-message event or via telegram_fetch_context.
+
+## Install script (narrate this to the human)
+    # telegram must already be registered and passing smoke
+    install_starter("telegram-communication")
+    # optional: edit manifest.json config.watchedChats / wakeWord
+    register_extension("telegram-communication")
+
+## Guardrails
+- Add chats to watchedChats deliberately. A busy group with a common
+  wake-word wakes olle a lot and spends tokens.
+- Standing-job delivery posts to the chat id you gave schedule_task.
+  Double-check that chat id before scheduling — a wrong id posts into the
+  wrong place on a cron.
+`,
   },
 };

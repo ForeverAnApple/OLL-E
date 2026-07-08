@@ -4,4 +4,4 @@ export {
   getStarter,
   type InstallStarterResult,
 } from "./install.ts";
-export { type StarterTemplate } from "./templates.ts";
+export { hasSetupGuide, type StarterTemplate } from "./templates.ts";

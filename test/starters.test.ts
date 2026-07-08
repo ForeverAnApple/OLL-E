@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installStarter, listStarters, getStarter } from "../src/starters/index.ts";
+import { installStarter, listStarters, getStarter, hasSetupGuide } from "../src/starters/index.ts";
 import { validateManifest } from "../src/extensions/manifest.ts";
 import { history } from "../src/extensions/git.ts";
 import { createBus, persistToStore } from "../src/bus/index.ts";
@@ -44,6 +44,19 @@ describe("starter templates", () => {
     for (const s of listStarters()) {
       expect(s.files["index.ts"]).toBeDefined();
       expect(s.files["smoke.ts"]).toBeDefined();
+    }
+  });
+
+  it("every starter ships a non-empty SETUP.md", () => {
+    const starters = listStarters();
+    expect(starters.length).toBe(8);
+    for (const s of starters) {
+      const setup = s.files["SETUP.md"];
+      expect(setup, `${s.name} missing SETUP.md`).toBeDefined();
+      expect(setup!.length).toBeGreaterThan(100);
+      // Escaping rule: SETUP bodies must not contain backtick fences.
+      expect(setup).not.toContain("```");
+      expect(hasSetupGuide(s)).toBe(true);
     }
   });
 

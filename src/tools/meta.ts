@@ -32,7 +32,7 @@ import {
   revertSubtree,
 } from "../extensions/git.ts";
 import { validateManifest } from "../extensions/manifest.ts";
-import { installStarter, listStarters } from "../starters/index.ts";
+import { getStarter, hasSetupGuide, installStarter, listStarters } from "../starters/index.ts";
 
 export interface MetaToolsOptions {
   extensions: ExtensionHost;
@@ -295,14 +295,23 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     execute: async ({ name, limit }) => gitHistory(extensionsDir, name, limit ?? 20),
   };
 
-  const listStartersT: ToolDef<Record<string, never>, Array<{ name: string; description: string }>> = {
+  const listStartersT: ToolDef<
+    Record<string, never>,
+    Array<{ name: string; description: string; hasSetupGuide: boolean }>
+  > = {
     name: "list_starters",
     tier: "operational",
     category: "extension authoring",
     shortClause: "list shipped starter extension templates",
-    description: "List the starter extension templates shipped with the binary.",
+    description:
+      "List the starter extension templates shipped with the binary. hasSetupGuide means the starter ships a SETUP.md — read it with read_extension_file before asking the human for secrets.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
-    execute: async () => listStarters().map(({ name, description }) => ({ name, description })),
+    execute: async () =>
+      listStarters().map((tpl) => ({
+        name: tpl.name,
+        description: tpl.description,
+        hasSetupGuide: hasSetupGuide(tpl),
+      })),
   };
 
   const queryHostContext: ToolDef<
@@ -379,14 +388,21 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
 
   const installStarterT: ToolDef<
     { name: string; overwrite?: boolean },
-    { name: string; filesWritten: number; alreadyExisted: boolean; commit: string | null }
+    {
+      name: string;
+      filesWritten: number;
+      alreadyExisted: boolean;
+      commit: string | null;
+      hasSetupGuide: boolean;
+      nextStep?: string;
+    }
   > = {
     name: "install_starter",
     tier: "strategic",
     category: "extension authoring",
     shortClause: "copy a starter into extensions/ and commit",
     description:
-      "Copy a named starter template into the extensions directory and git-commit it. Does not register.",
+      "Copy a named starter template into the extensions directory and git-commit it. Does not register. If the result has hasSetupGuide, read SETUP.md via read_extension_file(name, \"SETUP.md\") BEFORE asking the human for any secrets — it lists the exact secret names, how to acquire them, and the install script to narrate.",
     inputSchema: {
       type: "object",
       properties: {
@@ -403,11 +419,17 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
         authorName,
         overwrite,
       });
+      const tpl = getStarter(r.name);
+      const setup = tpl ? hasSetupGuide(tpl) : false;
       return {
         name: r.name,
         filesWritten: r.filesWritten,
         alreadyExisted: r.alreadyExisted,
         commit: r.commit,
+        hasSetupGuide: setup,
+        nextStep: setup
+          ? `Read the setup guide before collecting secrets: read_extension_file("${r.name}", "SETUP.md")`
+          : undefined,
       };
     },
   };

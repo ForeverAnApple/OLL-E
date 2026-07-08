@@ -37,3 +37,9 @@ export function listStarters(): StarterTemplate[] {
 export function getStarter(name: string): StarterTemplate | undefined {
   return STARTERS[name];
 }
+
+/** Whether a starter ships a SETUP.md the agent should read (via
+ *  read_extension_file) before asking the human for secrets. */
+export function hasSetupGuide(tpl: StarterTemplate): boolean {
+  return typeof tpl.files["SETUP.md"] === "string" && tpl.files["SETUP.md"].length > 0;
+}

@@ -284,5 +284,51 @@ export async function smokeTest() {
   }
 }
 `,
+    "SETUP.md":
+`# discord-communication — setup
+
+## What it does
+Bridges Discord and the chat agent so a human on Discord talks to olle the
+same way they do on the CLI. Inbound: DMs always route to olle; a guild
+channel routes only when the channel is in watchedChannels AND the bot is
+@mentioned OR the wake-word appears. Outbound: it accumulates the agent's
+reply through the turn and posts one message at turn-end.
+
+It also carries standing-job output: a schedule_task job with
+deliver:{kind:"discord",channelId} lands on this bridge and posts to the
+channel with no reply reference. No inbound message required.
+
+## Prerequisite
+The discord starter must be installed, secret-set, and registered first —
+this bridge is useless without discord emitting channel-message events and
+providing the discord_send tool. Set up discord (see its SETUP.md) before
+this one.
+
+## Secrets
+None of its own. It calls the discord starter's discord_send tool; that is
+where DISCORD_TOKEN lives.
+
+## Config knobs (manifest.json, config object)
+- wakeWord — default "olle". In a watched guild channel, a message
+  containing this word (or an @mention of the bot) wakes olle. Case-
+  insensitive, whole-word.
+- watchedChannels — array of channel ids. Empty means no guild channels are
+  watched (DMs still work). Add channel ids to opt them in.
+
+## Install script (narrate this to the human)
+    # discord must already be registered and passing smoke
+    install_starter("discord-communication")
+    # optional: edit manifest.json config.watchedChannels / wakeWord
+    register_extension("discord-communication")
+
+## Guardrails
+- Add channels to watchedChannels deliberately. A busy channel with a common
+  wake-word wakes olle a lot and spends tokens.
+- The discord starter's includeBotMessages must stay false, or olle can
+  answer its own messages in a loop through this bridge.
+- Standing-job delivery posts to the channel id you gave schedule_task.
+  Double-check that channel id before scheduling — a wrong id posts into the
+  wrong place on a cron.
+`,
   },
 };

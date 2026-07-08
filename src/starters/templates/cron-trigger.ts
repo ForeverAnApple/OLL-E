@@ -62,5 +62,43 @@ export function unload() {
   }
 }
 `,
+    "SETUP.md":
+`# cron-trigger — setup
+
+## What it does
+Emits a durable event on a fixed interval. Nothing more. It is the raw
+heartbeat other tasks subscribe to; it holds no cognition and reaches no
+network.
+
+If what you actually want is a scheduled *instruction* — a natural-language
+job that posts a digest on a cron, say — use the built-in schedule_task
+tool instead. This starter is the low-level primitive, not the standing-job
+system.
+
+## Secrets
+None. This starter never leaves the host.
+
+## Config knobs (manifest.json, config object)
+- intervalMs — milliseconds between fires. Default 60000 (one minute).
+- eventType — the event type published on each tick. Default cron.fire.
+
+One extension instance fires one interval. Need a second rate? Install a
+second copy under a new name (e.g. cron-hourly) and edit its config.
+
+## Install script (narrate this to the human)
+No secret to collect. Just:
+
+    install_starter("cron-trigger")
+    # optionally edit manifest.json config.intervalMs / config.eventType
+    register_extension("cron-trigger")
+
+Registration arms the timer immediately.
+
+## Guardrails
+- A very small intervalMs floods the bus. Keep it >= 1000 unless you know
+  why you want faster.
+- Nothing consumes cron.fire until you write a task that subscribes to it.
+  Firing into the void is harmless but pointless.
+`,
   },
 };

@@ -239,5 +239,50 @@ export async function smokeTest(_bus, ctx) {
   }
 }
 `,
+    "SETUP.md":
+`# freshrss — setup
+
+## What it does
+Reads your FreshRSS instance over its Google Reader compatible API. Three
+tools: freshrss_unread (a compact unread digest — the tool a morning digest
+reaches for), freshrss_feeds (list subscriptions), and freshrss_mark_read
+(strategic — marks items read, so it routes through the approval gate).
+
+## Secrets
+- FRESHRSS_USER — your FreshRSS username.
+- FRESHRSS_API_PASSWORD — the API password, NOT your web login password.
+
+## Getting the credentials (walk the human through this)
+1. Log in to FreshRSS in the browser.
+2. Settings → Profile. Find "External access via API".
+3. Enable the API and set an API password there. That value is
+   FRESHRSS_API_PASSWORD. Your username is FRESHRSS_USER.
+   (Some FreshRSS versions label this "API management" — same place, under
+   Profile.)
+4. Note your instance's base URL, e.g. https://rss.example.com — that goes
+   in manifest.config.url (NOT a secret).
+
+## Install script (narrate this to the human)
+    install_starter("freshrss")
+    # edit manifest.json config.url to your instance base URL
+    set_secret("FRESHRSS_USER", "<username>")
+    set_secret("FRESHRSS_API_PASSWORD", "<api password>")
+    register_extension("freshrss")
+
+register runs the smoke test first (a ClientLogin call). Its error message
+tells you whether the URL is unreachable or the credentials were rejected.
+
+## Config knobs (manifest.json, config object)
+- url — your FreshRSS base URL, no trailing /api path. Required.
+
+## Guardrails
+- NEVER paste the API password into chat. Route it through set_secret so it
+  is redacted from logs and persisted sessions.
+- freshrss_mark_read mutates reader state and is strategic tier — confirm
+  the item ids before approving. There is no undo.
+- freshrss_unread with a wide window and limit 100 can be large; it already
+  strips to compact shapes and caps summaries at 500 chars, but pass a
+  recent "since" for a digest.
+`,
   },
 };
