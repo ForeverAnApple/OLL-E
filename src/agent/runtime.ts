@@ -24,6 +24,7 @@ import {
   maybeTruncateOne,
   type TruncateOptions,
 } from "./tool-truncate.ts";
+import { formatInputError, validateToolInput } from "./validate-tool-input.ts";
 
 export interface AgentRunOptions {
   llm: Llm;
@@ -288,6 +289,17 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
           opts.onStep?.({ kind: "tool_result_live", id: block.id, name: block.name, content, isError: true });
           continue;
         }
+      }
+      // Structural input check before execute(). A blind call to a deferred
+      // tool (schema never loaded) or any wrong-shaped input gets a legible,
+      // schema-carrying error it can self-correct from — instead of an opaque
+      // throw from inside execute(). See validate-tool-input.ts.
+      const problems = validateToolInput(tool.inputSchema, block.input);
+      if (problems.length > 0) {
+        const content = formatInputError(tool.name, problems, tool.inputSchema);
+        pushResult(block.id, block.name, content, true);
+        opts.onStep?.({ kind: "tool_result_live", id: block.id, name: block.name, content, isError: true });
+        continue;
       }
       try {
         const args = tool.validate ? tool.validate(block.input) : block.input;

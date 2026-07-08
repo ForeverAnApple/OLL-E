@@ -10,7 +10,7 @@
 import { Box, Text } from "ink";
 import { theme, sym } from "./theme.ts";
 import { Markdown } from "./markdown.tsx";
-import { clipString } from "./format.ts";
+import { clipString, formatCost } from "./format.ts";
 
 export type ScrollbackEntry =
   | { kind: "user"; id: string; text: string }
@@ -25,6 +25,23 @@ export type ScrollbackEntry =
    *  is constructed for why. Per-turn cost is derivable as the delta
    *  from the previous turn-end entry. */
   | { kind: "turn-end"; id: string; model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; cumulativeUsdMicros: number; stopReason: string };
+
+/** One committed scrollback item as it sits inside `<Static>`. The `width`
+ *  pin is load-bearing, not cosmetic: `<Static>` mounts each item as a
+ *  detached root that does NOT inherit the terminal-width constraint Ink
+ *  applies to the live tree. Without a width budget, flex rows inside the
+ *  markdown (list items, blockquotes) and the gutter rows (user, tool) all
+ *  measure their text at max-content and bleed past the right edge on wide
+ *  terminals. Pass the terminal column count; the row carves its text column
+ *  out of it. Frozen at render time, which matches Static — committed
+ *  scrollback never reflows on resize anyway. */
+export function ScrollbackItem({ entry, width }: { entry: ScrollbackEntry; width: number }): React.ReactElement {
+  return (
+    <Box flexDirection="column" width={width}>
+      <MessageRow entry={entry} />
+    </Box>
+  );
+}
 
 export function MessageRow({ entry }: { entry: ScrollbackEntry }): React.ReactElement {
   switch (entry.kind) {
@@ -65,8 +82,10 @@ export function TrayList({ items }: { items: string[] }): React.ReactElement {
 }
 
 function UserRow({ text }: { text: string }): React.ReactElement {
+  // A blank line above each user turn is the strongest single cue that a
+  // new exchange started — turns stop running together in the scrollback.
   return (
-    <Box paddingX={1}>
+    <Box marginTop={1} paddingX={1}>
       <Text color={theme.user}>{sym.bar} </Text>
       <Box flexDirection="column" flexGrow={1}>
         {text.split("\n").map((line, i) => <Text key={i}>{line}</Text>)}
@@ -76,10 +95,12 @@ function UserRow({ text }: { text: string }): React.ReactElement {
 }
 
 function AssistantRow({ text }: { text: string }): React.ReactElement {
-  // Balanced L/R padding. paddingRight={1} left almost no right margin, so at
-  // wide terminals the wrap boundary lands against the edge and long lines
-  // bleed past it. paddingRight must match the live streaming region (app.tsx)
-  // so text doesn't reflow the instant a streaming turn commits.
+  // L/R padding is breathing room, not the wrap guarantee. The wrap budget
+  // comes from the width pinned on the Static item in app.tsx — without it,
+  // markdown list items and blockquotes bleed past the right edge on wide
+  // terminals (Static drops the terminal-width constraint). paddingRight
+  // matches the live streaming region (app.tsx) so text doesn't reflow the
+  // instant a streaming turn commits.
   return (
     <Box paddingLeft={3} paddingRight={2} flexDirection="column">
       <Markdown source={text} />
@@ -89,8 +110,10 @@ function AssistantRow({ text }: { text: string }): React.ReactElement {
 
 function ToolCallRow({ name, input }: { name: string; input: unknown }): React.ReactElement {
   const args = formatCallArgs(input);
+  // Each call gets air above it; its result (ToolResultRow) stays glued
+  // below with no margin, so a call+result reads as one unit.
   return (
-    <Box paddingLeft={3} paddingRight={1}>
+    <Box marginTop={1} paddingLeft={3} paddingRight={1}>
       <Text color={theme.tool}>{sym.tool} </Text>
       <Text>{name}</Text>
       {args && <Text color={theme.muted}>({args})</Text>}
@@ -199,11 +222,6 @@ function TurnEndRow(props: Extract<ScrollbackEntry, { kind: "turn-end" }>): Reac
       </Text>
     </Box>
   );
-}
-
-function formatCost(usdMicros: number): string {
-  const usd = usdMicros / 1_000_000;
-  return usd < 1 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
 }
 
 function formatCallArgs(input: unknown): string {

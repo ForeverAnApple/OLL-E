@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { startDaemon } from "../daemon/daemon.ts";
+import { enrichPathFromLoginShell } from "../daemon/path-env.ts";
 import { resolvePaths } from "../paths.ts";
 import { connectIpc, type IpcClient } from "../ipc/client.ts";
 import { connectOrExit, withIpc } from "./ipc-helper.ts";
@@ -112,6 +113,24 @@ async function cmdModel(args: string[]): Promise<void> {
 }
 
 async function cmdRun(): Promise<void> {
+  // launchd/systemd start the daemon with a stripped PATH. Pull the user's real
+  // PATH from their login shell and fix process.env.PATH, so anything resolving
+  // in-process (query_host_context's resolver, agent reasoning over the reported
+  // PATH) sees the real one. NOTE: this does NOT reach child processes — a
+  // compiled Bun binary spawns children with the *exec-time* env, not later
+  // process.env mutations (LOG 2026-06-17). Subprocess extensions therefore rely
+  // on the PATH baked into the launchd/systemd service definition by install.sh;
+  // this runtime pass is the in-process half (and the rescue for `olle run` from
+  // a stripped shell). See path-env.ts.
+  const enriched = enrichPathFromLoginShell();
+  if (enriched.changed) {
+    console.log(`olle: PATH enriched from login shell (+${enriched.added.length} dirs)`);
+  } else if (!enriched.probed) {
+    // The probe failed (no login shell, timeout, or a shell that didn't honor
+    // -lc). Don't fail boot, but say so — otherwise "claude not on PATH" later
+    // looks like the tool is missing rather than the daemon being blind to it.
+    console.warn("olle: could not read login-shell PATH; tools installed outside the service PATH may be invisible to the agent");
+  }
   const daemon = await startDaemon({ version: "0.0.0" });
   const stop = async (sig: NodeJS.Signals) => {
     console.log(`\nolle: received ${sig}, shutting down`);

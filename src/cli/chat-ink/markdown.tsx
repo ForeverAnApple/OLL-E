@@ -20,16 +20,20 @@ export function Markdown({ source }: { source: string }): React.ReactElement {
   const tokens = useMemo(() => marked.lexer(source), [source]);
   return (
     <Box flexDirection="column">
-      {tokens.map((tok, i) => <BlockToken key={i} token={tok} />)}
+      {tokens.map((tok, i) => <BlockToken key={i} token={tok} topLevel />)}
     </Box>
   );
 }
 
-function BlockToken({ token }: { token: Token }): React.ReactElement | null {
+// `topLevel` is true only for blocks rendered directly by Markdown's map.
+// It gates the paragraph-separating margin: nested paragraphs (inside a list
+// item or blockquote) sit next to a marker/bar in a flex *row*, where a
+// marginTop would offset them off the marker line and detach the bullet.
+function BlockToken({ token, topLevel = false }: { token: Token; topLevel?: boolean }): React.ReactElement | null {
   switch (token.type) {
     case "space":      return null;
     case "heading":    return <Heading token={token as Tokens.Heading} />;
-    case "paragraph":  return <Paragraph token={token as Tokens.Paragraph} />;
+    case "paragraph":  return <Paragraph token={token as Tokens.Paragraph} spaced={topLevel} />;
     case "code":       return <CodeBlock token={token as Tokens.Code} />;
     case "list":       return <List token={token as Tokens.List} />;
     case "blockquote": return <BlockQuote token={token as Tokens.Blockquote} />;
@@ -54,8 +58,13 @@ function Heading({ token }: { token: Tokens.Heading }): React.ReactElement {
   );
 }
 
-function Paragraph({ token }: { token: Tokens.Paragraph }): React.ReactElement {
-  return <Text><Inline tokens={token.tokens} /></Text>;
+function Paragraph({ token, spaced }: { token: Tokens.Paragraph; spaced: boolean }): React.ReactElement {
+  const body = <Text><Inline tokens={token.tokens} /></Text>;
+  // Only top-level paragraphs get the separating blank line. Inside a list
+  // item or blockquote the paragraph is a flex-row child next to its marker,
+  // and marginTop there would push the text below the marker line.
+  if (!spaced) return body;
+  return <Box marginTop={1}>{body}</Box>;
 }
 
 function BlockText({ token }: { token: Tokens.Text }): React.ReactElement {

@@ -214,7 +214,14 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
       pending: [],
       pendingOrigin: [],
       inFlightInbox: [],
-      loadedTools: new Set<string>(),
+      // Seed with every active extension's contributed tools. An installed,
+      // registered extension is a capability the agent already chose with
+      // intent to use; making a fresh thread re-guess or re-load_tools its
+      // schema every session is the same papercut register-auto-load deletes.
+      // These land in the separately-cached tools block, so they don't
+      // invalidate the identity prefix. Core deferred tools stay name-only —
+      // they're occasional reaches, not installed capabilities.
+      loadedTools: seedExtensionTools(opts.extensions),
       truncationState: createTruncationState(),
       mailHwm: loopStartMs,
       // Freeze model + effort at thread birth. New threads created after a
@@ -941,6 +948,18 @@ function wrapExtensionTool(tool: ToolDef, extensionId: string): ToolDef {
     ...tool,
     execute: (args, ctx) => tool.execute(args, { ...ctx, extensionId }),
   } as ToolDef;
+}
+
+/** Build a new thread's loaded set pre-populated with the names of every
+ *  active extension's contributed tools. Always-loaded tools are skipped —
+ *  they're handled out-of-band and never need to sit in the set. */
+export function seedExtensionTools(extensions: ExtensionHost | undefined): Set<string> {
+  const loaded = new Set<string>();
+  if (!extensions) return loaded;
+  for (const { tool } of extensions.tools()) {
+    if (!tool.alwaysLoaded) loaded.add(tool.name);
+  }
+  return loaded;
 }
 
 export interface RegisterAutoLoadDeps {

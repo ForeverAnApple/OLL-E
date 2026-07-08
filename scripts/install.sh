@@ -31,6 +31,36 @@ esac
 PLIST_PATH="$HOME/Library/LaunchAgents/${SERVICE_LABEL}.plist"
 SYSTEMD_UNIT="$HOME/.config/systemd/user/olle.service"
 
+# Baked into the service definition so the daemon's *exec-time* PATH carries the
+# user's real PATH. launchd/systemd otherwise start it with a stripped PATH, and
+# a compiled Bun binary cannot repair that at runtime — child processes
+# (query_host_context's resolver, every subprocess extension like claude-code /
+# codex) inherit the exec-time env, not later process.env mutations. Captured
+# from the login shell the same way the daemon's runtime fallback does; falls
+# back to install.sh's own PATH if the probe fails. Re-run install to refresh.
+#
+# Login shells routinely print to stdout from their profiles (nvm banners,
+# oh-my-zsh, a bare echo in .zshrc, MOTD), so we fence the PATH behind a sentinel
+# and keep only what follows the *last* one — otherwise that noise gets baked
+# into the service PATH and a literal newline breaks the systemd unit / corrupts
+# the launchd entry. This mirrors src/daemon/path-env.ts (same sentinel string).
+SERVICE_PATH_SENTINEL="@@OLLE_PATH@@"
+SERVICE_PATH_RAW="$("${SHELL:-/bin/sh}" -lc "printf %s \"${SERVICE_PATH_SENTINEL}\$PATH\"" 2>/dev/null || true)"
+case "$SERVICE_PATH_RAW" in
+  *"$SERVICE_PATH_SENTINEL"*) SERVICE_PATH="${SERVICE_PATH_RAW##*"$SERVICE_PATH_SENTINEL"}" ;;
+  *) SERVICE_PATH="" ;;  # sentinel absent → output untrustworthy, fail closed
+esac
+[[ -n "$SERVICE_PATH" ]] || SERVICE_PATH="$PATH"
+
+# Escape XML metacharacters for safe interpolation into the plist <string>.
+# A PATH dir containing & < > would otherwise produce malformed XML that
+# launchctl silently refuses to load. Done via sed (not bash ${//}) because
+# bash 5.2 treats a bare & in the replacement as "the matched text"; sed's
+# \& is reliably a literal ampersand across versions. & must escape first.
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mxxx\033[0m %s\n' "$*" >&2; exit 1; }
@@ -78,6 +108,8 @@ write_launchd_plist() {
   <dict>
     <key>OLLE_HOME</key>
     <string>$OLLE_HOME</string>
+    <key>PATH</key>
+    <string>$(xml_escape "$SERVICE_PATH")</string>
   </dict>"
   cat >"$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -114,6 +146,7 @@ After=network.target
 Type=simple
 ExecStart=$BIN_DIR/olle run
 Environment=OLLE_HOME=$OLLE_HOME
+Environment="PATH=$SERVICE_PATH"
 Restart=always
 RestartSec=3
 

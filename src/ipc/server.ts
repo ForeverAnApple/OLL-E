@@ -34,6 +34,7 @@ import {
 } from "../observability/index.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
 import { readDefaultModel, writeDefaultModel } from "../daemon/model-preference.ts";
+import { resolveBootModel } from "../memory/model.ts";
 
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
@@ -422,15 +423,22 @@ async function dispatch(
         return;
       }
       case "model.get": {
-        // Router is the source of truth when chat is up — that's what the
-        // next turn will actually use. Fall back to the persisted file
-        // when chat hasn't been brought up yet (router not constructed).
-        const current = opts.modelControl
+        // Report what the next NEW thread will actually run with — which is
+        // resolveBootModel (OLLE_MODEL override → thinking-model memory),
+        // exactly the precedence chat.ts freezes at thread birth. The router
+        // default is only the fall-through when the agent has no thinking-model
+        // memory; reporting it unconditionally is the bug where `/model` shows
+        // the stale host default after a `set_thinking_model` switch.
+        const thinking =
+          opts.store && opts.rootAgentId
+            ? resolveBootModel(opts.store, opts.rootAgentId)
+            : undefined;
+        const fallback = opts.modelControl
           ? opts.modelControl.current()
           : opts.paths
             ? readDefaultModel(opts.paths.defaultModelFile)
             : "";
-        send({ id: req.id, ok: true, value: { model: current } });
+        send({ id: req.id, ok: true, value: { model: thinking ?? fallback } });
         return;
       }
       case "model.set": {
