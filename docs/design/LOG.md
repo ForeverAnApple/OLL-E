@@ -1214,6 +1214,20 @@ Three prior entries parked agent-direct task authoring behind extension packagin
 
 ---
 
+## 2026-07-08 — Telegram UX: presence, streamed replies, real formatting; reaction-ack rejected
+
+**The gap.** The telegram starter pair was a functional pipe with dead air: a human sent a message and saw nothing until one unformatted blob arrived at turn-end — literal `**asterisks**` included, since `telegram_send` escaped everything and rendered nothing. Research (live Bot API docs + the openclaw/hermes reference integrations) drove a rework of both templates.
+
+**Streaming tiers, best-available-first.** Bot API 9.3 added native draft streaming (`sendMessageDraft`, all bots since 9.5): partial text animates as an ephemeral client-side draft, an empty draft renders a native "Thinking…" placeholder, and only the finalize `sendMessage` persists. Private chats get that; groups (and pre-9.5 servers, detected by first-draft failure) fall back to the classic throttled send-then-`editMessageText` loop with a ▌ cursor and a 4s-refreshed typing indicator. Constants follow the FAQ flood envelope and the reference repos' production practice: 1s edit cadence in DMs, 3s in groups, dedup-before-edit, "message is not modified" treated as success, `retry_after` honored up to 60s, truncate-don't-split mid-stream, split properly only at finalize. Rich Messages (Bot API 10.1, GFM markdown, 32k chars) noted as the upgrade that deletes the escaping and chunking code — deliberately not adopted at one month old.
+
+**Where the state lives.** `telegram_stream` is one stateful adapter tool (start/update/finalize/cancel session phases) rather than exposed `editMessageText` primitives: flood-control state belongs next to the token that pays for violating it. The bridge subscribes to `chat.assistant-delta` (the token feed existed all along; the manifest just never read it) and pushes latest-state-wins updates on a 1s tick — never per delta, because every `callTool` is a logged row. Turn-end finalizes in place; `telegram_send` remains the never-drop floor if the stream dies. All new tools are operational-tier — the runtime's `callTool` gate rejects strategic tools from extensions (the `discord_react` tier is why discord can't grow the same bridge-driven UX without a change).
+
+**Formatting.** Markdown→Telegram-HTML converter (fenced code with language class, inline code, bold/italic/strike with word-boundary guards, links, headings, quotes, bullets), everything else escaped, plain-text resend on entity-parse 400, fence-aware chunking at 3500 chars. HTML over MarkdownV2 stands: 3 escaped chars beats 18, and broken HTML is machine-detectable.
+
+**Reaction-ack rejected.** Bots have no read receipts (`readBusinessMessage` is business-connection-only); the idiomatic substitute is a 👀 `setMessageReaction`, and both reference repos ship elaborate status→emoji systems. The owner vetoed it as tacky and annoying — presence comes from the "Thinking…" draft and typing indicator alone, which signal the same thing without stamping the human's message. **Resurrect when:** a real need for per-message acknowledgment that presence can't express (e.g. group chats where the bot reads but doesn't answer).
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.

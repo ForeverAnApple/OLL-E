@@ -2,18 +2,20 @@ import type { StarterTemplate } from "./types.ts";
 
 export const telegramCommunication: StarterTemplate = {
   name: "telegram-communication",
-  description: "Bridges Telegram to/from the chat agent. DMs always active; group chats require the chat to be in watchedChats AND (wake-word match OR @mention). Accumulates assistant text until chat.turn-end, then posts one reply. Standing-job threads deliver chat-only.",
+  description:
+    "Bridges Telegram to/from the chat agent. DMs always active; group chats require the chat to be in watchedChats AND (wake-word match OR @mention). Shows presence the moment a turn starts, streams the reply live via telegram_stream, and finalizes one formatted message at turn-end. Standing-job threads deliver chat-only.",
   files: {
     "manifest.json": JSON.stringify(
       {
         name: "telegram-communication",
-        version: "0.1.0",
-        description: "Wake-word + DM bridge between Telegram and the chat agent.",
+        version: "0.2.0",
+        description: "Wake-word + DM bridge between Telegram and the chat agent, with live streamed replies.",
         capabilities: ["bridge:telegram-chat"],
-        callsTools: ["telegram_send"],
+        callsTools: ["telegram_send", "telegram_stream"],
         eventReads: [
           "channel-message",
           "chat.assistant-text",
+          "chat.assistant-delta",
           "chat.tool-call",
           "chat.turn-end",
           "chat.error",
@@ -29,8 +31,9 @@ export const telegramCommunication: StarterTemplate = {
     ) + "\n",
     "index.ts":
 `// telegram-communication: inbound/outbound relay between Telegram and the
-// chat agent. Structural twin of discord-communication — same accumulate-
-// then-send-one-reply shape, keyed on telegram threadIds.
+// chat agent. Structural twin of discord-communication, plus live
+// streaming: the human sees presence the moment the turn starts and
+// watches the reply grow instead of staring at a silent chat.
 //
 // Inbound (channel-message -> chat.input):
 //   - Only telegram-sourced messages (payload.source === "telegram"); the
@@ -41,17 +44,32 @@ export const telegramCommunication: StarterTemplate = {
 //     @mentioned OR the wake-word matches content).
 //   - Thread id: telegram:<chat_id>:<user_id> — one correlation per user
 //     per chat.
+//   - Right after publishing chat.input we fire telegram_stream(start) so
+//     presence ("Thinking…" draft in DMs, typing in groups) appears before
+//     the first token exists. The bridge originates the turn, so this is
+//     the earliest possible moment — there is no turn-start bus event.
 //
-// Outbound (chat.turn-end -> telegram_send):
-//   - Accumulates chat.assistant-text chunks through the turn.
-//   - On chat.turn-end, posts the accumulated text as one message.
+// Streaming (chat.assistant-delta -> telegram_stream update):
+//   - Deltas accumulate into a per-thread partial; completed hops arrive
+//     as chat.assistant-text (the canonical text) and replace the partial.
+//   - A 1s timer pushes latest-state-wins updates. We never push per
+//     delta: tool calls are logged rows, and token-cadence calls would
+//     flood both the log and Telegram's flood control (the adapter
+//     throttles again internally — belt and braces).
+//
+// Outbound (chat.turn-end -> telegram_stream finalize):
+//   - finalize renders markdown and upgrades the streamed message in
+//     place (or sends fresh if nothing streamed). If the adapter predates
+//     telegram_stream or the call fails, telegram_send is the floor — the
+//     reply must land even when the streaming UX can't.
 //
 // Standing jobs (schedule_task deliver:{kind:"telegram",chatId}):
 //   - The scheduler drives a turn on threadId telegram:<chatId>:job:<jobId>
 //     with no prior inbound message. getOrDeriveRoute() derives {chatId,
-//     originMessageId:null} from the threadId prefix — applied at ALL THREE
+//     originMessageId:null} from the threadId prefix — applied at ALL
 //     outbound sites, or the accumulator never fills. Derived routes are
-//     per-turn and evicted at turn-end/error.
+//     per-turn and evicted at turn-end/error. Streaming works there too:
+//     the first delta derives the route and opens the session.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -86,6 +104,13 @@ const derivedRoutes = new Set<string>();
 const accumulators = new Map<string, string[]>();
 const turnActors = new Map<string, string>();
 const turnExplicitSend = new Set<string>();
+
+// Streaming state, all keyed by threadId and torn down at turn boundary.
+const partials = new Map<string, string>();
+const streamTimers = new Map<string, ReturnType<typeof setInterval>>();
+const streamFailures = new Map<string, number>();
+const lastPushed = new Map<string, string>();
+const STREAM_TICK_MS = 1_000;
 
 // Loose bridge parse contract: any telegram:<chatId>:... threadId with no
 // stored route delivers chat-only, no reply_to.
@@ -152,6 +177,48 @@ export function register(api: any) {
   cfg = loadConfig();
   wakeRe = new RegExp(\`\\\\b\${escapeRegex(cfg.wakeWord)}\\\\b\`, "i");
 
+  function actorOpts(threadId: string): { asAgent: string } | undefined {
+    const actor = turnActors.get(threadId);
+    return actor ? { asAgent: actor } : undefined;
+  }
+
+  function stopStream(threadId: string): void {
+    const t = streamTimers.get(threadId);
+    if (t) clearInterval(t);
+    streamTimers.delete(threadId);
+    partials.delete(threadId);
+    lastPushed.delete(threadId);
+    streamFailures.delete(threadId);
+  }
+
+  // Completed hops (accumulators) + the in-flight hop's deltas (partials).
+  function composeStream(threadId: string): string {
+    const done = accumulators.get(threadId) ?? [];
+    const part = partials.get(threadId) ?? "";
+    return [...done, part].filter(Boolean).join("\\n\\n").trim();
+  }
+
+  async function pushStream(threadId: string): Promise<void> {
+    const route = routes.get(threadId);
+    if (!route) return;
+    const text = composeStream(threadId);
+    if (!text || text === lastPushed.get(threadId)) return;
+    lastPushed.set(threadId, text);
+    try {
+      await api.callTool(
+        "telegram_stream",
+        { session: threadId, chat_id: route.chatId, phase: "update", text },
+        actorOpts(threadId),
+      );
+      streamFailures.delete(threadId);
+    } catch {
+      const n = (streamFailures.get(threadId) ?? 0) + 1;
+      streamFailures.set(threadId, n);
+      // Adapter missing or broken — stop ticking; turn-end still delivers.
+      if (n >= 3) stopStream(threadId);
+    }
+  }
+
   api.on("channel-message", (ev: any) => {
     const msg = ev.payload as ChannelMessage;
     // Ignore other channels' traffic (discord etc.) sharing the bus.
@@ -167,6 +234,12 @@ export function register(api: any) {
       { text },
       { durable: true, toAgentId: target, threadId },
     );
+    // Presence intent: "Thinking…"/typing appears the moment the turn
+    // starts, not at the first token. Best-effort — an adapter without
+    // telegram_stream still delivers via turn-end.
+    void api
+      .callTool("telegram_stream", { session: threadId, chat_id: msg.channel_id, phase: "start" })
+      .catch(() => {});
   });
 
   api.on("chat.assistant-text", (ev: any) => {
@@ -177,7 +250,21 @@ export function register(api: any) {
     const acc = accumulators.get(threadId) ?? [];
     acc.push(p.text);
     accumulators.set(threadId, acc);
+    // The hop's canonical text replaces its delta accumulation.
+    partials.delete(threadId);
     if (ev.actorId) turnActors.set(threadId, ev.actorId as string);
+  });
+
+  api.on("chat.assistant-delta", (ev: any) => {
+    const threadId = ev.threadId;
+    if (!threadId) return;
+    if (!getOrDeriveRoute(threadId)) return;
+    const p = ev.payload as { text: string };
+    partials.set(threadId, (partials.get(threadId) ?? "") + p.text);
+    if (ev.actorId) turnActors.set(threadId, ev.actorId as string);
+    if (!streamTimers.has(threadId)) {
+      streamTimers.set(threadId, setInterval(() => { void pushStream(threadId); }, STREAM_TICK_MS));
+    }
   });
 
   api.on("chat.tool-call", (ev: any) => {
@@ -199,22 +286,33 @@ export function register(api: any) {
     if (!threadId) return;
     const route = getOrDeriveRoute(threadId);
     if (!route) return;
+    stopStream(threadId);
     const text = finalize(threadId);
-    const actor = turnActors.get(threadId);
+    const opts = actorOpts(threadId);
     turnActors.delete(threadId);
     const explicit = turnExplicitSend.delete(threadId);
     try {
       if (text && !explicit) {
-        const sendArgs: Record<string, unknown> = { chat_id: route.chatId, text };
-        if (route.originMessageId) sendArgs.reply_to = route.originMessageId;
-        await api.callTool(
-          "telegram_send",
-          sendArgs,
-          actor ? { asAgent: actor } : undefined,
-        );
+        const args: Record<string, unknown> = { session: threadId, chat_id: route.chatId, phase: "finalize", text };
+        if (route.originMessageId) args.reply_to = route.originMessageId;
+        try {
+          await api.callTool("telegram_stream", args, opts);
+        } catch {
+          // Adapter predates telegram_stream or the stream died. The reply
+          // must land regardless — plain send is the floor.
+          const sendArgs: Record<string, unknown> = { chat_id: route.chatId, text };
+          if (route.originMessageId) sendArgs.reply_to = route.originMessageId;
+          await api.callTool("telegram_send", sendArgs, opts);
+        }
+      } else {
+        // Nothing to say (or the agent already sent explicitly) — tear
+        // down presence and any partial quietly.
+        void api
+          .callTool("telegram_stream", { session: threadId, chat_id: route.chatId, phase: "cancel" }, opts)
+          .catch(() => {});
       }
     } catch (err) {
-      console.error("[telegram-communication] telegram_send failed:", (err as Error).message);
+      console.error("[telegram-communication] delivery failed:", (err as Error).message);
     } finally {
       evictDerived(threadId);
     }
@@ -223,6 +321,14 @@ export function register(api: any) {
   api.on("chat.error", (ev: any) => {
     const threadId = ev.threadId;
     if (!threadId) return;
+    const route = routes.get(threadId);
+    const opts = actorOpts(threadId);
+    stopStream(threadId);
+    if (route) {
+      void api
+        .callTool("telegram_stream", { session: threadId, chat_id: route.chatId, phase: "cancel" }, opts)
+        .catch(() => {});
+    }
     accumulators.delete(threadId);
     turnActors.delete(threadId);
     turnExplicitSend.delete(threadId);
@@ -231,6 +337,11 @@ export function register(api: any) {
 }
 
 export function unload() {
+  for (const t of streamTimers.values()) clearInterval(t);
+  streamTimers.clear();
+  partials.clear();
+  lastPushed.clear();
+  streamFailures.clear();
   routes.clear();
   derivedRoutes.clear();
   accumulators.clear();
@@ -253,6 +364,7 @@ export async function smokeTest() {
   const m = JSON.parse(readFileSync(join(here, "manifest.json"), "utf8")) as {
     config?: { wakeWord?: unknown; watchedChats?: unknown };
     callsTools?: unknown;
+    eventReads?: unknown;
   };
   if (!m.config || typeof m.config.wakeWord !== "string" || m.config.wakeWord.length === 0) {
     throw new Error("telegram-communication: manifest.config.wakeWord must be a non-empty string");
@@ -260,8 +372,13 @@ export async function smokeTest() {
   if (!Array.isArray(m.config.watchedChats)) {
     throw new Error("telegram-communication: manifest.config.watchedChats must be an array");
   }
-  if (!Array.isArray(m.callsTools) || !m.callsTools.includes("telegram_send")) {
-    throw new Error("telegram-communication: manifest.callsTools must include \\"telegram_send\\"");
+  for (const tool of ["telegram_send", "telegram_stream"]) {
+    if (!Array.isArray(m.callsTools) || !m.callsTools.includes(tool)) {
+      throw new Error(\`telegram-communication: manifest.callsTools must include "\${tool}"\`);
+    }
+  }
+  if (!Array.isArray(m.eventReads) || !m.eventReads.includes("chat.assistant-delta")) {
+    throw new Error('telegram-communication: manifest.eventReads must include "chat.assistant-delta" (streaming feed)');
   }
 }
 `,
@@ -272,22 +389,30 @@ export async function smokeTest() {
 Bridges Telegram and the chat agent so a human on Telegram talks to olle the
 same way they do on the CLI. Inbound: DMs (private chats) always route to
 olle; a group chat routes only when the chat is in watchedChats AND the bot
-is @mentioned OR the wake-word appears. Outbound: it accumulates the agent's
-reply through the turn and posts one message at turn-end.
+is @mentioned OR the wake-word appears.
+
+Outbound is live, not batch. The moment a message routes in, presence
+appears — Telegram's native "Thinking…" draft bubble in DMs, a typing
+indicator in groups. As the agent produces text the reply streams into the
+chat (an animated draft in DMs, a growing ▌-cursor message in groups), and
+at turn-end one formatted message is finalized in place. If the telegram
+adapter is an older version without telegram_stream, the bridge quietly
+falls back to the classic one-message-at-turn-end behavior — the reply
+always lands.
 
 It also carries standing-job output: a schedule_task job with
 deliver:{kind:"telegram",chatId} lands here and posts to the chat with no
-reply reference. No inbound message required.
+reply reference. No inbound message required; streaming works there too.
 
 ## Prerequisite
 The telegram starter must be installed, secret-set, and registered first —
 this bridge is useless without telegram emitting channel-message events and
-providing the telegram_send tool. Set up telegram (see its SETUP.md) before
-this one.
+providing the telegram_send / telegram_stream tools. Set up telegram (see
+its SETUP.md) before this one.
 
 ## Secrets
-None of its own. It calls the telegram starter's telegram_send tool; that is
-where TELEGRAM_BOT_TOKEN lives.
+None of its own. It calls the telegram starter's tools; that is where
+TELEGRAM_BOT_TOKEN lives.
 
 ## Config knobs (manifest.json, config object)
 - wakeWord — default "olle". In a watched group chat, a message containing
@@ -309,6 +434,9 @@ where TELEGRAM_BOT_TOKEN lives.
 - Standing-job delivery posts to the chat id you gave schedule_task.
   Double-check that chat id before scheduling — a wrong id posts into the
   wrong place on a cron.
+- Streaming edits cost API calls (~1/s per active reply). That is well
+  inside Telegram's flood limits for a personal bot, but don't watch a
+  high-traffic group with streaming if dozens of replies run concurrently.
 `,
   },
 };

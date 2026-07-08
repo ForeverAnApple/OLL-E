@@ -379,8 +379,8 @@ Eight ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting w
 
 - `discord` — bot gateway + message send/receive; hardened with RESUME + backoff, heartbeat-ACK zombie detection, 429 retry
 - `discord-communication` — wake-word chat behavior over the discord gateway; standing-job channel routing (lazy `getOrDeriveRoute`)
-- `telegram` — long-poll `getUpdates` adapter; `telegram_send` (HTML-escaped, 4096-char chunked), `telegram_fetch_context`
-- `telegram-communication` — structural port of `discord-communication` for Telegram
+- `telegram` — long-poll `getUpdates` adapter; markdown→Telegram-HTML rendering with plain-text fallback; `telegram_send` (fence-aware chunking, reply_parameters), `telegram_stream` (native draft streaming in DMs, throttled edit loop in groups, presence timers, retry_after obedience), `telegram_typing`, `telegram_fetch_context`
+- `telegram-communication` — structural port of `discord-communication` for Telegram, plus live replies: presence fires on `chat.input` publish, `chat.assistant-delta` streams through `telegram_stream` on a 1s latest-state-wins tick, turn-end finalizes in place with `telegram_send` as the never-drop fallback
 - `github` — webhook receiver + API calls (issues, PRs, comments); `github_activity` since-based delta tool
 - `freshrss` — Google Reader API (ClientLogin); `freshrss_unread` / `freshrss_feeds` (operational), `freshrss_mark_read` (strategic)
 - `cron-trigger`
