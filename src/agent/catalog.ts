@@ -13,6 +13,7 @@
 // (which the LLM provider caches separately), not by this catalog text.
 
 import type { ToolDef } from "../extensions/types.ts";
+import type { StarterTemplate } from "../starters/index.ts";
 
 /** Default category for tools that don't declare one. Rendered last. */
 const MISC = "misc";
@@ -73,7 +74,9 @@ const CATEGORY_PROSE: Record<string, { tagline: string; body: string }> = {
       "Store, list, or remove host-scoped secrets (API tokens, etc.).\n" +
       "Extensions declare what they need in their manifest; you set the\n" +
       "value once and it's injected at load. Values are redacted from\n" +
-      "audit events and persisted messages.",
+      "audit events and persisted messages. Secret values are opaque by\n" +
+      "name — tools receive them injected; reading a secret's value (e.g.\n" +
+      "via a shell) is never necessary and never acceptable.",
   },
   "host context": {
     tagline: "live state of your machine",
@@ -134,9 +137,15 @@ const DEFAULT_CATEGORY: { tagline: string; body: string } = {
 };
 
 /** Render the catalog as a markdown block suitable for the stable
- *  segment of the system prompt. Pure function of the registered tool
- *  set — calling it again with the same tools returns identical text. */
-export function renderToolCatalog(tools: ToolDef[]): string {
+ *  segment of the system prompt. Pure function of the registered tool set
+ *  and the shipped starters — calling it again with the same inputs
+ *  returns identical text. `starters` is the binary's starter set
+ *  (listStarters()); it changes only with the binary, so it stays out of
+ *  the volatile per-turn segment. */
+export function renderToolCatalog(
+  tools: ToolDef[],
+  starters: StarterTemplate[] = [],
+): string {
   const grouped = groupByCategory(tools);
   const ordered = orderedCategories(grouped);
   const parts: string[] = [];
@@ -157,7 +166,37 @@ export function renderToolCatalog(tools: ToolDef[]): string {
     }
     parts.push(lines.join("\n"));
   }
+  const startersBlock = renderStarters(starters);
+  if (startersBlock) parts.push(startersBlock);
   return parts.join("\n\n");
+}
+
+/** Starters ship in the binary as ready-made extension templates. Surface
+ *  them in the catalog so the agent reaches for one before authoring from
+ *  scratch or — the failure this exists to prevent — standing up its own
+ *  infrastructure for a service a starter already connects to. */
+function renderStarters(starters: StarterTemplate[]): string {
+  if (starters.length === 0) return "";
+  const parts: string[] = [];
+  parts.push("## Available starters");
+  parts.push(
+    "These extension templates ship in the binary. Before authoring any\n" +
+      "capability from scratch or standing up a service, check\n" +
+      "`list_starters` and read the starter's SETUP.md (via\n" +
+      "`read_extension_file`) — a starter that CONNECTS to an existing\n" +
+      "service beats hosting one. Never provision infrastructure (docker\n" +
+      "containers, servers) for the human unprompted — propose first.",
+  );
+  const sorted = [...starters].sort((a, b) => a.name.localeCompare(b.name));
+  const lines = sorted.map((s) => `  - ${s.name} — ${starterClause(s)}`);
+  parts.push(lines.join("\n"));
+  return parts.join("\n\n");
+}
+
+function starterClause(s: StarterTemplate): string {
+  const desc = (s.description ?? "").trim();
+  if (desc.length <= 80) return desc;
+  return desc.slice(0, 77).trimEnd() + "...";
 }
 
 function groupByCategory(tools: ToolDef[]): Map<string, ToolDef[]> {

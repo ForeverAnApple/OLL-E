@@ -46,6 +46,7 @@ import {
 } from "./tool-truncate.ts";
 import { runAgent, type AgentStep } from "./runtime.ts";
 import { buildRedactionMap, mergeRedactionMap, redactInput, redactMessages } from "./redaction.ts";
+import { listStarters } from "../starters/index.ts";
 
 export interface AgentLoopOptions {
   bus: EventBus;
@@ -401,7 +402,7 @@ async function runTurn(
     // the tools block (which the LLM provider caches separately), NOT
     // in this catalog text — the catalog must stay stable across
     // load_tools calls within a thread or it'll invalidate the prefix.
-    const catalogBlock = renderToolCatalog(turnStartTools);
+    const catalogBlock = renderToolCatalog(turnStartTools, listStarters());
     // Mailbox sidebar — situational awareness block appended to the
     // system prompt each turn. Two sections:
     //   1. Other threads with activity (delegation cue).

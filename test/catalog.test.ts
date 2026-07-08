@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import type { ToolDef } from "../src/extensions/types.ts";
+import type { StarterTemplate } from "../src/starters/index.ts";
 import { renderToolCatalog } from "../src/agent/catalog.ts";
+
+function starter(name: string, description: string): StarterTemplate {
+  return { name, description, files: {} };
+}
 
 function tool(
   name: string,
@@ -96,6 +101,38 @@ describe("renderToolCatalog", () => {
       tool("a", "memory", "x"),
       tool("b", "observability", "y"),
     ];
-    expect(renderToolCatalog(tools)).toBe(renderToolCatalog(tools));
+    const starters = [starter("discord", "bot gateway"), starter("github", "webhook receiver")];
+    expect(renderToolCatalog(tools, starters)).toBe(renderToolCatalog(tools, starters));
+  });
+
+  it("renders a starters section with name + description, sorted by name", () => {
+    const tools = [tool("memory_search", "memory", "recall")];
+    const starters = [
+      starter("github", "webhook receiver + API calls"),
+      starter("discord", "bot gateway + message send/receive"),
+    ];
+    const out = renderToolCatalog(tools, starters);
+    expect(out).toContain("## Available starters");
+    expect(out).toContain("- discord — bot gateway + message send/receive");
+    expect(out).toContain("- github — webhook receiver + API calls");
+    // Guidance an agent must read before standing up its own service.
+    expect(out).toContain("CONNECTS to an existing");
+    expect(out).toContain("Never provision infrastructure");
+    // Alphabetical: discord before github.
+    expect(out.indexOf("- discord")).toBeLessThan(out.indexOf("- github"));
+  });
+
+  it("omits the starters section when no starters are supplied", () => {
+    const out = renderToolCatalog([tool("memory_search", "memory", "recall")]);
+    expect(out).not.toContain("## Available starters");
+  });
+
+  it("carries the secret-value guardrail in the secrets category prose", () => {
+    const out = renderToolCatalog([
+      tool("set_secret", "secrets", "store a host-scoped secret"),
+    ]);
+    expect(out).toContain("### secrets —");
+    expect(out).toContain("reading a secret's value");
+    expect(out).toContain("never acceptable");
   });
 });
