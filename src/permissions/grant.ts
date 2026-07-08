@@ -30,17 +30,32 @@ export interface GrantScopeExecutor {
   stop(): void;
 }
 
+/** The inner proposal payload both event shapes carry under `payload`. */
+interface GrantProposalPayload {
+  action?: string;
+  agentId?: string;
+  tool?: string;
+  tier?: Tier;
+}
+
 interface DecisionResolvedPayload {
   status?: string;
   ownerAgentId?: string;
   decisionId?: string;
   /** The (possibly modified) decision payload. */
-  payload?: {
-    action?: string;
-    agentId?: string;
-    tool?: string;
-    tier?: Tier;
-  };
+  payload?: GrantProposalPayload;
+}
+
+/** `askUp` emits this when an intermediate agent's allowTiers covers the
+ *  tier — a second terminal alongside `decision.resolved`. It skips the
+ *  inbox, so there is no status/decisionId; the approver is the delegate
+ *  that auto-approved and its own scope gates the grant. */
+interface DecisionAutoApprovedPayload {
+  approverAgentId?: string;
+  proposingAgentId?: string;
+  tier?: Tier;
+  summary?: string;
+  payload?: GrantProposalPayload;
 }
 
 /** Merge a granted {tool, tier} into a scope, idempotently:
@@ -65,11 +80,14 @@ function mergeGrant(scope: AgentScope, tool: string, tier: Tier): AgentScope {
 export function installGrantScopeExecutor(opts: GrantScopeExecutorOptions): GrantScopeExecutor {
   const { bus, store, hostId } = opts;
 
-  const unsub = bus.subscribe<DecisionResolvedPayload>("decision.resolved", (ev) => {
-    const p = ev.payload;
-    if (!p) return;
-    if (p.status !== "approved" && p.status !== "modified") return;
-    const inner = p.payload;
+  /** Apply a grant_scope decision: authority-gate against the approver's own
+   *  scope, merge into the target, emit scope.granted / scope.grant-rejected.
+   *  Shared by the inbox-resolved and auto-approved terminals of askUp. */
+  function applyGrant(
+    inner: GrantProposalPayload | undefined,
+    approverAgentId: string | undefined,
+    decisionId: string | undefined,
+  ): void {
     if (!inner || inner.action !== "grant_scope") return;
 
     const targetAgentId = inner.agentId;
@@ -79,7 +97,6 @@ export function installGrantScopeExecutor(opts: GrantScopeExecutorOptions): Gran
       return;
     }
 
-    const approverAgentId = p.ownerAgentId;
     const approverRow = approverAgentId
       ? store
           .select({ scope: tables.agents.scope })
@@ -99,7 +116,7 @@ export function installGrantScopeExecutor(opts: GrantScopeExecutorOptions): Gran
         actorId: approverAgentId ?? hostId,
         durable: true,
         payload: {
-          decisionId: p.decisionId,
+          decisionId,
           agentId: targetAgentId,
           tool,
           tier,
@@ -122,7 +139,7 @@ export function installGrantScopeExecutor(opts: GrantScopeExecutorOptions): Gran
         actorId: approverAgentId ?? hostId,
         durable: true,
         payload: {
-          decisionId: p.decisionId,
+          decisionId,
           agentId: targetAgentId,
           tool,
           tier,
@@ -145,7 +162,7 @@ export function installGrantScopeExecutor(opts: GrantScopeExecutorOptions): Gran
       actorId: approverAgentId ?? hostId,
       durable: true,
       payload: {
-        decisionId: p.decisionId,
+        decisionId,
         agentId: targetAgentId,
         tool,
         tier,
@@ -153,7 +170,29 @@ export function installGrantScopeExecutor(opts: GrantScopeExecutorOptions): Gran
         scope: nextScope,
       },
     });
+  }
+
+  const unsubResolved = bus.subscribe<DecisionResolvedPayload>("decision.resolved", (ev) => {
+    const p = ev.payload;
+    if (!p) return;
+    if (p.status !== "approved" && p.status !== "modified") return;
+    // On inbox resolution the approver is the inbox owner.
+    applyGrant(p.payload, p.ownerAgentId, p.decisionId);
   });
 
-  return { stop: unsub };
+  // askUp's other terminal: an intermediate delegate auto-approved within
+  // its allowTiers, skipping the inbox. Without this the grant never lands
+  // and chat.ts re-proposes every turn (grantProposed is per-turn state).
+  const unsubAuto = bus.subscribe<DecisionAutoApprovedPayload>("decision.auto-approved", (ev) => {
+    const p = ev.payload;
+    if (!p) return;
+    applyGrant(p.payload, p.approverAgentId, undefined);
+  });
+
+  return {
+    stop: () => {
+      unsubResolved();
+      unsubAuto();
+    },
+  };
 }

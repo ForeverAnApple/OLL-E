@@ -5,6 +5,7 @@ import { openStore, tables } from "../src/store/index.ts";
 import type { AgentScope } from "../src/store/schema.ts";
 import { ulid } from "../src/id/index.ts";
 import { installGrantScopeExecutor } from "../src/permissions/index.ts";
+import { askUp, type Inbox } from "../src/inbox/index.ts";
 
 function rig() {
   const store = openStore({ path: ":memory:" });
@@ -101,6 +102,73 @@ describe("grant_scope executor", () => {
     );
 
     expect(scopeOf(target).allowTools).toEqual(["memory_search", "telegram_send"]);
+  });
+
+  it("applies a grant auto-approved by an intermediate delegate (askUp topology)", () => {
+    const { store, hostId, seedAgent, scopeOf, bus } = rig();
+    // human root (owns money) → root AI (allowTiers covers strategic) → child.
+    const human = ulid();
+    const rootAi = ulid();
+    const child = ulid();
+    seedAgent(human, { allowTiers: ["operational", "strategic", "vision"] }, true);
+    // rootAi delegates strategic to descendants; parent is the human.
+    store
+      .insert(tables.agents)
+      .values({
+        id: rootAi,
+        name: rootAi,
+        hostId,
+        parentAgentId: human,
+        scope: { allowTiers: ["operational", "strategic"], allowTools: ["discord_send"] },
+        channels: [],
+        ownsMoney: false,
+        createdAt: Date.now(),
+      })
+      .run();
+    store
+      .insert(tables.agents)
+      .values({
+        id: child,
+        name: child,
+        hostId,
+        parentAgentId: rootAi,
+        scope: { allowTools: ["memory_search"] },
+        channels: [],
+        ownsMoney: false,
+        createdAt: Date.now(),
+      })
+      .run();
+
+    const inbox: Inbox = {
+      propose() {
+        throw new Error("should not queue — the root AI auto-approves");
+      },
+    } as unknown as Inbox;
+    const granted: Event[] = [];
+    bus.subscribe("scope.granted", (e) => void granted.push(e));
+
+    const result = askUp(
+      { bus, store, hostId, inbox },
+      {
+        proposingAgentId: child,
+        ownerAgentId: human,
+        tier: "strategic",
+        summary: "grant child discord_send",
+        payload: {
+          action: "grant_scope",
+          agentId: child,
+          tool: "discord_send",
+          tier: "strategic",
+        },
+      },
+    );
+
+    expect(result.kind).toBe("auto-approved");
+    expect(result.approverAgentId).toBe(rootAi);
+    // The child's scope actually gained the tool via decision.auto-approved.
+    expect(scopeOf(child).allowTools).toEqual(["memory_search", "discord_send"]);
+    expect(granted).toHaveLength(1);
+    expect((granted[0]!.payload as { approverAgentId: string }).approverAgentId).toBe(rootAi);
   });
 
   it("is a no-op on a denied resolution", () => {
