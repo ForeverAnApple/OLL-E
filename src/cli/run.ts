@@ -5,6 +5,7 @@ import { resolvePaths } from "../paths.ts";
 import { connectIpc, type IpcClient } from "../ipc/client.ts";
 import { connectOrExit, withIpc } from "./ipc-helper.ts";
 import { ANSI } from "./theme.ts";
+import { formatTokens, renderStats } from "./stats-render.ts";
 import type {
   AgentSelf,
   BudgetStatus,
@@ -877,21 +878,15 @@ async function cmdChat(): Promise<void> {
 }
 
 function color(code: string, s: string): string {
-  // Skip styling when stdout is piped — keeps output clean.
-  if (!process.stdout.isTTY) return s;
+  // Skip styling when stdout is piped or NO_COLOR is set (any value, per
+  // no-color.org — `!= null` so NO_COLOR= still disables) — keeps output clean.
+  if (!process.stdout.isTTY || process.env.NO_COLOR != null) return s;
   return `${code}${s}${ANSI.reset}`;
 }
 
 function termWidth(): number {
   const w = process.stdout.columns;
   return w && w > 20 ? w : 80;
-}
-
-function formatTokens(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
-  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
-  return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
 // --- Observability subcommands. All wrap the same observability.* IPC
@@ -973,38 +968,27 @@ function parseFlagValue(args: string[], name: string): string | undefined {
 }
 
 async function cmdStats(args: string[]): Promise<void> {
-  await runObsCmd<UsageStats>(args, {
-    method: "observability.usage",
-    buildParams: (f) => ({ actorId: f.agent, threadId: f.thread, since: f.since }),
-    format: (stats) => {
-      const t = stats.totals;
-      console.log(
-        `tokens: in=${t.inputTokens} out=${t.outputTokens} cache_read=${t.cacheReadTokens} cache_create=${t.cacheCreationTokens}`,
-      );
-      console.log(`hit_ratio: ${fmtPct(t.cacheHitRatio)}`);
-      console.log(`usd: ${fmtUsd(t.usdMicros)} (${stats.rows} ledger rows scanned)`);
-      if (stats.byModel.length > 0) {
-        console.log("by model:");
-        for (const m of stats.byModel) {
-          const tag = m.pricePosted ? "" : " (fallback price)";
-          console.log(
-            `  ${m.provider}/${m.model}: ${m.calls} calls, in=${m.inputTokens} out=${m.outputTokens} cache_r=${m.cacheReadTokens} hit=${fmtPct(m.cacheHitRatio)} ${fmtUsd(m.usdMicros)}${tag}`,
-          );
-        }
-      }
-    },
-    // Budget side, same call shape if --agent given.
-    extra: async (client, f) => {
-      if (!f.agent) return;
-      const b = await client.call<BudgetStatus>("observability.budget", { actorId: f.agent });
-      if (b.rows.length === 0) return;
-      console.log("budget:");
-      for (const r of b.rows) {
-        const cap = r.capUsd != null ? fmtUsd(r.capUsd) : "-";
-        const pct = r.percentUsd != null ? fmtPct(r.percentUsd) : "-";
-        console.log(`  ${r.period}: ${fmtUsd(r.spentUsd)} / ${cap}  (${pct})`);
-      }
-    },
+  // One IPC pull for usage, a second for budget when --agent is set, then a
+  // single render — the pretty layout weaves budget into the same receipt,
+  // so we can't print usage before the budget call returns.
+  const flags = parseObsFlags(args);
+  const paths = resolvePaths();
+  await withIpc(paths.socketFile, async (client) => {
+    const stats = await client.call<UsageStats>("observability.usage", {
+      actorId: flags.agent,
+      threadId: flags.thread,
+      since: flags.since,
+    });
+    const budget = flags.agent
+      ? await client.call<BudgetStatus>("observability.budget", { actorId: flags.agent })
+      : undefined;
+    console.log(
+      renderStats(stats, budget, {
+        width: process.stdout.columns ?? 80,
+        color: Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null,
+        agent: flags.agent,
+      }),
+    );
   });
 }
 
