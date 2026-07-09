@@ -55,6 +55,7 @@ export async function runInkChat(): Promise<void> {
       agentName={agentName}
       initialThreadId={initialThreadId}
       initialModel={headerModel}
+      initialEffort={self?.reasoningEffort ?? ""}
       inboxOpen={inboxOpen}
     />,
     { exitOnCtrlC: false },  // we handle Ctrl-C inside the app (two-tap quit + cancel-turn)

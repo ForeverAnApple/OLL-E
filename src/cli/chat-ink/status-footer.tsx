@@ -10,12 +10,16 @@ import { contextWindow } from "../../llm/models.ts";
 export function StatusFooter({
   agentName,
   model,
+  effort,
   inboxOpen,
   totalUsdMicros,
   contextTokens,
 }: {
   agentName: string;
   model: string;
+  /** Reasoning-effort preference ("off" when thinking is disabled). Answers
+   *  "is this agent thinking at all?" without waiting for a live stream. */
+  effort?: string;
   inboxOpen: number;
   /** Cumulative spend for the thread, in micro-USD. */
   totalUsdMicros: number;
@@ -37,6 +41,7 @@ export function StatusFooter({
       <Box>
         <Text color={theme.primary}>{agentName}</Text>
         {model && <Text color={theme.muted}> {sym.sep} {model}</Text>}
+        {effort && <Text color={theme.muted}> {sym.sep} think:{effort}</Text>}
       </Box>
       <Box>
         {inboxOpen > 0 && (

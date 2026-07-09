@@ -16,6 +16,7 @@ import type { IpcClient } from "../../ipc/client.ts";
 import { connectIpc } from "../../ipc/client.ts";
 import type { Event } from "../../bus/types.ts";
 import { ScrollbackItem, TrayList, type ScrollbackEntry } from "./message.tsx";
+import { theme } from "./theme.ts";
 import { InputFrame, StatusLine, type BarState } from "./input-bar.tsx";
 import { StatusFooter } from "./status-footer.tsx";
 import { mintEntryId, mintThreadId, mintToolId } from "./ids.ts";
@@ -44,6 +45,9 @@ export interface ChatAppProps {
   agentName: string;
   initialThreadId: string;
   initialModel: string;
+  /** Agent's reasoning-effort preference at REPL start ("off" when unset).
+   *  Display-only; the per-thread frozen value is what actually runs. */
+  initialEffort: string;
   inboxOpen: number;
 }
 
@@ -53,6 +57,7 @@ type Action =
   | { type: "drain-tray"; count: number }
   | { type: "discard-tray-last" }
   | { type: "delta"; text: string }
+  | { type: "thinking-delta"; text: string }
   | { type: "assistant-text"; text: string }
   | { type: "tool-call"; name: string; input: unknown }
   | { type: "tool-result"; content: string; isError: boolean }
@@ -71,6 +76,13 @@ type Action =
 interface ChatState {
   scrollback: ScrollbackEntry[];
   streaming: string;
+  /** Live thinking text for the current reasoning stretch. Visualization
+   *  only — collapses to a one-line `thinking` scrollback entry the moment
+   *  the round-trip moves on (text starts, tool call lands, turn ends). */
+  thinking: string;
+  /** Epoch ms when the current thinking stretch started; drives the
+   *  "thought for Ns" duration on the collapsed entry. */
+  thinkingStartedAt: number | null;
   turnBusy: boolean;
   /** True between the user pressing Ctrl-C mid-turn and the daemon
    *  emitting the terminal event (chat.cancelled / chat.error /
@@ -94,7 +106,31 @@ interface ChatState {
   contextTokens: number;
 }
 
-function reducer(state: ChatState, action: Action): ChatState {
+/** Commit the live thinking region (if any) as a one-line scrollback
+ *  marker. Called from every reducer arm that means "the reasoning
+ *  stretch is over" — first visible text, a tool call, turn end, cancel,
+ *  error. Idempotent when there's nothing to collapse. */
+function collapseThinking(state: ChatState): ChatState {
+  if (state.thinking.length === 0) return state;
+  const ms = state.thinkingStartedAt != null ? Date.now() - state.thinkingStartedAt : 0;
+  return {
+    ...state,
+    scrollback: [...state.scrollback, { kind: "thinking", id: mintEntryId(), ms }],
+    thinking: "",
+    thinkingStartedAt: null,
+  };
+}
+
+function reducer(rawState: ChatState, action: Action): ChatState {
+  // Any action that isn't more thinking ends the current reasoning
+  // stretch — visible text, tool activity, and terminal events all mean
+  // the model moved on. Collapsing here (rather than in each arm) keeps
+  // the interleaved-thinking case correct: think → tool → think → text
+  // yields one marker per stretch.
+  const state =
+    action.type === "thinking-delta" || action.type === "inbox-count" || action.type === "context-usage"
+      ? rawState
+      : collapseThinking(rawState);
   switch (action.type) {
     case "user-submit":
       return {
@@ -121,6 +157,12 @@ function reducer(state: ChatState, action: Action): ChatState {
       return state.tray.length === 0 ? state : { ...state, tray: state.tray.slice(0, -1) };
     case "delta":
       return { ...state, streaming: state.streaming + action.text };
+    case "thinking-delta":
+      return {
+        ...state,
+        thinking: state.thinking + action.text,
+        thinkingStartedAt: state.thinkingStartedAt ?? Date.now(),
+      };
     case "assistant-text": {
       const text = action.text || state.streaming;
       const next: ScrollbackEntry[] = text.length > 0
@@ -212,6 +254,8 @@ function reducer(state: ChatState, action: Action): ChatState {
         threadId: action.threadId,
         scrollback: [],
         streaming: "",
+        thinking: "",
+        thinkingStartedAt: null,
         turnBusy: false,
         cancelling: false,
         tray: [],
@@ -243,7 +287,7 @@ const STREAM_DRAIN_DIVISOR = 5;
 // ...but always at least this many, so the last few chars don't crawl.
 const STREAM_MIN_CHARS = 3;
 
-export function ChatApp({ client: initialClient, socketFile, agentId, agentName, initialThreadId, initialModel, inboxOpen }: ChatAppProps): React.ReactElement {
+export function ChatApp({ client: initialClient, socketFile, agentId, agentName, initialThreadId, initialModel, initialEffort, inboxOpen }: ChatAppProps): React.ReactElement {
   const { exit } = useApp();
   const { stdout } = useStdout();
   // Width budget for scrollback rows. <Static> mounts each item as a detached
@@ -257,6 +301,8 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
   const [state, dispatch] = useReducer(reducer, {
     scrollback: [],
     streaming: "",
+    thinking: "",
+    thinkingStartedAt: null,
     turnBusy: false,
     cancelling: false,
     threadId: initialThreadId,
@@ -574,6 +620,17 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
       <Static items={state.scrollback}>
         {(entry) => <ScrollbackItem key={entry.id} entry={entry} width={cols} />}
       </Static>
+      {state.thinking.length > 0 && (
+        // Live thinking: dim italic, clipped to the last few lines so a
+        // deep reasoning stretch reads as a background hum, not a wall.
+        // Collapses to a one-line marker when the model moves on.
+        <Box marginTop={1} paddingLeft={3} paddingRight={2} flexDirection="column">
+          <Text color={theme.muted} italic>✻ thinking…</Text>
+          {lastLines(state.thinking, 4).map((line, i) => (
+            <Text key={i} color={theme.muted} italic>{line}</Text>
+          ))}
+        </Box>
+      )}
       {state.streaming.length > 0 && (
         <Box marginTop={1} paddingLeft={3} paddingRight={2} flexDirection="column">
           {state.streaming.split("\n").map((line, i) => <Text key={i}>{line}</Text>)}
@@ -593,6 +650,7 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
         <StatusFooter
           agentName={agentName}
           model={state.model}
+          effort={initialEffort}
           inboxOpen={state.inboxOpen}
           totalUsdMicros={state.totalUsdMicros}
           contextTokens={state.contextTokens}
@@ -600,6 +658,13 @@ export function ChatApp({ client: initialClient, socketFile, agentId, agentName,
       </Box>
     </Box>
   );
+}
+
+/** Last N non-empty-tail lines of a streaming buffer — the visible slice
+ *  of the live thinking region. */
+function lastLines(s: string, n: number): string[] {
+  const lines = s.split("\n");
+  return lines.slice(Math.max(0, lines.length - n));
 }
 
 /** Sleep that resolves on either timeout or abort. Without the abort
@@ -661,6 +726,11 @@ function dispatchTailEvent(
       // Pool the delta; the smoothing timer eases it onto screen. No dispatch
       // here, so bursty arrival doesn't drive bursty rendering.
       pending.current += String(p.text ?? "");
+      return;
+    case "chat.thinking-delta":
+      // No smoothing lane — thinking is a dim background hum where bursty
+      // arrival is fine; the smoothing pump stays reserved for the answer.
+      dispatch({ type: "thinking-delta", text: String(p.text ?? "") });
       return;
     case "chat.assistant-text":
       // Turn's text is final and authoritative — drop any unrevealed buffer

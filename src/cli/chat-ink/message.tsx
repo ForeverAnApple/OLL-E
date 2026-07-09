@@ -15,6 +15,10 @@ import { clipString, formatCost } from "./format.ts";
 export type ScrollbackEntry =
   | { kind: "user"; id: string; text: string }
   | { kind: "assistant"; id: string; text: string }
+  /** Collapsed marker for one reasoning stretch. The thinking text itself
+   *  is visualization-only (it streamed live, then vanished); the marker
+   *  keeps the scrollback honest about where time went. */
+  | { kind: "thinking"; id: string; ms: number }
   | { kind: "tool-call"; id: string; name: string; input: unknown }
   | { kind: "tool-result"; id: string; content: string; isError: boolean }
   | { kind: "note"; id: string; text: string }
@@ -47,6 +51,7 @@ export function MessageRow({ entry }: { entry: ScrollbackEntry }): React.ReactEl
   switch (entry.kind) {
     case "user":          return <UserRow text={entry.text} />;
     case "assistant":     return <AssistantRow text={entry.text} />;
+    case "thinking":      return <ThinkingRow ms={entry.ms} />;
     case "tool-call":     return <ToolCallRow name={entry.name} input={entry.input} />;
     case "tool-result":   return <ToolResultRow content={entry.content} isError={entry.isError} />;
     case "note":          return <NoteRow text={entry.text} />;
@@ -104,6 +109,15 @@ function AssistantRow({ text }: { text: string }): React.ReactElement {
   return (
     <Box paddingLeft={3} paddingRight={2} flexDirection="column">
       <Markdown source={text} />
+    </Box>
+  );
+}
+
+function ThinkingRow({ ms }: { ms: number }): React.ReactElement {
+  const secs = ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10_000 ? 0 : 1)}s` : "<1s";
+  return (
+    <Box paddingLeft={3} paddingRight={1}>
+      <Text color={theme.muted} italic>✻ thought for {secs}</Text>
     </Box>
   );
 }
