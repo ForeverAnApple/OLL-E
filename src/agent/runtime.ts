@@ -105,6 +105,10 @@ export interface AgentRunOptions {
 export type AgentStep =
   | { kind: "assistant"; content: ContentBlock[] }
   | { kind: "assistant_delta"; text: string }
+  // Streaming thinking/reasoning text. Visualization only — the durable
+  // record is the thinking block inside the `assistant` step's content
+  // (which must persist anyway for the signature echo).
+  | { kind: "thinking_delta"; text: string }
   | { kind: "tool_use"; id: string; name: string; input: Record<string, unknown> }
   // `tool_result_live` is the UX-facing event: fires the moment a tool's
   // output is computed (post per-tool cap, *pre* aggregate-budget cap).
@@ -205,6 +209,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
     if (toolSpecs && toolSpecs.length > 0) req.tools = toolSpecs;
     req.onRetry = (info) => opts.onStep?.({ kind: "retry", info });
     req.onTextDelta = (delta) => opts.onStep?.({ kind: "assistant_delta", text: delta });
+    req.onReasoningDelta = (delta) => opts.onStep?.({ kind: "thinking_delta", text: delta });
     if (opts.signal) req.signal = opts.signal;
     const completion = await opts.llm.complete(req);
     total.inputTokens += completion.usage.inputTokens;

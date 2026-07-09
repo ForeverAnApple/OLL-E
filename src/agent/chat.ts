@@ -1080,6 +1080,21 @@ function emitStep(
       durable: false,
       payload: { text: step.text },
     });
+  } else if (step.kind === "thinking_delta") {
+    if (!step.text) return;
+    // Streaming thinking text. Non-durable like assistant-delta: pure
+    // visualization. The thinking cost is already inside output_tokens
+    // (ledger-exact); the thinking block itself persists in the thread
+    // messages for the signature echo — no separate durable record needed.
+    opts.bus.publish({
+      type: "chat.thinking-delta",
+      hostId: opts.hostId,
+      actorId: opts.agentId,
+      parentEventId: origin.id,
+      threadId,
+      durable: false,
+      payload: { text: step.text },
+    });
   } else if (step.kind === "tool_use") {
     const input = redactToolInput(step.name, step.input);
     opts.bus.publish({

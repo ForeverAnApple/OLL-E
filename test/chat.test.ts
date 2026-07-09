@@ -151,6 +151,55 @@ describe("agent loop over the mailbox", () => {
     expect((seen[0]!.payload as { text: string }).text).toBe("hi from mock");
   });
 
+  it("publishes chat.thinking-delta for streamed reasoning, non-durable", async () => {
+    const r = rig();
+    const llm: Llm = {
+      provider: "mock",
+      defaultModel: "mock-1",
+      async complete(req) {
+        req.onReasoningDelta?.("mulling ");
+        req.onReasoningDelta?.("it over");
+        return endTurn("answer");
+      },
+    };
+    startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      system: "test",
+    });
+
+    const thinkingDeltas: string[] = [];
+    r.bus.subscribe("chat.thinking-delta", (e) =>
+      void thinkingDeltas.push((e.payload as { text: string }).text),
+    );
+    const done = new Promise<void>((resolve) => {
+      r.bus.subscribe("chat.turn-end", () => resolve());
+    });
+    r.bus.publish({
+      type: "chat.input",
+      hostId: r.hostId,
+      actorId: "cli",
+      durable: true,
+      toAgentId: r.agentId,
+      threadId: "t1",
+      payload: { text: "hello" },
+    });
+    await done;
+
+    expect(thinkingDeltas).toEqual(["mulling ", "it over"]);
+    // Deltas are visualization, not history: nothing lands in the durable
+    // event log. (The thinking block itself persists in thread messages.)
+    const persisted = r.store
+      .select()
+      .from(tables.events)
+      .where(eq(tables.events.type, "chat.thinking-delta"))
+      .all();
+    expect(persisted).toEqual([]);
+  });
+
   it("resolves function system prompts at turn time", async () => {
     const r = rig();
     const requests: CompletionRequest[] = [];
