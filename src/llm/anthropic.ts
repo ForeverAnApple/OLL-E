@@ -101,8 +101,17 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
       // Reasoning effort ⇒ adaptive thinking + effort dial, carried via the
       // AI SDK's Anthropic providerOptions. Opus 4.7/4.8 reject sampling
       // params when effort is set, so we drop temperature in that case.
+      // display: "summarized" because the Opus 4.7+ default ("omitted")
+      // returns thinking blocks with EMPTY text — nothing to stream, nothing
+      // to persist. Billing is identical either way (thinking tokens count
+      // toward output_tokens regardless of display), so visibility is free.
       const effortOptions = req.effort
-        ? { anthropic: { thinking: { type: "adaptive" as const }, effort: req.effort } }
+        ? {
+            anthropic: {
+              thinking: { type: "adaptive" as const, display: "summarized" as const },
+              effort: req.effort,
+            },
+          }
         : undefined;
 
       const result = streamText({
@@ -115,14 +124,16 @@ export function createAnthropicAdapter(opts: AnthropicAdapterOptions = {}): Llm 
         ...(effortOptions && { providerOptions: effortOptions }),
         maxRetries,
         ...(req.signal && { abortSignal: req.signal }),
-        ...(req.onTextDelta && {
+        ...((req.onTextDelta || req.onReasoningDelta) && {
           onChunk: ({ chunk }) => {
-            if (chunk.type === "text-delta") {
-              try {
+            try {
+              if (chunk.type === "text-delta") {
                 req.onTextDelta?.(chunk.text);
-              } catch {
-                // A misbehaving subscriber must not blow up the LLM call.
+              } else if (chunk.type === "reasoning-delta") {
+                req.onReasoningDelta?.(chunk.text);
               }
+            } catch {
+              // A misbehaving subscriber must not blow up the LLM call.
             }
           },
         }),

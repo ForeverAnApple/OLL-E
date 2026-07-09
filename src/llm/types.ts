@@ -106,6 +106,12 @@ export interface CompletionRequest {
    *  visibility hook for surfaces (CLI, future bridges) that want to
    *  render tokens as they arrive instead of waiting for the full block. */
   onTextDelta?: (delta: string) => void;
+  /** Fired with each thinking/reasoning delta as it streams in. Same
+   *  contract as onTextDelta: visibility only, the assembled thinking
+   *  block still arrives in the Completion content. Only fires when the
+   *  request has `effort` set (no thinking otherwise) and the provider
+   *  returns thinking content. */
+  onReasoningDelta?: (delta: string) => void;
   /** Cancel the in-flight request. The adapter forwards this to the SDK;
    *  on abort the call rejects with an AbortError. Lets the agent loop
    *  surface a Ctrl-C from the CLI as a real network interrupt rather

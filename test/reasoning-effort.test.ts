@@ -65,7 +65,10 @@ describe("anthropic adapter — reasoning effort", () => {
     const llm = createAnthropicAdapter({ languageModel: model });
     await llm.complete({ ...base, effort: "high", temperature: 0.7 });
     const anthropic = calls[0]!.providerOptions?.anthropic as Record<string, unknown>;
-    expect(anthropic?.thinking).toEqual({ type: "adaptive" });
+    // display: "summarized" is load-bearing — the Opus 4.7+ default
+    // ("omitted") returns thinking blocks with empty text, leaving nothing
+    // to stream or persist.
+    expect(anthropic?.thinking).toEqual({ type: "adaptive", display: "summarized" });
     expect(anthropic?.effort).toBe("high");
     // 4.7/4.8 reject sampling params alongside effort.
     expect(calls[0]!.temperature).toBeUndefined();

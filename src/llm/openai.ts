@@ -97,14 +97,16 @@ export function createOpenAIAdapter(opts: OpenAIAdapterOptions = {}): Llm {
         ...(req.temperature !== undefined && { temperature: req.temperature }),
         maxRetries,
         ...(req.signal && { abortSignal: req.signal }),
-        ...(req.onTextDelta && {
+        ...((req.onTextDelta || req.onReasoningDelta) && {
           onChunk: ({ chunk }) => {
-            if (chunk.type === "text-delta") {
-              try {
+            try {
+              if (chunk.type === "text-delta") {
                 req.onTextDelta?.(chunk.text);
-              } catch {
-                // A misbehaving subscriber must not blow up the LLM call.
+              } else if (chunk.type === "reasoning-delta") {
+                req.onReasoningDelta?.(chunk.text);
               }
+            } catch {
+              // A misbehaving subscriber must not blow up the LLM call.
             }
           },
         }),

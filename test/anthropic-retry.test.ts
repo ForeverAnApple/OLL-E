@@ -97,4 +97,61 @@ describe("anthropic adapter streaming", () => {
     expect(out.content).toEqual([{ type: "text", text: "hello world" }]);
     expect(out.stopReason).toBe("end_turn");
   });
+
+  test("forwards reasoning deltas to req.onReasoningDelta and keeps the thinking block", async () => {
+    const thinkingDeltas: string[] = [];
+    const textDeltas: string[] = [];
+    let capturedOptions: { providerOptions?: Record<string, unknown> } | undefined;
+    const model = new MockLanguageModelV3({
+      provider: "anthropic",
+      modelId: "claude-opus-4-8",
+      doStream: async (options) => {
+        capturedOptions = options as typeof capturedOptions;
+        return {
+          stream: streamOf([
+            { type: "stream-start", warnings: [] },
+            { type: "reasoning-start", id: "r1" },
+            { type: "reasoning-delta", id: "r1", delta: "let me " },
+            { type: "reasoning-delta", id: "r1", delta: "mull" },
+            { type: "reasoning-end", id: "r1" },
+            { type: "text-start", id: "t1" },
+            { type: "text-delta", id: "t1", delta: "answer" },
+            { type: "text-end", id: "t1" },
+            {
+              type: "finish",
+              usage: {
+                inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                outputTokens: { total: 5, text: 2, reasoning: 3 },
+              },
+              finishReason: { unified: "stop", raw: undefined },
+            },
+          ]),
+        };
+      },
+    });
+    const llm = createAnthropicAdapter({ languageModel: model });
+    const out = await llm.complete({
+      ...baseReq,
+      effort: "medium",
+      onTextDelta: (d) => textDeltas.push(d),
+      onReasoningDelta: (d) => thinkingDeltas.push(d),
+    });
+    expect(thinkingDeltas).toEqual(["let me ", "mull"]);
+    expect(textDeltas).toEqual(["answer"]);
+    // The assembled thinking block still lands in content (needed for the
+    // signature echo on the next turn), alongside the text.
+    expect(out.content).toEqual([
+      { type: "thinking", thinking: "let me mull", signature: "" },
+      { type: "text", text: "answer" },
+    ]);
+    // Effort must reach the wire as adaptive thinking with summarized
+    // display — the Opus 4.7+ default ("omitted") returns empty thinking
+    // text, which would make the whole streaming path render nothing.
+    const anthropicOpts = capturedOptions?.providerOptions?.anthropic as {
+      thinking?: { type: string; display?: string };
+      effort?: string;
+    };
+    expect(anthropicOpts?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+    expect(anthropicOpts?.effort).toBe("medium");
+  });
 });
