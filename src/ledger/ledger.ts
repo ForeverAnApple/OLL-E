@@ -75,15 +75,21 @@ export function createLedger(opts: LedgerOptions): Ledger {
       })
       .run();
 
-    // USD is computed at apply time from current prices. We return it so
-    // callers (chat loop, future paid-tool wrappers) can surface "this
-    // turn cost ~$X at today's prices" without re-pricing themselves.
-    const usdMicros = priceTokens(input.provider, input.model, {
-      inputTokens: input.inputTokens,
-      outputTokens: input.outputTokens,
-      cacheReadInputTokens: cacheRead,
-      cacheCreationInputTokens: cacheCreation,
-    });
+    // USD is computed at apply time, at the rate in effect for this
+    // spend's timestamp (= now; record() runs as the turn ends). We
+    // return it so callers (chat loop, future paid-tool wrappers) can
+    // surface "this turn cost ~$X" without re-pricing themselves.
+    const usdMicros = priceTokens(
+      input.provider,
+      input.model,
+      {
+        inputTokens: input.inputTokens,
+        outputTokens: input.outputTokens,
+        cacheReadInputTokens: cacheRead,
+        cacheCreationInputTokens: cacheCreation,
+      },
+      now,
+    );
 
     let overBudget = false;
     if (input.ownerAgentId) {

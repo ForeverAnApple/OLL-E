@@ -88,11 +88,91 @@ export async function runCli(args: string[]): Promise<void> {
     case "model":
       await cmdModel(rest);
       return;
+    case "budget":
+      await cmdBudget(rest);
+      return;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
       process.exit(2);
   }
+}
+
+interface BudgetSetResult {
+  agentId: string | null;
+  period: string;
+  capUsdMicros: number | null;
+  capTokens: number | null;
+  spentUsdMicros: number;
+  spentTokens: number;
+  created: boolean;
+}
+
+function parseBudgetFlags(args: string[]): { agent?: string; usd?: string; tokens?: string } {
+  const out: { agent?: string; usd?: string; tokens?: string } = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--agent" && args[i + 1]) out.agent = args[++i];
+    else if (a === "--usd" && args[i + 1]) out.usd = args[++i];
+    else if (a === "--tokens" && args[i + 1]) out.tokens = args[++i];
+  }
+  return out;
+}
+
+async function cmdBudget(args: string[]): Promise<void> {
+  // `olle budget show [--agent X]` → cap + spend for the agent (default root).
+  // `olle budget set --usd N [--tokens N] [--agent X]` → arm/adjust the cap.
+  //   USD is whole dollars (fractions ok: --usd 12.50); "none" clears a cap.
+  const sub = args[0];
+  const paths = resolvePaths();
+  await withIpc(paths.socketFile, async (client) => {
+    if (sub === "set") {
+      const flags = parseBudgetFlags(args.slice(1));
+      const params: Record<string, unknown> = {};
+      if (flags.agent) params.agentId = flags.agent;
+      if (flags.usd !== undefined) {
+        params.capUsdMicros =
+          flags.usd === "none" ? null : Math.round(Number(flags.usd) * 1_000_000);
+        if (params.capUsdMicros !== null && !Number.isFinite(params.capUsdMicros as number)) {
+          throw new Error(`--usd must be a number or "none", got "${flags.usd}"`);
+        }
+      }
+      if (flags.tokens !== undefined) {
+        params.capTokens = flags.tokens === "none" ? null : Number(flags.tokens);
+        if (params.capTokens !== null && !Number.isFinite(params.capTokens as number)) {
+          throw new Error(`--tokens must be a number or "none", got "${flags.tokens}"`);
+        }
+      }
+      if (params.capUsdMicros === undefined && params.capTokens === undefined) {
+        throw new Error("usage: olle budget set --usd <dollars|none> [--tokens <n|none>] [--agent <id>]");
+      }
+      const r = await client.call<BudgetSetResult>("budget.set", params);
+      const cap = r.capUsdMicros != null ? fmtUsd(r.capUsdMicros) : "-";
+      const tok = r.capTokens != null ? ` / ${r.capTokens} tokens` : "";
+      console.log(
+        `budget ${r.created ? "armed" : "updated"} for ${r.agentId ?? "(owner)"} [${r.period}]: cap ${cap}${tok}, spent so far ${fmtUsd(r.spentUsdMicros)}`,
+      );
+      return;
+    }
+    if (sub === "show" || sub === undefined) {
+      const flags = parseBudgetFlags(args.slice(1));
+      const agentId =
+        flags.agent ??
+        (await client.call<{ rootAgentId: string }>("status.rootAgent")).rootAgentId;
+      const b = await client.call<BudgetStatus>("observability.budget", { actorId: agentId });
+      if (b.rows.length === 0) {
+        console.log("(no budget rows — spend is uncapped; arm one with `olle budget set --usd N`)");
+        return;
+      }
+      for (const r of b.rows) {
+        const cap = r.capUsd != null ? fmtUsd(r.capUsd) : "-";
+        const pct = r.percentUsd != null ? ` (${fmtPct(r.percentUsd)})` : "";
+        console.log(`${r.period}: ${fmtUsd(r.spentUsd)} / ${cap}${pct}`);
+      }
+      return;
+    }
+    throw new Error(`unknown budget subcommand "${sub}" — use show|set`);
+  });
 }
 
 async function cmdModel(args: string[]): Promise<void> {

@@ -1,9 +1,11 @@
 // Per-model token prices. Single source of truth for the USD-as-derivation
 // rule (LOG 2026-04-24): the ledger stores tokens; anyone who wants USD
-// computes it from current prices via priceTokens(). Update this map when
-// providers change rates — historical ledger rows naturally re-price to
-// the new rate, which is honest ("at today's prices, that conversation
-// would have cost X").
+// computes it from prices via priceTokens(). Prices are effective-dated
+// (LOG 2026-07-09): when a provider changes a rate, append a new era with
+// its effectiveFrom instead of editing the old one, and pass the spend's
+// timestamp to priceTokens — historical rows keep pricing at the rate that
+// was actually billed. Editing an old era is reserved for fixing a rate
+// that was simply recorded wrong (a bug is not a price change).
 //
 // All values are micro-USD per million tokens. 1_000_000 micros = $1.
 // Cache pricing per provider posted multipliers:
@@ -33,11 +35,23 @@ export interface PricedUsage {
   cacheCreationInputTokens?: number;
 }
 
-// Posted prices as of 2026-05. Edit this map when Anthropic updates rates.
+/** One rate era for a model. A model's rates are either a bare ModelPrice
+ *  (never changed since we started tracking) or an ascending list of eras;
+ *  the era in effect at time T is the last one with effectiveFrom <= T. */
+export interface PriceEra {
+  /** Epoch ms this rate took effect. Omit on the first era (since ever). */
+  effectiveFrom?: number;
+  price: ModelPrice;
+}
+
+type ModelRates = ModelPrice | PriceEra[];
+
+// Posted prices as of 2026-05. Edit this map when Anthropic updates rates —
+// as a NEW era with effectiveFrom, not an edit (see header).
 // Source: https://platform.claude.com/docs/en/docs/about-claude/pricing
 // Conservative fallback below for unknown models so pricing never throws —
 // agents see a number, possibly wrong, never crash.
-const PRICES: Record<string, Record<string, ModelPrice>> = {
+const PRICES: Record<string, Record<string, ModelRates>> = {
   anthropic: {
     // Opus 4.5+ priced 3x cheaper than the original Opus 4 / 4.1 tier.
     // (Opus 4.0/4.1 were $15/$75; Opus 4.5/4.6/4.7/4.8 are $5/$25.)
@@ -126,13 +140,37 @@ const FALLBACK: ModelPrice = {
   cacheCreationMicros: 6_250_000,
 };
 
-export function lookupPrice(provider: string, model: string): ModelPrice {
-  return PRICES[provider]?.[model] ?? FALLBACK;
+/** The rate in effect at `at` from an ascending era list: the last era
+ *  with effectiveFrom <= at. A timestamp before the first dated era gets
+ *  the earliest known rate (better than FALLBACK — the model existed, we
+ *  just don't have an older rate on record). Exported for tests. */
+export function eraPriceAt(eras: PriceEra[], at: number): ModelPrice {
+  let current = eras[0]!.price;
+  for (const era of eras) {
+    if (era.effectiveFrom !== undefined && era.effectiveFrom > at) break;
+    current = era.price;
+  }
+  return current;
 }
 
-/** Compute micro-USD for a given usage at current prices. Pure function. */
-export function priceTokens(provider: string, model: string, usage: PricedUsage): number {
-  const p = lookupPrice(provider, model);
+/** Rate for a model at time `at` (default: now). */
+export function lookupPrice(provider: string, model: string, at: number = Date.now()): ModelPrice {
+  const rates = PRICES[provider]?.[model];
+  if (!rates) return FALLBACK;
+  if (!Array.isArray(rates)) return rates;
+  return eraPriceAt(rates, at);
+}
+
+/** Compute micro-USD for a given usage at the prices in effect at `at`
+ *  (default: now — right for pricing a spend as it happens; pass the
+ *  row's timestamp when repricing history). Pure function. */
+export function priceTokens(
+  provider: string,
+  model: string,
+  usage: PricedUsage,
+  at: number = Date.now(),
+): number {
+  const p = lookupPrice(provider, model, at);
   return (
     (usage.inputTokens * p.inMicros) / 1_000_000 +
     (usage.outputTokens * p.outMicros) / 1_000_000 +

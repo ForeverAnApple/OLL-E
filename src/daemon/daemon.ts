@@ -433,16 +433,31 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
           // Bound it with a short timeout: a model that can't answer "ok" in
           // one token within the window is rejected, the turn completes, and
           // the agent stays on its current model (recoverable, no brick).
-          probe: async (model) => {
+          probe: async (model, actorId) => {
             const PROBE_TIMEOUT_MS = 15_000;
             const ctl = new AbortController();
             const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
             try {
-              await llm.complete({
+              const completion = await llm.complete({
                 model,
                 messages: [{ role: "user", content: "ok" }],
                 maxTokens: 1,
                 signal: ctl.signal,
+              });
+              // Tiny (~a dozen tokens) but real, billed spend — record it
+              // so the ledger covers 100% of LLM call sites. A failed
+              // probe throws before here; the SDK surfaces no usage for
+              // failed calls, so there is nothing to record on that path.
+              ledger.record({
+                actorId,
+                threadId: "model-probe",
+                ownerAgentId: humanAgentId,
+                provider: llm.provider,
+                model,
+                inputTokens: completion.usage.inputTokens,
+                outputTokens: completion.usage.outputTokens,
+                cacheReadTokens: completion.usage.cacheReadInputTokens,
+                cacheCreationTokens: completion.usage.cacheCreationInputTokens,
               });
             } catch (err) {
               if (ctl.signal.aborted) {

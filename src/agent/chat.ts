@@ -28,7 +28,7 @@ import type { Event } from "../bus/types.ts";
 import type { Store } from "../store/db.ts";
 import type { Ledger } from "../ledger/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
-import type { Llm, Message, ReasoningEffort, SystemSegment } from "../llm/index.ts";
+import type { Llm, Message, ReasoningEffort, SystemSegment, Usage } from "../llm/index.ts";
 import type { ToolDef } from "../extensions/types.ts";
 import { askUp, type Inbox } from "../inbox/index.ts";
 import { checkTool } from "../permissions/index.ts";
@@ -359,6 +359,36 @@ async function runTurn(
   thread.messages.push({ role: "user", content: text });
   const turnAbort = new AbortController();
   thread.activeAbort = turnAbort;
+  // Spend accounting accumulates per round-trip (from the usage steps),
+  // not from runAgent's return value — a turn that throws or is cancelled
+  // mid-flight never returns, but every completed round-trip was already
+  // billed by the provider. Recording from the accumulator in both the
+  // success and error paths closes the hole where a failed multi-round-
+  // trip turn silently dropped the completed rounds' real spend (and
+  // under-decremented the budget). On success it equals result.totalUsage.
+  const turnUsage: Usage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    totalTokens: 0,
+  };
+  let spendRecorded = false;
+  const recordSpend = (): { usdMicros: number } | undefined => {
+    if (spendRecorded || !opts.ledger || turnUsage.totalTokens === 0) return undefined;
+    spendRecorded = true;
+    return opts.ledger.record({
+      actorId: opts.agentId,
+      threadId: thread.id,
+      ownerAgentId: opts.ownerAgentId,
+      provider: opts.llm.provider,
+      model: thread.model ?? opts.llm.defaultModel,
+      inputTokens: turnUsage.inputTokens,
+      outputTokens: turnUsage.outputTokens,
+      cacheReadTokens: turnUsage.cacheReadInputTokens,
+      cacheCreationTokens: turnUsage.cacheCreationInputTokens,
+    });
+  };
   try {
     // Core tools wrapped per-turn so register_extension's auto-load
     // closure binds this thread's loadedTools.
@@ -516,7 +546,16 @@ async function runTurn(
       scrubResult: opts.secretsDir
         ? (content) => scrubSecrets(content, getSecretsProvider(opts.secretsDir!)())
         : undefined,
-      onStep: (step) => emitStep(opts, thread.id, origin, step, redactToolInput),
+      onStep: (step) => {
+        if (step.kind === "usage") {
+          turnUsage.inputTokens += step.usage.inputTokens;
+          turnUsage.outputTokens += step.usage.outputTokens;
+          turnUsage.cacheReadInputTokens += step.usage.cacheReadInputTokens;
+          turnUsage.cacheCreationInputTokens += step.usage.cacheCreationInputTokens;
+          turnUsage.totalTokens += step.usage.totalTokens;
+        }
+        emitStep(opts, thread.id, origin, step, redactToolInput);
+      },
       authorize: (tool) =>
         checkTool(scope, { name: tool.name, tier: tool.tier ?? "operational" }),
       onDenied: ({ tool, reason, input }) => {
@@ -602,20 +641,7 @@ async function runTurn(
       thread.mailHwm = Math.max(thread.mailHwm, sidebar.mailHwmAfterRead);
     }
     thread.messages = result.messages;
-    let recorded: { usdMicros: number } | undefined;
-    if (opts.ledger && result.totalUsage.totalTokens > 0) {
-      recorded = opts.ledger.record({
-        actorId: opts.agentId,
-        threadId: thread.id,
-        ownerAgentId: opts.ownerAgentId,
-        provider: opts.llm.provider,
-        model: thread.model ?? opts.llm.defaultModel,
-        inputTokens: result.totalUsage.inputTokens,
-        outputTokens: result.totalUsage.outputTokens,
-        cacheReadTokens: result.totalUsage.cacheReadInputTokens,
-        cacheCreationTokens: result.totalUsage.cacheCreationInputTokens,
-      });
-    }
+    const recorded = recordSpend();
     // Commit snapshot before announcing turn-end so subscribers reacting
     // to the event can rely on disk state being current. Sensitive tool
     // inputs (e.g. set_secret value) are redacted from the persisted form.
@@ -644,6 +670,10 @@ async function runTurn(
       },
     });
   } catch (err) {
+    // The turn died, but every round-trip that completed before the
+    // failure was real, billed spend — record it. A cancel especially:
+    // the API already served those tokens.
+    recordSpend();
     const cancelled =
       turnAbort.signal.aborted ||
       (err as { name?: string })?.name === "AbortError" ||

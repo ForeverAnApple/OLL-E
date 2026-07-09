@@ -32,6 +32,7 @@ import {
   threadInventory,
   usageStats,
 } from "../observability/index.ts";
+import { setBudget } from "../ledger/index.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
 import { readDefaultModel, writeDefaultModel } from "../daemon/model-preference.ts";
 import { resolveBootModel } from "../memory/model.ts";
@@ -527,6 +528,44 @@ async function dispatch(
       case "observability.budget":
         observabilityCall(req, opts, send, (store, params) => budgetStatus(store, params));
         return;
+      // Budget cap write — the human arming/adjusting a cap on their own
+      // money. Not a privileged bypass of the inbox: the inbox flow is how
+      // an AGENT requests a raise; the owner granting one directly is the
+      // terminal act of that same chain (analogous to `olle secret set`).
+      case "budget.set": {
+        if (!opts.store) {
+          send({ id: req.id, ok: false, error: { message: "store unavailable" } });
+          return;
+        }
+        const ownerAgentId =
+          (req.params?.ownerAgentId as string | undefined) ?? opts.humanAgentId;
+        if (!ownerAgentId) {
+          send({ id: req.id, ok: false, error: { message: "no owner agent on this host" } });
+          return;
+        }
+        // Default target: the root agent — the spender the decrement path
+        // (ledger.record actorId) and the pre-turn wall both key on.
+        const agentId = (req.params?.agentId as string | undefined) ?? opts.rootAgentId;
+        const capUsdMicros = req.params?.capUsdMicros as number | null | undefined;
+        const capTokens = req.params?.capTokens as number | null | undefined;
+        if (capUsdMicros === undefined && capTokens === undefined) {
+          send({
+            id: req.id,
+            ok: false,
+            error: { message: "capUsdMicros or capTokens required (null clears)" },
+          });
+          return;
+        }
+        const result = setBudget(opts.store, {
+          ownerAgentId,
+          ...(agentId !== undefined && { agentId }),
+          ...(req.params?.period !== undefined && { period: req.params.period as string }),
+          ...(capUsdMicros !== undefined && { capUsdMicros }),
+          ...(capTokens !== undefined && { capTokens }),
+        });
+        send({ id: req.id, ok: true, value: result });
+        return;
+      }
       case "observability.runs":
         observabilityCall(req, opts, send, (store, params) => runHistory(store, params));
         return;

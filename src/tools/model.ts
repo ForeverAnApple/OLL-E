@@ -42,7 +42,7 @@ export interface ModelToolsOptions {
    *  that don't exercise it). "Posted price" proves the host can bill the
    *  model, not that the API serves it — this closes that gap so a switch
    *  can never brick the loop with a priced-but-unserved model. */
-  probe?: (model: string) => Promise<void>;
+  probe?: (model: string, actorId: string) => Promise<void>;
 }
 
 interface SetArgs {
@@ -112,7 +112,7 @@ export function buildModelTools(opts: ModelToolsOptions): ToolDef[] {
       // turn. ("default" needs no probe — it can't be wrong.)
       if (!isDefault && probe) {
         try {
-          await probe(model);
+          await probe(model, ctx.actorId);
         } catch (err) {
           const msg = (err as Error)?.message ?? String(err);
           throw new Error(

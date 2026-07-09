@@ -150,7 +150,7 @@ decision_messages  (id, decision_id, host_id, actor_id, text, at)         -- age
 budgets       (id, owner_agent_id, agent_id, period, cap_tokens, cap_usd, spent, updated_at)
 ledger        (id, hlc, host_id, actor_id, thread_id, provider, model,
                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tool_call_id)
-              -- tokens-only by design (LOG 2026-04-24); USD is computed from current prices
+              -- tokens-only by design (LOG 2026-04-24); USD derived at the rate in effect at the row's timestamp (LOG 2026-07-09)
 
 memories      (id, hlc, host_id, actor_id, scope, title, body_md, tags)  -- scope ∈ {private,team,scratch}
 memory_reads  (memory_id, reader_actor_id, at)
@@ -240,7 +240,7 @@ Budget is owned by **principals**. Principals allocate portions to **agents**. E
 
 Budget allocation (raising cap, creating new allocation) is always an inbox decision — never self-authorized by the agent.
 
-**Tokens-only ledger; USD as derivation** (LOG 2026-04-24). Ledger rows store `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, and `thread_id`. They do **not** store USD. Per-row USD would be a snapshot at insert time — provider prices change, snapshots rot, and an agent reading its own ledger would see false physics. The physical unit is tokens; USD is computed from current prices via `src/llm/pricing.ts`, which is the single source of truth and gets updated when providers change rates.
+**Tokens-only ledger; USD as derivation** (LOG 2026-04-24). Ledger rows store `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, and `thread_id`. They do **not** store USD. Per-row USD would be a snapshot at insert time — provider prices change, snapshots rot, and an agent reading its own ledger would see false physics. The physical unit is tokens; USD is computed via `src/llm/pricing.ts`, the single source of truth. Prices are **effective-dated** (LOG 2026-07-09): a provider rate change appends a new era with its `effectiveFrom` rather than editing the old one, and every derivation prices a row at the rate in effect at that row's timestamp — so history never re-values when rates move. Editing an era in place is reserved for fixing a rate that was recorded wrong (a bug is not a price change).
 
 Budgets stay USD-denominated because principals back them with real money. The asymmetry resolves at decrement time: the ledger module computes USD via `priceTokens(model, usage)` and accumulates into `budgets.spent_usd`, snapshotting USD into the *budget* (one number per agent×period) instead of every ledger row. The cap-comparison stays meaningful even when prices later shift; agents see cost as physics; nobody is lying to anybody.
 
@@ -363,7 +363,7 @@ Trigger declarations are themselves authority statements for their `type` field 
 ### Core bundle (shipped in binary, not an extension)
 
 - LLM provider adapters (Anthropic, OpenAI) via API key config
-- Pricing config (`src/llm/pricing.ts`) — single source of truth for token prices, USD computed on read
+- Pricing config (`src/llm/pricing.ts`) — single source of truth for token prices; effective-dated eras, USD computed on read at the rate in effect at spend time
 - Store / event bus / scheduler
 - Decision-inbox router
 - CLI chat handler (channel-of-first-contact)

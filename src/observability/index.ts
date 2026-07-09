@@ -41,7 +41,7 @@ export interface UsageStatsRow {
   cacheReadTokens: number;
   cacheCreationTokens: number;
   totalTokens: number;
-  /** Computed from current prices via priceTokens. */
+  /** Computed via priceTokens at the rate in effect at each row's timestamp. */
   usdMicros: number;
   /** Cache_read / (cache_read + input). 0 when nothing cached. */
   cacheHitRatio: number;
@@ -75,6 +75,7 @@ export function usageStats(store: Store, filter: UsageStatsFilter = {}): UsageSt
       outputTokens: tables.ledger.outputTokens,
       cacheReadTokens: tables.ledger.cacheReadTokens,
       cacheCreationTokens: tables.ledger.cacheCreationTokens,
+      at: tables.ledger.at,
     })
     .from(tables.ledger)
     .where(conds)
@@ -93,6 +94,7 @@ export function usageStats(store: Store, filter: UsageStatsFilter = {}): UsageSt
       output: number;
       cacheRead: number;
       cacheCreation: number;
+      usdMicros: number;
       calls: number;
     }
   >();
@@ -105,6 +107,20 @@ export function usageStats(store: Store, filter: UsageStatsFilter = {}): UsageSt
     tOut += r.outputTokens;
     tCacheR += r.cacheReadTokens;
     tCacheC += r.cacheCreationTokens;
+    // Priced PER ROW at the rate in effect at the row's timestamp (LOG
+    // 2026-07-09, effective-dated prices) — pricing the group sum at one
+    // rate would re-value history whenever a provider changes a rate.
+    const rowUsd = priceTokens(
+      r.provider,
+      r.model,
+      {
+        inputTokens: r.inputTokens,
+        outputTokens: r.outputTokens,
+        cacheReadInputTokens: r.cacheReadTokens,
+        cacheCreationInputTokens: r.cacheCreationTokens,
+      },
+      r.at,
+    );
     const k = groupKey(r.provider, r.model);
     const g = groups.get(k);
     if (g) {
@@ -112,6 +128,7 @@ export function usageStats(store: Store, filter: UsageStatsFilter = {}): UsageSt
       g.output += r.outputTokens;
       g.cacheRead += r.cacheReadTokens;
       g.cacheCreation += r.cacheCreationTokens;
+      g.usdMicros += rowUsd;
       g.calls += 1;
     } else {
       groups.set(k, {
@@ -121,6 +138,7 @@ export function usageStats(store: Store, filter: UsageStatsFilter = {}): UsageSt
         output: r.outputTokens,
         cacheRead: r.cacheReadTokens,
         cacheCreation: r.cacheCreationTokens,
+        usdMicros: rowUsd,
         calls: 1,
       });
     }
@@ -138,12 +156,7 @@ export function usageStats(store: Store, filter: UsageStatsFilter = {}): UsageSt
 
   const byModel: UsageStatsByModel[] = [];
   for (const g of groups.values()) {
-    const usd = priceTokens(g.provider, g.model, {
-      inputTokens: g.input,
-      outputTokens: g.output,
-      cacheReadInputTokens: g.cacheRead,
-      cacheCreationInputTokens: g.cacheCreation,
-    });
+    const usd = g.usdMicros;
     totals.usdMicros += usd;
     byModel.push({
       provider: g.provider,

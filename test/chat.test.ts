@@ -151,6 +151,55 @@ describe("agent loop over the mailbox", () => {
     expect((seen[0]!.payload as { text: string }).text).toBe("hi from mock");
   });
 
+  it("records completed round-trips' spend when a later round-trip throws", async () => {
+    const r = rig();
+    const { createLedger } = await import("../src/ledger/index.ts");
+    const ledger = createLedger({ bus: r.bus, store: r.store, hostId: r.hostId });
+    let calls = 0;
+    const llm: Llm = {
+      provider: "mock",
+      defaultModel: "mock-1",
+      async complete() {
+        calls++;
+        // Round 1 succeeds (tool_use keeps the turn going); round 2 dies.
+        if (calls === 1) return toolUseTurn("no_such_tool", {});
+        throw new Error("provider exploded mid-turn");
+      },
+    };
+    startAgentLoop({
+      bus: r.bus,
+      store: r.store,
+      hostId: r.hostId,
+      llm,
+      agentId: r.agentId,
+      system: "test",
+      ledger,
+    });
+
+    const done = new Promise<void>((resolve) => {
+      r.bus.subscribe("chat.error", () => resolve());
+    });
+    r.bus.publish({
+      type: "chat.input",
+      hostId: r.hostId,
+      actorId: "cli",
+      durable: true,
+      toAgentId: r.agentId,
+      threadId: "t1",
+      payload: { text: "hello" },
+    });
+    await done;
+
+    // Round 1 was real, billed spend (1 in / 1 out per toolUseTurn) and
+    // must survive the round-2 failure in the ledger.
+    const rows = r.store.select().from(tables.ledger).all();
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.inputTokens).toBe(1);
+    expect(rows[0]!.outputTokens).toBe(1);
+    expect(rows[0]!.threadId).toBe("t1");
+    expect(rows[0]!.actorId).toBe(r.agentId);
+  });
+
   it("publishes chat.thinking-delta for streamed reasoning, non-durable", async () => {
     const r = rig();
     const llm: Llm = {

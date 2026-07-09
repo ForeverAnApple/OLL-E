@@ -1286,6 +1286,18 @@ Three prior entries parked agent-direct task authoring behind extension packagin
 
 ---
 
+## 2026-07-09 — Accounting audit fixes: partial-usage recording, effective-dated prices, budget armed
+
+**The audit.** A full accounting audit (code trace + live-DB reconciliation) found the pipeline exact for every completed turn — ledger totals matched `chat.turn-end` events with zero drift on all 36 threads — and three gaps, all closed here.
+
+**Partial usage survives a failed turn.** `runAgent` accumulated usage across round-trips but a thrown error or user cancel discarded the whole total: the catch in `runTurn` skipped `ledger.record`, so a turn that died on round-trip 6 silently dropped five rounds of real, billed spend (each round re-reads the whole context as cache_read) and under-decremented the budget. The turn's spend now accumulates outside `runAgent`'s return path — from the per-round-trip `usage` steps — and is recorded in both the success and error paths. Zero occurrences in live data (no `chat.error`/`chat.cancelled` ever); fixed before it cost anything. The model-switch smoke probe (`daemon.ts`), the one other billed LLM call site, now records too.
+
+**Prices are effective-dated; history stops moving.** `priceTokens` gains an `at` parameter and `pricing.ts` supports per-model rate eras (`effectiveFrom`); observability prices each ledger row at the rate in effect at the row's own timestamp, and the ledger prices a spend at record time. This refines 2026-04-24's "USD computed from current prices": the ledger stays tokens-only and USD stays a derivation — but a derivation from *the rate that was actually billed*, so a provider price change appends an era instead of retroactively re-valuing every past month. Note for the record: the 2026-05-05 pricing.ts change was a **bug fix**, not a price change — opus-4-7 was always $5/$25 (the initial sheet wrongly copied the legacy Opus 4.1 tier), so it stays a single-era model and pre-fix `turn-end.usdMicros` snapshots (~$18.5 total) overstate what Anthropic actually billed (~$10.8). Current `olle stats` is the number that reconciles against the console.
+
+**Budget armed; the write surface now exists.** The audit found the `budgets` table empty — the whole cap machinery (thresholds, inbox alerts, pre-turn wall) wired but dormant, all spend uncapped. `ARCHITECTURE.md` sketched `olle budget set` but only the read side was ever built. Added `setBudget` (upsert preserving accumulated spend — a cap change is a policy change, not an amnesty), a `budget.set` IPC method, and the `olle budget show|set` CLI. Vision check: this is not a privileged bypass of the inbox — the inbox flow is how an *agent* requests a raise; the owner granting one on their own money is the terminal act of that same chain (same standing as `olle secret set`). Armed: $100 all-time on the root agent.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.
