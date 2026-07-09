@@ -251,6 +251,42 @@ describe("renderStats — empty state", () => {
     expect(out).toContain("Budget");
     expect(out).toContain("$50.00");
   });
+
+  test("empty-state prose + inline command fit width and never split at 60/100", () => {
+    const sBoth = [
+      stats({ byModel: [], totals: zeroTotals(), rows: 0 }),
+      stats({ byModel: [], totals: zeroTotals(), rows: 0, window: { since: Date.now() - 3_600_000 } }),
+    ];
+    for (const s of sBoth) {
+      for (const width of [60, 100]) {
+        for (const color of [true, false]) {
+          const rendered = renderStats(s, undefined, { width, color });
+          for (const line of rendered.split("\n")) {
+            expect(plain(line).length).toBeLessThanOrEqual(width);
+          }
+          // The suggested command stays copy-pasteable — never wrapped.
+          expect(plain(rendered)).toContain(
+            s.window.since != null ? "olle stats --since 7d" : "olle chat",
+          );
+        }
+      }
+    }
+  });
+
+  test("empty-state budget row fits a narrow terminal (barW reservation)", () => {
+    const s = stats({ byModel: [], totals: zeroTotals(), rows: 0 });
+    const b: BudgetStatus = {
+      rows: [
+        { id: "b1", ownerAgentId: "oz", agentId: "oz", period: "daily", capUsd: usd(50), capTokens: null, spentUsd: usd(42.3), spentTokens: 0, percentUsd: 0.846, percentTokens: null },
+      ],
+    };
+    for (const width of [60, 100]) {
+      const rendered = renderStats(s, b, { width, color: true, agent: "oz" });
+      for (const line of rendered.split("\n")) {
+        expect(plain(line).length).toBeLessThanOrEqual(width);
+      }
+    }
+  });
 });
 
 describe("renderStats — alignment & degradation", () => {

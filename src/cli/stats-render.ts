@@ -10,9 +10,28 @@
 // escapes are zero-width, columns stay aligned identically with or without
 // color. So there is no vlen/padVisible math here — padding is always done
 // before any escape is added.
+//
+// Generic formatting/bar primitives live in render.ts (shared across the
+// CLI); this module keeps only the stats-specific layout.
 
 import { ANSI } from "./theme.ts";
+import {
+  bar,
+  clip,
+  fmtAge,
+  fmtUsdSmart,
+  formatTokens,
+  hiColor,
+  intComma,
+  loColor,
+  wrap,
+  wrapSpans,
+  type Colorer,
+} from "./render.ts";
 import type { BudgetStatus, UsageStats } from "../observability/index.ts";
+
+// run.ts and test/stats-render.test.ts import formatTokens from here.
+export { formatTokens, fmtUsdSmart };
 
 export interface StatsRenderOpts {
   width: number;
@@ -22,41 +41,7 @@ export interface StatsRenderOpts {
   agent?: string;
 }
 
-// --- number / label formatting -------------------------------------------
-
-/** Humanize a token count. Billions tier included so 1e9 doesn't render as
- *  "1000.0M". */
-export function formatTokens(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
-  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
-  if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  return `${(n / 1_000_000_000).toFixed(2)}B`;
-}
-
-/** Adaptive USD precision: sub-dollar dev bills keep up to 4dp so they stay
- *  meaningful (trailing zeros trimmed to at least 2dp — "$0.59", not
- *  "$0.5900"); dollars use 2dp; thousands get comma grouping. */
-export function fmtUsdSmart(micros: number): string {
-  if (micros === 0) return "$0.00";
-  const d = micros / 1_000_000;
-  if (d < 1) return `$${d.toFixed(4).replace(/0{1,2}$/, "")}`;
-  if (d < 1000) return `$${d.toFixed(2)}`;
-  return `$${d.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function intComma(n: number): string {
-  return n.toLocaleString("en-US");
-}
-
-// Compact relative duration — mirrors run.ts fmtAge; duplicated to keep this
-// module free of any run.ts (daemon-heavy) import.
-function fmtAge(ms: number): string {
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
-  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
-  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
-  return `${Math.round(ms / 86_400_000)}d`;
-}
+// --- stats-specific labels -----------------------------------------------
 
 function windowLabel(since?: number): string {
   return since == null ? "all time" : `last ${fmtAge(Date.now() - since)}`;
@@ -74,33 +59,6 @@ function hitCell(input: number, cacheRead: number): string {
   const denom = input + cacheRead;
   if (denom === 0) return "—";
   return `${Math.round((cacheRead / denom) * 100)}%`;
-}
-
-// --- bars & threshold colors ---------------------------------------------
-
-function bar(ratio: number, width: number): { filled: string; empty: string } {
-  const k = Math.round(Math.max(0, Math.min(1, ratio)) * width);
-  return { filled: "█".repeat(k), empty: "░".repeat(width - k) };
-}
-
-/** Cache: higher is better. */
-function hiColor(ratio: number): string {
-  return ratio >= 0.7 ? ANSI.success : ratio >= 0.4 ? ANSI.warning : ANSI.error;
-}
-
-/** Budget: lower is better. Thresholds match the 80%/100% inbox auto-post
- *  thresholds in ARCHITECTURE.md — the visual state flips exactly where the
- *  system already acts. */
-function loColor(ratio: number): string {
-  return ratio < 0.8 ? ANSI.success : ratio < 1.0 ? ANSI.warning : ANSI.error;
-}
-
-// --- plain-string helpers ------------------------------------------------
-
-/** Head-keeping ellipsis on a PLAIN (un-colored) string. */
-function clip(s: string, width: number): string {
-  if (s.length <= width) return s;
-  return s.slice(0, Math.max(0, width - 1)) + "…";
 }
 
 // -------------------------------------------------------------------------
@@ -133,7 +91,7 @@ export function renderStats(
   out.push("");
 
   if (stats.byModel.length === 0) {
-    renderEmpty(out, C, since);
+    renderEmpty(out, C, width, since);
   } else {
     renderSpend(out, C, stats);
     renderCache(out, C, stats, width);
@@ -148,15 +106,13 @@ export function renderStats(
 
   // Fallback footnote — only meaningful when models rendered.
   if (stats.byModel.some((m) => !m.pricePosted)) {
-    out.push(
-      C(ANSI.muted, "~ estimated at a fallback rate — no posted price for this model"),
-    );
+    for (const line of wrap("~ estimated at a fallback rate — no posted price for this model", width)) {
+      out.push(C(ANSI.muted, line));
+    }
   }
 
   return out.join("\n");
 }
-
-type Colorer = (code: string, s: string) => string;
 
 function renderSpend(out: string[], C: Colorer, stats: UsageStats): void {
   const t = stats.totals;
@@ -282,8 +238,17 @@ function renderBudget(
   width: number,
 ): void {
   out.push(C(ANSI.secondary + ANSI.bold, "Budget") + C(ANSI.muted, ` · agent ${agent}`));
-  const barW = Math.min(20, Math.max(8, width - 40));
   const SPENT_CAP_W = 17;
+  // Line = indent(2) + period(9) + scW(17) + gap(2) + bar + gap(2) + pct(4)
+  //      + gap(3) + "$X left". Reserve the widest "left" so the bar never
+  //      pushes a capped row past the terminal edge.
+  const leftMax = Math.max(
+    0,
+    ...budget.rows.map((r) =>
+      r.capUsd != null ? `${fmtUsdSmart(Math.max(0, r.capUsd - r.spentUsd))} left`.length : 0,
+    ),
+  );
+  const barW = Math.max(4, Math.min(20, width - (2 + 9 + SPENT_CAP_W + 2 + 2 + 4 + 3 + leftMax)));
 
   for (const r of budget.rows) {
     const periodLabel = C(ANSI.dim, r.period.padEnd(9));
@@ -320,21 +285,21 @@ function renderBudget(
   out.push("");
 }
 
-function renderEmpty(out: string[], C: Colorer, since?: number): void {
+function renderEmpty(out: string[], C: Colorer, width: number, since?: number): void {
   out.push(C(ANSI.text, "No spend recorded yet."));
   out.push("");
-  if (since != null) {
-    out.push(
-      C(ANSI.muted, `Nothing has used tokens in the ${windowLabel(since)} window. Widen it with `) +
-        C(ANSI.text, "olle stats --since 7d") +
-        C(ANSI.muted, ", or drop --since for all time."),
-    );
-  } else {
-    out.push(
-      C(ANSI.muted, "Nothing on this host has used tokens yet. Open a chat with ") +
-        C(ANSI.text, "olle chat") +
-        C(ANSI.muted, " and this fills in: spend, model breakdown, and cache savings."),
-    );
-  }
+  const spans =
+    since != null
+      ? [
+          { code: ANSI.muted, text: `Nothing has used tokens in the ${windowLabel(since)} window. Widen it with ` },
+          { code: ANSI.text, text: "olle stats --since 7d", nowrap: true },
+          { code: ANSI.muted, text: ", or drop --since for all time." },
+        ]
+      : [
+          { code: ANSI.muted, text: "Nothing on this host has used tokens yet. Open a chat with " },
+          { code: ANSI.text, text: "olle chat", nowrap: true },
+          { code: ANSI.muted, text: " and this fills in: spend, model breakdown, and cache savings." },
+        ];
+  for (const line of wrapSpans(C, spans, width)) out.push(line);
   out.push("");
 }

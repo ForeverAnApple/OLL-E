@@ -2,10 +2,38 @@ import { readFileSync } from "node:fs";
 import { startDaemon } from "../daemon/daemon.ts";
 import { enrichPathFromLoginShell } from "../daemon/path-env.ts";
 import { resolvePaths } from "../paths.ts";
-import { connectIpc, type IpcClient } from "../ipc/client.ts";
+import { connectIpc } from "../ipc/client.ts";
 import { connectOrExit, withIpc } from "./ipc-helper.ts";
 import { ANSI } from "./theme.ts";
-import { formatTokens, renderStats } from "./stats-render.ts";
+import { renderStats } from "./stats-render.ts";
+import { renderCache, renderRuns, renderThreads, renderEvents, renderEventLine } from "./obs-render.ts";
+import {
+  renderExtensionList,
+  renderExtensionHistory,
+  renderExtensionReloadAck,
+  renderExtensionRevertAck,
+  renderStarterList,
+  renderStarterInstallAck,
+  renderSecretList,
+  renderSecretRemoveAck,
+  renderSecretSetAck,
+} from "./entity-render.ts";
+import {
+  renderTeamStatus,
+  renderTeamCreateAck,
+  renderTeamInviteAck,
+  renderTeamJoinAck,
+  renderTeamLeaveAck,
+  renderBudgetShow,
+  renderBudgetSet,
+  renderModelGet,
+  renderModelSet,
+  renderPublishAck,
+  type TeamStatusData,
+} from "./team-render.ts";
+import { renderStatus, renderInspectAgent } from "./status-render.ts";
+import { renderInboxList, renderInboxShow } from "./inbox-render.ts";
+import { makeColorer } from "./render.ts";
 import type {
   AgentSelf,
   BudgetStatus,
@@ -127,6 +155,7 @@ async function cmdBudget(args: string[]): Promise<void> {
   const sub = args[0];
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
+    const opts = renderOpts();
     if (sub === "set") {
       const flags = parseBudgetFlags(args.slice(1));
       const params: Record<string, unknown> = {};
@@ -148,11 +177,7 @@ async function cmdBudget(args: string[]): Promise<void> {
         throw new Error("usage: olle budget set --usd <dollars|none> [--tokens <n|none>] [--agent <id>]");
       }
       const r = await client.call<BudgetSetResult>("budget.set", params);
-      const cap = r.capUsdMicros != null ? fmtUsd(r.capUsdMicros) : "-";
-      const tok = r.capTokens != null ? ` / ${r.capTokens} tokens` : "";
-      console.log(
-        `budget ${r.created ? "armed" : "updated"} for ${r.agentId ?? "(owner)"} [${r.period}]: cap ${cap}${tok}, spent so far ${fmtUsd(r.spentUsdMicros)}`,
-      );
+      console.log(renderBudgetSet(r, opts));
       return;
     }
     if (sub === "show" || sub === undefined) {
@@ -161,15 +186,7 @@ async function cmdBudget(args: string[]): Promise<void> {
         flags.agent ??
         (await client.call<{ rootAgentId: string }>("status.rootAgent")).rootAgentId;
       const b = await client.call<BudgetStatus>("observability.budget", { actorId: agentId });
-      if (b.rows.length === 0) {
-        console.log("(no budget rows — spend is uncapped; arm one with `olle budget set --usd N`)");
-        return;
-      }
-      for (const r of b.rows) {
-        const cap = r.capUsd != null ? fmtUsd(r.capUsd) : "-";
-        const pct = r.percentUsd != null ? ` (${fmtPct(r.percentUsd)})` : "";
-        console.log(`${r.period}: ${fmtUsd(r.spentUsd)} / ${cap}${pct}`);
-      }
+      console.log(renderBudgetShow(b, { ...opts, agent: flags.agent ?? agentId }));
       return;
     }
     throw new Error(`unknown budget subcommand "${sub}" — use show|set`);
@@ -181,15 +198,16 @@ async function cmdModel(args: string[]): Promise<void> {
   // `olle model <name>` → set the default; daemon swaps live if up.
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
+    const opts = renderOpts();
     if (args.length === 0) {
       const r = await client.call<{ model: string }>("model.get");
-      console.log(r.model || "(unset)");
+      console.log(renderModelGet({ model: r.model }, opts));
       return;
     }
     const model = args.join(" ").trim();
     if (!model) throw new Error("usage: olle model [<model>]");
     const r = await client.call<{ model: string }>("model.set", { model });
-    console.log(`default model → ${r.model}`);
+    console.log(renderModelSet(r, opts));
   });
 }
 
@@ -279,221 +297,14 @@ async function cmdStatus(args: string[]): Promise<void> {
           .catch(() => null)
       : null;
 
-    const now = Date.now();
-    const sinceLabel = fmtAge(now - sinceMs);
-    const heading = (s: string) => color(ANSI.accent, s);
-    const label = (s: string) => color(ANSI.muted, s);
-    const ok = (s: string) => color(ANSI.success, s);
-    const warn = (s: string) => color(ANSI.warning, s);
-    const err = (s: string) => color(ANSI.error, s);
-
-    // ─── daemon ────────────────────────────────────────────────────────
-    console.log(heading("daemon"));
-    if (host) {
-      console.log(`  ${label("host")}    ${host.hostId}`);
-      console.log(`  ${label("pid")}     ${host.pid}`);
-      console.log(`  ${label("uptime")}  ${fmtAge(host.uptimeMs)}`);
-    } else {
-      console.log(`  ${err("daemon unreachable")}`);
-    }
-    if (chat) {
-      const chatLabel = chat.enabled
-        ? ok("enabled")
-        : `${err("disabled")}${chat.reason ? ` (${chat.reason})` : ""}`;
-      console.log(`  ${label("chat")}    ${chatLabel}`);
-    }
-    if (self) {
-      const named = self.displayName ? ` / ${self.displayName}` : "";
-      console.log(`  ${label("agent")}   ${self.name}${named}  ${color(ANSI.muted, self.agentId)}`);
-      // `tools` here is extension-registered tools only — core tools live in
-      // memory and aren't in the agents row. Label it explicitly so the
-      // count isn't read as "the agent has only N tools available".
-      const principles = `${self.principleCount} ${self.principleCount === 1 ? "principle" : "principles"}`;
-      const tools = `${self.tools.length} ext ${self.tools.length === 1 ? "tool" : "tools"}`;
-      console.log(`  ${label("        ")}${principles}  ${tools}`);
-      // The model the agent thinks in (its own choice, or the host default)
-      // plus its reasoning effort when it's running thinking on.
-      const modelTag = self.thinkingModelIsDefault ? color(ANSI.muted, " (default)") : "";
-      const effortTag =
-        self.reasoningEffort && self.reasoningEffort !== "off"
-          ? `  ${color(ANSI.muted, `effort: ${self.reasoningEffort}`)}`
-          : "";
-      console.log(`  ${label("model")}   ${self.thinkingModel}${modelTag}${effortTag}`);
-    }
-
-    // ─── teams ─────────────────────────────────────────────────────────
-    // Only render when this host is in at least one team. Solo users get
-    // the un-cluttered dashboard; federated hosts get peer connectivity
-    // surfaced up top where flapping links are easy to spot.
-    if (teams.teams.length > 0) {
-      console.log("");
-      console.log(heading("teams"));
-      for (const t of teams.teams) {
-        const memberCount = t.members.length;
-        const peerCount = t.peers.length;
-        const connected = t.peers.filter((p) => p.status === "connected").length;
-        const stale = t.peers.filter((p) => p.status === "stale").length;
-        const disconnected = t.peers.filter(
-          (p) => p.status === "disconnected" || p.status === "connecting" || p.status === "rejected",
-        ).length;
-        const left = t.peers.filter((p) => p.status === "left").length;
-        const peerSummary: string[] = [];
-        if (connected > 0) peerSummary.push(ok(`${connected} connected`));
-        if (stale > 0) peerSummary.push(warn(`${stale} stale`));
-        if (disconnected > 0) peerSummary.push(err(`${disconnected} disconnected`));
-        if (left > 0) peerSummary.push(label(`${left} left`));
-        const peersTxt =
-          peerCount === 0 ? label("(no peers yet)") : peerSummary.join("  ");
-        console.log(
-          `  ${t.name}  ${color(ANSI.muted, t.teamId.slice(0, 10))}  ${memberCount} ${memberCount === 1 ? "member" : "members"}  ${peersTxt}`,
-        );
-        for (const p of t.peers.slice(0, 5)) {
-          const statusFmt =
-            p.status === "connected"
-              ? ok(p.status)
-              : p.status === "stale"
-                ? warn(p.status)
-                : p.status === "left"
-                  ? label(p.status)
-                  : err(p.status);
-          const hb =
-            p.lastHeartbeatAt != null
-              ? color(ANSI.muted, `hb=${fmtAge(now - p.lastHeartbeatAt)}`)
-              : color(ANSI.muted, "hb=—");
-          console.log(
-            `    ${color(ANSI.muted, p.peerHostId.slice(0, 10))}  ${statusFmt.padEnd(20)}  ${color(ANSI.muted, p.addr)}  ${hb}`,
-          );
-        }
-      }
-    }
-
-    // ─── inbox ─────────────────────────────────────────────────────────
-    const open = inbox.filter((d) => d.status === "open").length;
-    const unreadReplies = inbox.reduce((n, d) => n + (d.unreadReplyCount ?? 0), 0);
-    const stale = inbox.filter(
-      (d) => d.status === "open" && d.staleness != null && d.staleness < now,
-    ).length;
-    console.log("");
-    console.log(heading("inbox"));
-    if (inbox.length === 0) {
-      console.log(`  ${label("(empty)")}`);
-    } else {
-      const openTxt = open > 0 ? warn(`${open}`) : `${open}`;
-      console.log(`  ${label("open")}        ${openTxt} actionable`);
-      if (unreadReplies > 0) {
-        console.log(`  ${label("replies")}     ${warn(`${unreadReplies}`)} unread`);
-      }
-      if (stale > 0) {
-        console.log(`  ${label("stale")}       ${err(`${stale}`)} past deadline`);
-      }
-      // Show the top 3 actionable items as a peek.
-      const actionable = inbox
-        .filter((d) => d.status === "open" || (d.unreadReplyCount ?? 0) > 0)
-        .slice(0, 3);
-      if (actionable.length > 0) {
-        console.log(`  ${label("recent:")}`);
-        for (const d of actionable) {
-          const age = fmtAge(now - d.createdAt);
-          const summary = d.summary.length > 60 ? `${d.summary.slice(0, 57)}...` : d.summary;
-          console.log(
-            `    ${color(ANSI.muted, d.id.slice(0, 10))}  ${d.tier.padEnd(10)}  ${summary}  ${color(ANSI.muted, age)}`,
-          );
-        }
-      }
-    }
-
-    // ─── usage ─────────────────────────────────────────────────────────
-    console.log("");
-    console.log(`${heading("usage")}  ${color(ANSI.muted, `(last ${sinceLabel})`)}`);
-    if (!usage || usage.rows === 0) {
-      console.log(`  ${label("(no ledger activity)")}`);
-    } else {
-      const t = usage.totals;
-      const calls = usage.byModel.reduce((n, m) => n + m.calls, 0);
-      console.log(
-        `  ${label("tokens")}      in=${formatTokens(t.inputTokens)} out=${formatTokens(t.outputTokens)} cache_r=${formatTokens(t.cacheReadTokens)} cache_w=${formatTokens(t.cacheCreationTokens)}`,
-      );
-      const callsTxt = `${calls} ${calls === 1 ? "call" : "calls"}`;
-      console.log(
-        `  ${label("cost")}        ${fmtUsd(t.usdMicros)}  ${color(ANSI.muted, `(${callsTxt}, cache hit ${fmtPct(t.cacheHitRatio)})`)}`,
-      );
-      if (usage.byModel.length > 0) {
-        const top = usage.byModel[0]!;
-        const tag = top.pricePosted ? "" : color(ANSI.warning, " (fallback price)");
-        const topCalls = `${top.calls} ${top.calls === 1 ? "call" : "calls"}`;
-        console.log(
-          `  ${label("top model")}   ${top.provider}/${top.model}  ${fmtUsd(top.usdMicros)}  ${color(ANSI.muted, `(${topCalls})`)}${tag}`,
-        );
-      }
-    }
-
-    // ─── runs ──────────────────────────────────────────────────────────
-    console.log("");
-    console.log(`${heading("runs")}  ${color(ANSI.muted, `(last ${sinceLabel})`)}`);
-    if (runs.length === 0) {
-      console.log(`  ${label("(no task runs)")}`);
-    } else {
-      const counts: Record<string, number> = {};
-      for (const r of runs) counts[r.status] = (counts[r.status] ?? 0) + 1;
-      const succeeded = counts.succeeded ?? 0;
-      const failed = counts.failed ?? 0;
-      const running = counts.running ?? 0;
-      const lost = counts.lost ?? 0;
-      const queued = counts.queued ?? 0;
-      const parts: string[] = [];
-      parts.push(`${ok(`✓${succeeded}`)}`);
-      if (failed > 0) parts.push(err(`✗${failed}`));
-      if (running > 0) parts.push(color(ANSI.info, `⏵${running}`));
-      if (queued > 0) parts.push(color(ANSI.muted, `⏸${queued}`));
-      if (lost > 0) parts.push(warn(`?${lost}`));
-      console.log(`  ${parts.join("  ")}  ${color(ANSI.muted, `(${runs.length} total)`)}`);
-    }
-
-    // ─── threads ───────────────────────────────────────────────────────
-    console.log("");
-    console.log(heading("threads"));
-    if (threads.length === 0) {
-      console.log(`  ${label("(no threads)")}`);
-    } else {
-      const oneHourAgo = now - 3_600_000;
-      const recentlyActive = threads.filter((t) => t.lastEventAt >= oneHourAgo).length;
-      console.log(
-        `  ${label("active")}      ${recentlyActive} ${color(ANSI.muted, `in last hour (of ${threads.length} recent)`)}`,
-      );
-      // Lead with the conversation's opening line — what a human recognizes
-      // the thread by — then its current context size (the last turn's prompt
-      // tokens = how much information is in the conversation now) and age.
-      for (const t of threads.slice(0, 5)) {
-        const age = fmtAge(now - t.lastEventAt);
-        const size =
-          t.contextTokens > 0
-            ? `${formatTokens(t.contextTokens)} tokens`
-            : label("(no turns yet)");
-        console.log(
-          `    ${threadSnippet(t.firstUserText).padEnd(40)} ${color(ANSI.muted, `${size} · ${age}`)}`,
-        );
-      }
-    }
-
-    // ─── extensions ────────────────────────────────────────────────────
-    console.log("");
-    console.log(heading("extensions"));
-    if (exts.length === 0) {
-      console.log(`  ${label("(none on disk)")}`);
-    } else {
-      const registered = exts.filter((e) => e.status === "registered").length;
-      const broken = exts.filter((e) => e.status === "broken");
-      const unregistered = exts.filter((e) => e.status === "unregistered").length;
-      const parts: string[] = [];
-      parts.push(`${ok(`${registered}`)} registered`);
-      if (broken.length > 0) parts.push(`${err(`${broken.length}`)} broken`);
-      if (unregistered > 0) parts.push(`${warn(`${unregistered}`)} unregistered`);
-      console.log(`  ${parts.join("  ")}`);
-      for (const b of broken) {
-        const why = b.error ? `  ${color(ANSI.muted, b.error)}` : "";
-        console.log(`    ${err("✗")} ${b.name}${why}`);
-      }
-    }
+    const width = process.stdout.columns ?? 80;
+    const color = process.stdout.isTTY === true && process.env.NO_COLOR == null;
+    console.log(
+      renderStatus(
+        { host, chat, rootAgent, self, exts, usage, runs, threads, inbox, teams, sinceMs },
+        { width, color },
+      ),
+    );
   });
 }
 
@@ -571,10 +382,10 @@ async function cmdTail(args: string[]): Promise<void> {
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
+  const tailWidth = process.stdout.columns ?? 80;
+  const tailC = makeColorer(Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null);
   for await (const ev of sub.events) {
-    console.log(
-      `${ev.hlc} ${ev.type} actor=${ev.actorId} payload=${JSON.stringify(ev.payload)}`,
-    );
+    console.log(renderEventLine(tailC, ev, tailWidth));
   }
 }
 
@@ -601,7 +412,7 @@ async function cmdPublish(args: string[]): Promise<void> {
       actorId: "cli",
       durable: true,
     });
-    console.log(`${res.hlc} ${res.id}`);
+    console.log(renderPublishAck(res, renderOpts()));
   });
 }
 
@@ -609,6 +420,8 @@ async function cmdExtension(args: string[]): Promise<void> {
   const [sub, ...rest] = args;
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
+    const width = process.stdout.columns ?? 80;
+    const color = Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null;
     switch (sub) {
       case undefined:
       case "list": {
@@ -621,24 +434,14 @@ async function cmdExtension(args: string[]): Promise<void> {
             lastCommit?: { sha: string; date: number; subject: string };
           }>
         >("extensions.list");
-        if (list.length === 0) {
-          console.log("(no extensions on disk)");
-          return;
-        }
-        for (const e of list) {
-          const last = e.lastCommit
-            ? ` (${e.lastCommit.sha.slice(0, 7)} ${new Date(e.lastCommit.date).toISOString().slice(0, 10)})`
-            : "";
-          const detail = e.status === "broken" && e.error ? `  err=${e.error}` : "";
-          console.log(`${e.name}  ${e.status}${last}${detail}`);
-        }
+        console.log(renderExtensionList(list, { width, color }));
         return;
       }
       case "reload": {
         const name = rest[0];
         if (!name) throw new Error("usage: olle extension reload <name>");
         const r = await client.call<{ name: string; status: string }>("extensions.reload", { name });
-        console.log(`${r.name} ${r.status}`);
+        console.log(renderExtensionReloadAck(r, { color }));
         return;
       }
       case "history": {
@@ -647,10 +450,7 @@ async function cmdExtension(args: string[]): Promise<void> {
         const rows = await client.call<
           Array<{ sha: string; author: string; date: number; subject: string }>
         >("extensions.history", { name });
-        for (const r of rows) {
-          const when = new Date(r.date).toISOString();
-          console.log(`${r.sha.slice(0, 8)} ${when} ${r.author}: ${r.subject}`);
-        }
+        console.log(renderExtensionHistory(rows, { width, color, name }));
         return;
       }
       case "revert": {
@@ -662,7 +462,7 @@ async function cmdExtension(args: string[]): Promise<void> {
           newCommit: string | null;
           status: string;
         }>("extensions.revert", { name, sha });
-        console.log(`${r.name}: reverted to ${sha.slice(0, 8)} (now ${r.status})`);
+        console.log(renderExtensionRevertAck(r, { color }));
         return;
       }
       default:
@@ -675,13 +475,13 @@ async function cmdStarter(args: string[]): Promise<void> {
   const [sub, ...rest] = args;
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
+    const width = process.stdout.columns ?? 80;
+    const color = Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null;
     switch (sub) {
       case undefined:
       case "list": {
         const list = await client.call<Array<{ name: string; description: string }>>("starters.list");
-        for (const s of list) {
-          console.log(`${s.name}\n  ${s.description}`);
-        }
+        console.log(renderStarterList(list, { width, color }));
         return;
       }
       case "install": {
@@ -696,11 +496,7 @@ async function cmdStarter(args: string[]): Promise<void> {
           commit: string | null;
           status?: string;
         }>("starters.install", { name, overwrite, load: !noLoad });
-        if (r.alreadyExisted && !overwrite) {
-          console.log(`${r.name}: already installed (use --overwrite to replace)`);
-        } else {
-          console.log(`${r.name}: installed ${r.filesWritten} files${r.commit ? ` (commit ${r.commit.slice(0, 8)})` : ""}${r.status ? `; status=${r.status}` : ""}`);
-        }
+        console.log(renderStarterInstallAck(r, { color }));
         return;
       }
       default:
@@ -713,20 +509,15 @@ async function cmdSecret(args: string[]): Promise<void> {
   const [sub, ...rest] = args;
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
+    const width = process.stdout.columns ?? 80;
+    const color = Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null;
     switch (sub) {
       case undefined:
       case "list": {
         const list = await client.call<
           Array<{ name: string; size: number; updatedAt: number }>
         >("secrets.list");
-        if (list.length === 0) {
-          console.log("(no secrets set)");
-          return;
-        }
-        for (const s of list) {
-          const when = new Date(s.updatedAt).toISOString();
-          console.log(`${s.name}  ${s.size}B  ${when}`);
-        }
+        console.log(renderSecretList(list, { width, color }));
         return;
       }
       case "set": {
@@ -749,7 +540,7 @@ async function cmdSecret(args: string[]): Promise<void> {
           name,
           value,
         });
-        console.log(`${r.name}: ${r.bytes}B written`);
+        console.log(renderSecretSetAck(r, { color }));
         return;
       }
       case "remove":
@@ -757,7 +548,7 @@ async function cmdSecret(args: string[]): Promise<void> {
         const name = rest[0];
         if (!name) throw new Error("usage: olle secret remove <NAME>");
         await client.call("secrets.remove", { name });
-        console.log(`${name}: removed`);
+        console.log(renderSecretRemoveAck({ name }, { color }));
         return;
       }
       default:
@@ -770,6 +561,7 @@ async function cmdTeam(args: string[]): Promise<void> {
   const [sub, ...rest] = args;
   const paths = resolvePaths();
   await withIpc(paths.socketFile, async (client) => {
+    const opts = renderOpts();
     switch (sub) {
       case "create": {
         const name = rest.join(" ").trim();
@@ -780,8 +572,7 @@ async function cmdTeam(args: string[]): Promise<void> {
           error?: string;
         }>("team.create", { name });
         if (!r.ok) throw new Error(`team create failed: ${r.error ?? "unknown"}`);
-        console.log(`Created team "${name}" (${r.teamId}).`);
-        console.log(`Use 'olle team invite ${r.teamId}' to add peers.`);
+        console.log(renderTeamCreateAck({ teamId: r.teamId!, name }, opts));
         return;
       }
       case "invite": {
@@ -801,8 +592,7 @@ async function cmdTeam(args: string[]): Promise<void> {
           error?: string;
         }>("team.invite", params);
         if (!r.ok) throw new Error(`team invite failed: ${r.error ?? "unknown"}`);
-        console.log(r.code);
-        console.log(`(invite ${r.inviteId} — share the code above out-of-band)`);
+        console.log(renderTeamInviteAck({ code: r.code!, inviteId: r.inviteId! }, opts));
         return;
       }
       case "join": {
@@ -815,7 +605,7 @@ async function cmdTeam(args: string[]): Promise<void> {
           error?: string;
         }>("team.join", { code });
         if (!r.ok) throw new Error(`team join failed: ${r.error ?? "unknown"}`);
-        console.log(`Joined team ${r.teamId} via peer ${r.peerHostId}.`);
+        console.log(renderTeamJoinAck({ teamId: r.teamId!, peerHostId: r.peerHostId! }, opts));
         return;
       }
       case "leave": {
@@ -826,43 +616,13 @@ async function cmdTeam(args: string[]): Promise<void> {
           { teamId },
         );
         if (!r.ok) throw new Error(`team leave failed: ${r.error ?? "unknown"}`);
-        console.log(`Left team ${r.teamId}.`);
+        console.log(renderTeamLeaveAck({ teamId: r.teamId! }, opts));
         return;
       }
       case undefined:
       case "status": {
-        const r = await client.call<{
-          teams: Array<{
-            teamId: string;
-            name: string;
-            members: Array<{ actorId: string; role: string }>;
-            peers: Array<{
-              peerHostId: string;
-              status: string;
-              addr: string;
-              lastHeartbeatAt: number | null;
-            }>;
-          }>;
-        }>("team.status");
-        if (r.teams.length === 0) {
-          console.log("(no teams)");
-          return;
-        }
-        for (const t of r.teams) {
-          console.log(`${t.name}  ${t.teamId}`);
-          console.log(`  members: ${t.members.map((m) => `${m.actorId} (${m.role})`).join(", ") || "(none)"}`);
-          if (t.peers.length === 0) {
-            console.log(`  peers:   (none)`);
-          } else {
-            for (const p of t.peers) {
-              const hb =
-                p.lastHeartbeatAt != null
-                  ? new Date(p.lastHeartbeatAt).toISOString()
-                  : "-";
-              console.log(`  peer ${p.peerHostId}  ${p.status}  ${p.addr}  hb=${hb}`);
-            }
-          }
-        }
+        const r = await client.call<TeamStatusData>("team.status");
+        console.log(renderTeamStatus(r, opts));
         return;
       }
       default:
@@ -887,6 +647,16 @@ function color(code: string, s: string): string {
 function termWidth(): number {
   const w = process.stdout.columns;
   return w && w > 20 ? w : 80;
+}
+
+/** Render opts shared by every restyled command: live terminal width and a
+ *  single color gate (TTY and NO_COLOR unset). Renderers take {width,color}
+ *  as data, so this is computed once per command and passed straight in. */
+function renderOpts(): { width: number; color: boolean } {
+  return {
+    width: process.stdout.columns ?? 80,
+    color: Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null,
+  };
 }
 
 // --- Observability subcommands. All wrap the same observability.* IPC
@@ -929,37 +699,6 @@ function parseSinceArg(raw: string): number {
   return Date.now() - n * ms;
 }
 
-function fmtUsd(micros: number): string {
-  if (micros === 0) return "$0.00";
-  return `$${(micros / 1_000_000).toFixed(4)}`;
-}
-
-function fmtPct(p: number): string {
-  return `${(p * 100).toFixed(1)}%`;
-}
-
-// Shared shape for the simple observability commands: parse obs flags +
-// any extras, run one IPC call, hand the result to a formatter. Commands
-// that need a second call (cmdStats' optional budget pull) take an
-// `extra` hook with the live client. Everyone goes through withIpc.
-async function runObsCmd<T>(
-  args: string[],
-  spec: {
-    method: string;
-    buildParams: (flags: ObsFlags, args: string[]) => Record<string, unknown>;
-    format: (value: T) => void;
-    extra?: (client: IpcClient, flags: ObsFlags) => Promise<void>;
-  },
-): Promise<void> {
-  const flags = parseObsFlags(args);
-  const paths = resolvePaths();
-  await withIpc(paths.socketFile, async (client) => {
-    const value = await client.call<T>(spec.method, spec.buildParams(flags, args));
-    spec.format(value);
-    if (spec.extra) await spec.extra(client, flags);
-  });
-}
-
 function parseFlagValue(args: string[], name: string): string | undefined {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === name && args[i + 1]) return args[i + 1];
@@ -993,93 +732,64 @@ async function cmdStats(args: string[]): Promise<void> {
 }
 
 async function cmdCache(args: string[]): Promise<void> {
-  // Cache-focused rollup — just the cache columns + hit ratio.
-  await runObsCmd<UsageStats>(args, {
-    method: "observability.usage",
-    buildParams: (f) => ({ actorId: f.agent, threadId: f.thread, since: f.since }),
-    format: (stats) => {
-      const t = stats.totals;
-      console.log(`hit_ratio: ${fmtPct(t.cacheHitRatio)}`);
-      console.log(
-        `cache_read=${t.cacheReadTokens} cache_create=${t.cacheCreationTokens} input=${t.inputTokens}`,
-      );
-      if (stats.byModel.length === 0) {
-        console.log("(no ledger rows)");
-        return;
-      }
-      console.log("by model:");
-      for (const m of stats.byModel) {
-        console.log(
-          `  ${m.provider}/${m.model}: hit=${fmtPct(m.cacheHitRatio)} read=${m.cacheReadTokens} create=${m.cacheCreationTokens} (${m.calls} calls)`,
-        );
-      }
-    },
+  const flags = parseObsFlags(args);
+  const paths = resolvePaths();
+  await withIpc(paths.socketFile, async (client) => {
+    const stats = await client.call<UsageStats>("observability.usage", {
+      actorId: flags.agent, threadId: flags.thread, since: flags.since,
+    });
+    console.log(renderCache(stats, {
+      width: process.stdout.columns ?? 80,
+      color: Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null,
+      agent: flags.agent, since: flags.since,
+    }));
   });
 }
 
 async function cmdRuns(args: string[]): Promise<void> {
-  await runObsCmd<RunHistoryRow[]>(args, {
-    method: "observability.runs",
-    buildParams: (f, raw) => ({
-      actorId: f.agent,
-      status: parseFlagValue(raw, "--status"),
-      since: f.since,
-      limit: f.limit,
-    }),
-    format: (runs) => {
-      if (runs.length === 0) {
-        console.log("(no runs)");
-        return;
-      }
-      for (const r of runs) {
-        const dur = r.durationMs != null ? `${r.durationMs}ms` : "running";
-        const err = r.error ? `  err=${r.error}` : "";
-        const when = new Date(r.startedAt).toISOString();
-        console.log(`${when}  ${r.status.padEnd(9)}  ${r.taskId}  ${dur}${err}`);
-      }
-    },
+  const flags = parseObsFlags(args);
+  const paths = resolvePaths();
+  await withIpc(paths.socketFile, async (client) => {
+    const runs = await client.call<RunHistoryRow[]>("observability.runs", {
+      actorId: flags.agent, status: parseFlagValue(args, "--status"),
+      since: flags.since, limit: flags.limit,
+    });
+    console.log(renderRuns(runs, {
+      width: process.stdout.columns ?? 80,
+      color: Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null,
+      agent: flags.agent, since: flags.since,
+    }));
   });
 }
 
 async function cmdThreads(args: string[]): Promise<void> {
-  await runObsCmd<ThreadInventoryRow[]>(args, {
-    method: "observability.threads",
-    buildParams: (f) => ({ toAgentId: f.agent, limit: f.limit }),
-    format: (threads) => {
-      if (threads.length === 0) {
-        console.log("(no threads)");
-        return;
-      }
-      for (const t of threads) {
-        const when = new Date(t.lastEventAt).toISOString();
-        console.log(
-          `${when}  ${t.threadId}  events=${t.events}  hit=${fmtPct(t.cacheHitRatio)}  last=${t.lastType}`,
-        );
-      }
-    },
+  const flags = parseObsFlags(args);
+  const paths = resolvePaths();
+  await withIpc(paths.socketFile, async (client) => {
+    const threads = await client.call<ThreadInventoryRow[]>("observability.threads", {
+      toAgentId: flags.agent, limit: flags.limit,
+    });
+    console.log(renderThreads(threads, {
+      width: process.stdout.columns ?? 80,
+      color: Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null,
+      agent: flags.agent,
+    }));
   });
 }
 
 async function cmdEvents(args: string[]): Promise<void> {
-  // Single-shot event-log query (the streaming variant is `olle tail`).
-  await runObsCmd<RecentEventRow[]>(args, {
-    method: "observability.events",
-    buildParams: (f, raw) => ({
-      actorId: f.agent,
-      type: parseFlagValue(raw, "--type"),
-      threadId: f.thread,
-      since: f.since,
-      limit: f.limit,
-    }),
-    format: (events) => {
-      if (events.length === 0) {
-        console.log("(no events)");
-        return;
-      }
-      for (const e of events) {
-        console.log(`${e.hlc} ${e.type} actor=${e.actorId} payload=${JSON.stringify(e.payload)}`);
-      }
-    },
+  const flags = parseObsFlags(args);
+  const paths = resolvePaths();
+  await withIpc(paths.socketFile, async (client) => {
+    const events = await client.call<RecentEventRow[]>("observability.events", {
+      actorId: flags.agent, type: parseFlagValue(args, "--type"),
+      threadId: flags.thread, since: flags.since, limit: flags.limit,
+    });
+    console.log(renderEvents(events, {
+      width: process.stdout.columns ?? 80,
+      color: Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null,
+      agent: flags.agent, since: flags.since,
+    }));
   });
 }
 
@@ -1097,29 +807,9 @@ async function cmdInspect(args: string[]): Promise<void> {
       console.error(`agent not found: ${target}`);
       process.exit(1);
     }
-    console.log(`id:     ${self.agentId}`);
-    console.log(`name:   ${self.name}`);
-    if (self.displayName) console.log(`called: ${self.displayName}`);
-    console.log(`host:   ${self.hostId}`);
-    console.log(`parent: ${self.parentAgentId ?? "(none)"}`);
-    console.log(`principles: ${self.principleCount}`);
-    if (self.scope.allowTiers) {
-      console.log(`scope: tiers=${self.scope.allowTiers.join(",")}`);
-    }
-    if (self.tools.length > 0) {
-      console.log(`tools: ${self.tools.map((t) => t.name).join(", ")}`);
-    }
-    if (self.recentlyPricedModels.length > 0) {
-      console.log("recent models:");
-      for (const m of self.recentlyPricedModels) {
-        const tag = m.pricePosted ? "" : " (fallback price)";
-        console.log(`  ${m.provider}/${m.model}${tag}`);
-      }
-    }
-    if (self.systemPrompt) {
-      console.log("---");
-      console.log(self.systemPrompt);
-    }
+    const width = process.stdout.columns ?? 80;
+    const color = process.stdout.isTTY === true && process.env.NO_COLOR == null;
+    console.log(renderInspectAgent(self, { width, color }));
   });
 }
 
@@ -1162,21 +852,6 @@ interface InboxRowWithMessages extends InboxRow {
   messages?: DecisionMessageRow[];
 }
 
-function fmtAge(ms: number): string {
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
-  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
-  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
-  return `${Math.round(ms / 86_400_000)}d`;
-}
-
-/** The opening line of a thread's conversation, normalized for the status
- *  dashboard — what a human recognizes the thread by, in place of an opaque id. */
-function threadSnippet(firstUserText: string | null): string {
-  const raw = (firstUserText ?? "").replace(/\s+/g, " ").trim();
-  if (!raw) return "(no messages yet)";
-  return raw.length > 38 ? `${raw.slice(0, 37)}…` : raw;
-}
-
 type InboxVote = "approve" | "deny" | "modify";
 
 interface RespondArgs {
@@ -1217,236 +892,8 @@ function parseRespondArgs(rest: string[]): RespondArgs {
   return { id, vote: v, message, payloadOverride };
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// Inbox CLI rendering — list + show. ANSI dressing on a TTY; plain on
-// pipes. Visibility-first: unread badges on the listing, `[NEW]` markers
-// on the show view (auto-marked-read by `inbox.get` after capture).
-// ───────────────────────────────────────────────────────────────────────
-
-const STATUS_GLYPH: Record<string, string> = {
-  open: "●",
-  approved: "✓",
-  denied: "✗",
-  modified: "±",
-  stale: "·",
-};
-
-function statusGlyphColored(status: string, hasUnread: boolean): string {
-  const glyph = STATUS_GLYPH[status] ?? " ";
-  // Cyan for "has unread replies you should look at" — reads as
-  // higher-priority than the open-yellow it overlays.
-  if (hasUnread) return color(`${ANSI.bold}${ANSI.cyan}`, glyph);
-  switch (status) {
-    case "open":
-      return color(ANSI.yellow, glyph);
-    case "approved":
-      return color(ANSI.green, glyph);
-    case "denied":
-      return color(ANSI.red, glyph);
-    case "modified":
-      return color(ANSI.cyan, glyph);
-    case "stale":
-      return color(ANSI.gray, glyph);
-    default:
-      return glyph;
-  }
-}
-
-function tierColored(tier: string): string {
-  switch (tier) {
-    case "vision":
-      return color(ANSI.magenta, tier);
-    case "strategic":
-      return color(ANSI.cyan, tier);
-    case "operational":
-      return color(ANSI.gray, tier);
-    default:
-      return tier;
-  }
-}
-
-function renderInboxList(rows: InboxRow[]): void {
-  const now = Date.now();
-  const cols = termWidth();
-  // Column widths chosen so the summary gets the lion's share. id+age+tier
-  // are dense and scan-friendly; the summary is the headline.
-  const idW = 10;
-  const ageW = 5;
-  const tierW = 18;
-  const fixed = 1 /*glyph*/ + 1 /*stale*/ + 2 + idW + 2 + tierW + 2 + ageW + 2;
-  const summaryW = Math.max(20, cols - fixed - 18 /*reserved for "(N new)" suffix*/);
-
-  let totalUnread = 0;
-  for (const r of rows) totalUnread += r.unreadReplyCount ?? 0;
-
-  // Header line — quick orientation.
-  const totalLine =
-    `${rows.length} item${rows.length === 1 ? "" : "s"}` +
-    (totalUnread > 0
-      ? ` · ${color(ANSI.bold + ANSI.cyan, `${totalUnread} unread ${totalUnread === 1 ? "reply" : "replies"}`)}`
-      : "");
-  console.log(color(ANSI.dim, totalLine));
-  console.log(color(ANSI.dim, "─".repeat(cols)));
-
-  for (const r of rows) {
-    const unread = r.unreadReplyCount ?? 0;
-    const glyph = statusGlyphColored(r.status, unread > 0);
-    const stale =
-      r.status === "open" && r.staleness != null && r.staleness < now
-        ? color(ANSI.red, "!")
-        : " ";
-    const age = fmtAge(now - r.createdAt);
-    const id = color(ANSI.dim, r.id.slice(0, idW));
-    const tag = r.status === "open" ? tierColored(r.tier) : `${tierColored(r.tier)}/${r.status}`;
-    const fromTag = r.proposingAgentName
-      ? color(ANSI.dim, `[${r.proposingAgentName}] `)
-      : "";
-    const summaryRaw = r.summary.replace(/\s+/g, " ");
-    const summary = clipPlain(summaryRaw, summaryW);
-    const unreadBadge =
-      unread > 0
-        ? " " + color(ANSI.bold + ANSI.cyan, `(${unread} new)`)
-        : "";
-    console.log(
-      ` ${glyph}${stale} ${id}  ${padVisible(tag, tierW)}  ${age.padStart(ageW)}  ${fromTag}${summary}${unreadBadge}`,
-    );
-  }
-}
-
-function renderInboxShow(r: InboxRowWithMessages): void {
-  const now = Date.now();
-  const cols = termWidth();
-  const rule = (label?: string): string => {
-    const base = label ? `── ${label} ` : "";
-    const fill = "─".repeat(Math.max(2, cols - vlen(base)));
-    return color(ANSI.dim, base + fill);
-  };
-
-  // Title block.
-  console.log(color(ANSI.bold, r.id));
-  console.log(color(ANSI.dim, "═".repeat(cols)));
-  console.log("");
-
-  const kv = (label: string, value: string): void => {
-    console.log(`  ${color(ANSI.dim, label.padEnd(10))}${value}`);
-  };
-
-  const statusValue = `${statusGlyphColored(r.status, false)} ${r.status}`;
-  kv("status", statusValue);
-  kv("tier", tierColored(r.tier));
-  kv(
-    "from",
-    r.proposingAgentName
-      ? `${r.proposingAgentName} ${color(ANSI.dim, `(${r.proposingAgentId.slice(0, 10)})`)}`
-      : r.proposingAgentId,
-  );
-  kv(
-    "to",
-    r.ownerDisplay
-      ? `${r.ownerDisplay} ${color(ANSI.dim, `(${r.ownerAgentId.slice(0, 10)})`)}`
-      : r.ownerAgentId,
-  );
-  kv("age", fmtAge(now - r.createdAt));
-  if (r.staleness != null) {
-    const remaining = r.staleness - now;
-    const dl =
-      remaining > 0
-        ? color(ANSI.yellow, `in ${fmtAge(remaining)}`)
-        : color(ANSI.red, `${fmtAge(-remaining)} ago`);
-    kv("stale", dl);
-  }
-  if (r.resolvedAt != null) {
-    kv("resolved", color(ANSI.dim, new Date(r.resolvedAt).toISOString()));
-  }
-  console.log("");
-  // Summary — wrapped, indented, given visual room.
-  for (const line of wrap(r.summary, cols - 4)) {
-    console.log(`  ${line}`);
-  }
-
-  console.log("");
-  console.log(rule("payload"));
-  const payloadStr = JSON.stringify(r.payload ?? {}, null, 2);
-  for (const line of payloadStr.split("\n")) {
-    console.log(`  ${line}`);
-  }
-
-  if (r.messages && r.messages.length > 0) {
-    const newCount = r.messages.filter((m) => !m.read).length;
-    const header =
-      `replies (${r.messages.length})` +
-      (newCount > 0
-        ? `  · ${color(ANSI.bold + ANSI.cyan, `${newCount} new`)}`
-        : "");
-    console.log("");
-    console.log(rule(header));
-    for (const m of r.messages) {
-      const when = formatTimestamp(m.at);
-      const newTag = m.read ? "" : " " + color(ANSI.bold + ANSI.cyan, "[NEW]");
-      const author = color(ANSI.bold, m.actorName ?? m.actorId);
-      console.log("");
-      console.log(`  · ${color(ANSI.dim, when)}  ${author}${newTag}`);
-      for (const line of m.text.split("\n")) {
-        for (const wrapped of wrap(line, cols - 6)) {
-          console.log(`      ${wrapped}`);
-        }
-      }
-    }
-  }
-  console.log("");
-}
-
-function formatTimestamp(at: number): string {
-  const d = new Date(at);
-  const Y = d.getFullYear();
-  const M = String(d.getMonth() + 1).padStart(2, "0");
-  const D = String(d.getDate()).padStart(2, "0");
-  const h = String(d.getHours()).padStart(2, "0");
-  const m = String(d.getMinutes()).padStart(2, "0");
-  return `${Y}-${M}-${D} ${h}:${m}`;
-}
-
-function wrap(text: string, width: number): string[] {
-  if (width < 10) width = 10;
-  const out: string[] = [];
-  for (const para of text.split("\n")) {
-    if (para.length === 0) {
-      out.push("");
-      continue;
-    }
-    let line = "";
-    for (const word of para.split(/\s+/)) {
-      if (line.length === 0) {
-        line = word;
-        continue;
-      }
-      if (line.length + 1 + word.length <= width) {
-        line += " " + word;
-      } else {
-        out.push(line);
-        line = word;
-      }
-    }
-    if (line.length > 0) out.push(line);
-  }
-  return out;
-}
-
-function vlen(s: string): number {
-  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
-}
-
-function clipPlain(s: string, width: number): string {
-  if (vlen(s) <= width) return s;
-  const plain = s.replace(/\x1b\[[0-9;]*m/g, "");
-  return plain.slice(0, Math.max(0, width - 1)) + "…";
-}
-
-function padVisible(s: string, width: number): string {
-  const n = vlen(s);
-  if (n >= width) return clipPlain(s, width);
-  return s + " ".repeat(width - n);
-}
+// `olle inbox` list/show rendering lives in inbox-render.ts (the shared
+// design-system module); cmdInbox below calls it. See inbox-render.ts.
 
 async function cmdInbox(args: string[]): Promise<void> {
   // Default form (`olle inbox` with no subcommand) drops into the
@@ -1471,25 +918,18 @@ async function cmdInbox(args: string[]): Promise<void> {
         const all = rest.includes("--all");
         const open = rest.includes("--open");
         const status = all ? "all" : open ? "open" : undefined;
+        const filter = all ? "all" : open ? "open" : "active";
         const rows = await client.call<InboxRow[]>("inbox.list", { status });
-        if (rows.length === 0) {
-          console.log(
-            all
-              ? "(no inbox items)"
-              : open
-                ? "(no open decisions)"
-                : "(inbox zero — nothing waiting for you)",
-          );
-          return;
-        }
-        renderInboxList(rows);
+        // renderInboxList carries its own humane empty state (keyed on the
+        // filter) — no bare "(none)" branch here.
+        console.log(renderInboxList(rows, { ...renderOpts(), filter }));
         return;
       }
       case "show": {
         const id = rest[0];
         if (!id) throw new Error("usage: olle inbox show <id>");
         const r = await client.call<InboxRowWithMessages>("inbox.get", { id });
-        renderInboxShow(r);
+        console.log(renderInboxShow(r, renderOpts()));
         return;
       }
       case "respond": {
@@ -1505,53 +945,84 @@ async function cmdInbox(args: string[]): Promise<void> {
 }
 
 function printHelp(): void {
-  console.log(
-    [
-      "olle — a world agents love to live in",
-      "",
-      "Usage: olle <command> [args]",
-      "",
-      "Commands:",
-      "  run                         start foreground daemon",
-      "  status [--since 24h]        dashboard: daemon, agent, inbox, usage, runs, extensions",
-      "  daemon restart              SIGTERM the daemon and wait for the supervisor to bring it back",
-      "  chat                        Ink-based REPL connected to the default agent",
-      "  tail [type]                 stream events (default: all)",
-      "  publish <type> [json]       emit a durable event",
-      "  extension list              list loaded extensions",
-      "  extension reload <name>     hot-reload an extension",
-      "  extension history <name>    show git history for an extension",
-      "  extension revert <name> <sha>   checkout <sha> of an extension",
-      "  starter list                list shipped starter templates",
-      "  starter install <name>      copy a starter into ~/.olle/extensions/",
-      "  secret list                 list secret names (values never shown)",
-      "  secret set <NAME> [value]   store a secret (or pipe on stdin)",
-      "  secret remove <NAME>        remove a stored secret",
-      "  model [<name>]              show or set the default LLM model (claude-opus-4-7, gpt-5.5, …)",
-      "",
-      "  Teams — cell-to-cell federation (paired with team_* tools):",
-      "  team status                                   list teams, members, and connected peers",
-      "  team create <name>                            mint a new team rooted on this host",
-      "  team invite <teamId> [--ttl <ms>]             issue a bearer code peers can redeem",
-      "  team join <code>                              accept a bearer code from a peer",
-      "  team leave <teamId>                           drop out of a team",
-      "",
-      "  Inbox — async decisions awaiting your response (paired with mail_* tools):",
-      "  inbox                                         interactive TUI (vim keys; ? for help)",
-      "  inbox list [--all|--open]                     list active (default), all, or strictly-open",
-      "  inbox show <id>                               full decision payload + agent reply thread",
-      "  inbox respond <id> approve|deny|modify [--message ...] [--payload {json}]",
-      "",
-      "  Observability — same data agents see via their query_my_* tools:",
-      "  stats [--agent X] [--thread X] [--since 1h]   token + USD rollup",
-      "  cache [--agent X] [--thread X] [--since 1h]   cache hit ratio rollup",
-      "  runs [--agent X] [--status X] [--since 1h]    recent task_runs",
-      "  threads [--agent X] [--limit N]               threads per mailbox",
-      "  events [--agent X] [--type T] [--thread X]    one-shot event query",
-      "  inspect agent <id>                            agent identity surface",
-      "",
-      "  version                     show version",
-      "  help                        show this help",
-    ].join("\n"),
-  );
+  const C = makeColorer(Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null);
+  const out: string[] = [];
+
+  // A titled block of `cmd → description` rows. The command column is sized
+  // per block to its widest command *that carries a description* (rows with
+  // no description, e.g. the long `inbox respond` form, print alone and don't
+  // inflate the column). Command in text, description muted; dim heading.
+  const block = (title: string | null, rows: Array<[string, string?]>): void => {
+    if (title) {
+      out.push("");
+      out.push(C(ANSI.dim, title));
+    }
+    const withDesc = rows.filter(([, d]) => d != null);
+    const col = withDesc.length
+      ? Math.max(...withDesc.map(([c]) => c.length)) + 2
+      : 2;
+    for (const [cmd, desc] of rows) {
+      if (!desc) {
+        out.push("  " + C(ANSI.text, cmd));
+        continue;
+      }
+      const pad = " ".repeat(Math.max(2, col - cmd.length));
+      out.push("  " + C(ANSI.text, cmd) + pad + C(ANSI.muted, desc));
+    }
+  };
+
+  out.push(C(ANSI.text, "olle") + C(ANSI.muted, " — a world agents love to live in"));
+  out.push("");
+  out.push(C(ANSI.dim, "Usage: ") + C(ANSI.text, "olle <command> [args]"));
+
+  block("commands", [
+    ["run", "start foreground daemon"],
+    ["status [--since 24h]", "dashboard: daemon, agent, inbox, usage, runs, extensions"],
+    ["daemon restart", "SIGTERM the daemon and wait for the supervisor to bring it back"],
+    ["chat", "Ink-based REPL connected to the default agent"],
+    ["tail [type]", "stream events (default: all)"],
+    ["publish <type> [json]", "emit a durable event"],
+    ["extension list", "list loaded extensions"],
+    ["extension reload <name>", "hot-reload an extension"],
+    ["extension history <name>", "show git history for an extension"],
+    ["extension revert <name> <sha>", "checkout <sha> of an extension"],
+    ["starter list", "list shipped starter templates"],
+    ["starter install <name>", "copy a starter into ~/.olle/extensions/"],
+    ["secret list", "list secret names (values never shown)"],
+    ["secret set <NAME> [value]", "store a secret (or pipe on stdin)"],
+    ["secret remove <NAME>", "remove a stored secret"],
+    ["model [<name>]", "show or set the default LLM model (claude-opus-4-7, gpt-5.5, …)"],
+  ]);
+
+  block("Teams — cell-to-cell federation (paired with team_* tools):", [
+    ["team status", "list teams, members, and connected peers"],
+    ["team create <name>", "mint a new team rooted on this host"],
+    ["team invite <teamId> [--ttl <ms>]", "issue a bearer code peers can redeem"],
+    ["team join <code>", "accept a bearer code from a peer"],
+    ["team leave <teamId>", "drop out of a team"],
+  ]);
+
+  block("Inbox — async decisions awaiting your response (paired with mail_* tools):", [
+    ["inbox", "interactive TUI (vim keys; ? for help)"],
+    ["inbox list [--all|--open]", "list active (default), all, or strictly-open"],
+    ["inbox show <id>", "full decision payload + agent reply thread"],
+    ["inbox respond <id> approve|deny|modify [--message ...] [--payload {json}]"],
+  ]);
+
+  block("Observability — same data agents see via their query_my_* tools:", [
+    ["stats [--agent X] [--thread X] [--since 1h]", "token + USD rollup"],
+    ["cache [--agent X] [--thread X] [--since 1h]", "cache hit ratio rollup"],
+    ["runs [--agent X] [--status X] [--since 1h]", "recent task_runs"],
+    ["threads [--agent X] [--limit N]", "threads per mailbox"],
+    ["events [--agent X] [--type T] [--thread X]", "one-shot event query"],
+    ["inspect agent <id>", "agent identity surface"],
+  ]);
+
+  out.push("");
+  block(null, [
+    ["version", "show version"],
+    ["help", "show this help"],
+  ]);
+
+  console.log(out.join("\n"));
 }
