@@ -1274,6 +1274,18 @@ Three prior entries parked agent-direct task authoring behind extension packagin
 
 ---
 
+## 2026-07-08 — Thinking made visible: summarized display, streamed thinking-delta; no ledger breakout
+
+**The gap.** Reasoning effort worked end-to-end (memory → per-thread freeze → clamp → `output_config.effort`) but was invisible twice over. First, the adapter sent `thinking: {type: "adaptive"}` with no `display`, and the Opus 4.7+ default is `"omitted"` — thinking blocks came back with *empty text*, so there was literally nothing to show or persist. Second, even non-empty thinking had no path out: the adapter's `onChunk` forwarded only `text-delta`, `emitStep` filtered assistant content to text blocks, and the CLI had no render arm or effort indicator. A user staring at `olle chat` could not tell whether the agent was thinking at all.
+
+**The fix.** `display: "summarized"` whenever effort is set (billing is identical either way — thinking tokens count toward `output_tokens` regardless of display, so visibility is free). A provider-neutral `onReasoningDelta` hook mirrors `onTextDelta` through both adapters; `runAgent` surfaces it as a `thinking_delta` step; the chat loop publishes it as **`chat.thinking-delta`, non-durable** — same reasoning as `chat.assistant-delta`: deltas are visualization, not history. The durable record is the thinking block inside the assistant message, which must persist anyway for the signature echo (a tool-use turn 400s without it). The CLI streams thinking dim-italic in the live region, collapses each stretch to a one-line `✻ thought for Ns` marker, and the footer shows `think:<effort>` next to the model.
+
+**Cost tracking: deliberately no breakout.** Anthropic does not report thinking tokens separately — they are folded into `output_tokens`, which the ledger already records exactly, so USD stays exact too. A `thinking_tokens` column could only hold an estimate (the summarized display text is a *summary*, not the billed reasoning — counting its characters would understate real cost), and storing estimates as physics is precisely what the 2026-04-24 tokens-only-ledger entry forbids. **Resurrect when:** the API starts reporting a real reasoning-token count in usage; then it's one ledger column and a pricing passthrough.
+
+**Context-feedback note, recorded because it keeps coming up.** Thinking blocks feed back into context *within* a turn (each tool round-trip re-sends them; required, and how the model keeps its reasoning chain across tool calls) but *not across* turns — the API strips prior-turn thinking server-side and doesn't bill it as input. OLL-E re-sending them from `thread.messages` is therefore harmless: no context cost, no cache invalidation, and the context gauge stays honest because it reads API-reported usage, not local message bytes.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.
