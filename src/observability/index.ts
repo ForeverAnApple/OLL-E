@@ -490,7 +490,17 @@ export interface AgentSelf {
   reasoningEffort: string;
 }
 
-export function agentSelf(store: Store, agentId: string): AgentSelf | null {
+export function agentSelf(
+  store: Store,
+  agentId: string,
+  // The model an agent with no explicit `thinking-model` memory actually
+  // runs on. Callers pass the live host default (router.defaultModel /
+  // the persisted default-model file); the hardcoded Anthropic default is
+  // only the last-resort fallback for callers that can't reach it (tests,
+  // paths-less IPC). Without this, a host booted on gpt-5.5 (no Anthropic
+  // key) reports claude-opus-4-7 here — status lying about the model.
+  hostDefaultModel: string = ANTHROPIC_DEFAULT_MODEL,
+): AgentSelf | null {
   const arows = store
     .select()
     .from(tables.agents)
@@ -545,7 +555,7 @@ export function agentSelf(store: Store, agentId: string): AgentSelf | null {
   // the configured choice rather than ledger history. Absent choice → host
   // default model / "off" effort.
   const chosenModel = resolveBootModel(store, agentId);
-  const thinkingModel = chosenModel ?? ANTHROPIC_DEFAULT_MODEL;
+  const thinkingModel = chosenModel ?? hostDefaultModel;
   const reasoningEffort = resolveReasoningEffort(store, agentId, thinkingModel) ?? "off";
 
   return {

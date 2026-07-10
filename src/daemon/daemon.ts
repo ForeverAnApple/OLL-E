@@ -463,7 +463,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         // World legibility — agents read their own ledger, runs, threads,
         // budget, and self-state through these. Same query layer the CLI
         // uses (no privileged human read surface).
-        ...buildObservabilityTools({ store }),
+        ...buildObservabilityTools({ store, hostDefaultModel: () => llm.defaultModel }),
         // Decision-inbox surface — same Inbox the askUp chain writes to and
         // the CLI (`olle inbox`) reads from. mail_list is always-loaded
         // (orientation tool); mail_respond is deferred (only needed when

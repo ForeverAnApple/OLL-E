@@ -442,6 +442,24 @@ describe("observability.agentSelf", () => {
     expect(self.reasoningEffort).toBe("off");
   });
 
+  it("reports the passed host default model when the agent has no thinking-model memory", () => {
+    // Regression: an OpenAI-only host boots on gpt-5.5, but agentSelf hardcoded
+    // the Anthropic default as its fallback — so `olle status` claimed Opus
+    // while the agent actually ran gpt-5.5. The live host default must win.
+    const { store, hostId } = rig();
+    const agentId = ulid();
+    store
+      .insert(tables.agents)
+      .values({ id: agentId, name: "gpt-host", hostId, createdAt: Date.now() })
+      .run();
+
+    const self = agentSelf(store, agentId, "gpt-5.5")!;
+    expect(self.thinkingModel).toBe("gpt-5.5");
+    // Still "default" — the agent made no explicit choice; the value just
+    // tracks the host default rather than a hardcoded provider constant.
+    expect(self.thinkingModelIsDefault).toBe(true);
+  });
+
   it("reports the configured thinkingModel, not the ledger's recent model (the query_self bug)", () => {
     const { store, bus, hostId } = rig();
     const agentId = ulid();
