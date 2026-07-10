@@ -543,7 +543,14 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: "agentId required" } });
           return;
         }
-        send({ id: req.id, ok: true, value: agentSelf(opts.store, agentId) });
+        // Same live-host-default source as `model.get` so `agent.self`
+        // (→ `olle status`) and `olle model` never disagree about the model.
+        const hostDefault = opts.modelControl
+          ? opts.modelControl.current()
+          : opts.paths
+            ? readDefaultModel(opts.paths.defaultModelFile)
+            : undefined;
+        send({ id: req.id, ok: true, value: agentSelf(opts.store, agentId, hostDefault) });
         return;
       }
       case "observability.events":

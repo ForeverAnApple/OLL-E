@@ -29,6 +29,11 @@ import {
 
 export interface ObservabilityToolsOptions {
   store: Store;
+  /** Live host default model for agents with no explicit `thinking-model`
+   *  memory. Lets `query_self.thinkingModel` report the model actually in
+   *  use (e.g. gpt-5.5 on an OpenAI-only host) instead of the hardcoded
+   *  Anthropic default. Omitted → `agentSelf`'s own fallback. */
+  hostDefaultModel?: () => string;
 }
 
 const COMMON_TIME_PROPS = {
@@ -203,7 +208,8 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
       },
       additionalProperties: false,
     },
-    execute: (args, ctx) => agentSelf(store, args.agentId ?? ctx.actorId),
+    execute: (args, ctx) =>
+      agentSelf(store, args.agentId ?? ctx.actorId, opts.hostDefaultModel?.()),
   };
 
   const queryEvents: ToolDef<
