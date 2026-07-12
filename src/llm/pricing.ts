@@ -170,6 +170,13 @@ export function priceTokens(
   usage: PricedUsage,
   at: number = Date.now(),
 ): number {
+  // Subscription-billed CLI brains (claude-cli, codex-cli) draw the user's
+  // plan, not a metered API — the physical unit spent is the plan, and its
+  // marginal USD is 0. Recording tokens stays honest; pricing them at $0 tells
+  // the truth about the money. Guarded by the "-cli" provider suffix, which no
+  // real metered provider ("anthropic"/"openai") ever carries, so this can't
+  // accidentally zero out a real bill.
+  if (provider.endsWith("-cli")) return 0;
   const p = lookupPrice(provider, model, at);
   return (
     (usage.inputTokens * p.inMicros) / 1_000_000 +

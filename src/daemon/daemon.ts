@@ -14,6 +14,12 @@ import {
   type RouterAdapters,
   type RouterLlm,
 } from "../llm/index.ts";
+import { createClaudeCliBrain } from "../llm/cli-brain/claude.ts";
+import { createCodexCliBrain } from "../llm/cli-brain/codex.ts";
+import { cliBrainToLlm } from "../llm/cli-brain/as-llm.ts";
+import type { CliBrain } from "../llm/cli-brain/types.ts";
+import { createToolDispatch } from "../mcp/dispatch.ts";
+import type { ToolDispatch } from "../mcp/contract.ts";
 import {
   fallbackForProvider,
   readDefaultModel,
@@ -52,8 +58,9 @@ import {
 } from "../memory/index.ts";
 import { createInbox, type Inbox } from "../inbox/index.ts";
 import { ulid } from "../id/index.ts";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { eq } from "drizzle-orm";
 
 export interface StartDaemonOptions {
@@ -70,6 +77,13 @@ export interface StartDaemonOptions {
   /** Disable the mesh layer entirely. Useful for tests that never touch
    *  teams — skips opening a listener port. Defaults to true. */
   enableMesh?: boolean;
+  /** Test seam: substitute the CLI-brain the detection ladder selects,
+   *  bypassing real `claude`/`codex` probes. When set, the ladder — reached
+   *  only after no API key is found — uses this as its sole CLI candidate
+   *  (still gated on its own `probe()` returning `ready`), so a mock brain
+   *  can exercise the whole-turn delegation path without spawning a process.
+   *  Production leaves this undefined and probes the real CLIs. */
+  cliBrainOverride?: CliBrain;
 }
 
 export interface Daemon {
@@ -237,6 +251,66 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // hot-add a provider when a second API key lands) without restarting
   // chat.
   let router: RouterLlm | undefined;
+  // The CLI brain currently backing the chat loop (CLI mode only). Outer
+  // state, like `router`, so the model-truth closures below read the live
+  // backend; cleared on teardown (the CLI→API upgrade path).
+  let activeCliBrain: CliBrain | undefined;
+  // Set when the CLI backend reports it lost auth mid-turn (chat.cli-auth-lost).
+  // Reflected in status.chat so `olle status` reads needs-login; cleared by the
+  // next successful delegated turn. The loop stays up and re-attempts each turn
+  // (a re-login makes the next turn work) — bounded, no auto-retry timer.
+  let cliAuthLostReason: string | undefined;
+  // Mutable holder for the MCP-bridge tool-execution surface. createIpcServer
+  // runs BEFORE chat bringup (it needs coreTools, built in phase 1), so the
+  // IPC server closes over a stable delegating object that reads this holder;
+  // bringup sets `.ref`. Empty holder = the RPCs reject with "unavailable",
+  // mirroring the IPC server's own absent-dispatch guard.
+  // ── Model truth ──────────────────────────────────────────────────────
+  // One resolution, shared by the chat loop (what a new thread freezes) and
+  // every read surface (model.get, observability.self / query_self). The
+  // statusbar bug this replaces: display surfaces hardcoded the Anthropic
+  // default while an OpenAI router or CLI brain served the turns.
+  //
+  // The agent's chosen model (OLLE_MODEL → thinking-model memory), clamped
+  // to the live backend: in API mode a choice whose provider has no loaded
+  // adapter cannot run — the router would throw on every call — so it
+  // resolves to undefined (= backend default) instead of being frozen into
+  // a thread that can only error. In CLI mode the choice passes through
+  // unclamped: the harness receives it (`--model`), so it IS what runs.
+  const chosenModelFor = (agentId: string): string | undefined => {
+    const chosen = resolveBootModel(store, agentId);
+    if (!chosen || !router) return chosen;
+    try {
+      return router.hasAdapter(providerForModel(chosen)) ? chosen : undefined;
+    } catch {
+      return undefined; // unknown provider prefix — can't run it
+    }
+  };
+  // What runs when the agent hasn't chosen (or the choice was clamped):
+  // the live backend's own default, falling back to the persisted file
+  // only when no backend is up at all.
+  const backendDefaultModel = (): string =>
+    router
+      ? router.defaultModel
+      : activeCliBrain
+        ? activeCliBrain.defaultModel
+        : readDefaultModel(paths.defaultModelFile);
+  // The model the next NEW thread for `agentId` will actually run — the
+  // number every display surface reports.
+  const effectiveModelFor = (agentId: string): string =>
+    chosenModelFor(agentId) ?? backendDefaultModel();
+
+  const toolDispatchHolder: { ref: ToolDispatch | undefined } = { ref: undefined };
+  const delegatingDispatch: ToolDispatch = {
+    list: (agentId) =>
+      toolDispatchHolder.ref
+        ? toolDispatchHolder.ref.list(agentId)
+        : Promise.reject(new Error("tool dispatch unavailable (chat backend not up)")),
+    call: (req) =>
+      toolDispatchHolder.ref
+        ? toolDispatchHolder.ref.call(req)
+        : Promise.reject(new Error("tool dispatch unavailable (chat backend not up)")),
+  };
 
   const ipc = createIpcServer({
     socketPath: paths.socketFile,
@@ -250,14 +324,21 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     inbox,
     teamTools,
     meshEnabled: bridge !== undefined,
+    toolDispatch: delegatingDispatch,
     chatStatus: () => ({
+      // CLI auth-loss does NOT disable chat. The loop is still up and a
+      // re-login makes the next turn work (the feature's keep-alive intent).
+      // Flipping enabled=false here would hard-exit `olle chat` — the only
+      // surface that can send the recovering turn on a keyless CLI-brain host
+      // — so recovery would deadlock. Report enabled with the auth-loss note
+      // as a degraded reason; the next successful root turn clears it.
       enabled: chat !== undefined,
-      reason: chatDisabledReason,
+      reason: chat !== undefined ? cliAuthLostReason : chatDisabledReason,
     }),
     chatCancel: (threadId: string) => (chat ? chat.cancel(threadId) : false),
     modelControl: {
-      current: () =>
-        router ? router.defaultModel : readDefaultModel(paths.defaultModelFile),
+      current: () => backendDefaultModel(),
+      effective: (agentId?: string) => effectiveModelFor(agentId ?? rootAgentId),
       validate: (model: string) => {
         // Always reject unknown provider prefixes (typos like
         // "claud-opus-4-7"). When the router is alive, also reject
@@ -293,66 +374,126 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     }
   }
 
-  // Root agent loop — only if there's an API key. Without it the daemon
-  // still runs but `olle chat` just bounces with chat.error. Note: this
-  // is no longer a "chat agent"; it's the generic agent drain loop
-  // anchored to root's mailbox. Bridges publish into that mailbox.
+  // Write an env-var API key into the secrets file so there's one source of
+  // truth (readSecret only consults the file). The user's own key on their own
+  // box — importing it silently keeps a zero-click flow zero-click.
+  const importEnvSecret = (name: string, value: string): void => {
+    mkdirSync(paths.secretsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(paths.secretsDir, name), value, { mode: 0o600 });
+    if (!opts.quiet) {
+      console.log(`olle: imported ${name} from env → ${paths.secretsDir}`);
+    }
+  };
+
+  // Root agent loop — only if a backend resolves (API key or a logged-in CLI).
+  // Without one the daemon still runs but `olle chat` just bounces with
+  // chat.error. Note: this is no longer a "chat agent"; it's the generic agent
+  // drain loop anchored to root's mailbox. Bridges publish into that mailbox.
   //
-  // Bringup is split into a helper so it runs in two scenarios: at boot
-  // (when the key is already on disk) and on a `secret.set` event for
-  // ANTHROPIC_API_KEY (when the principal sets the key after install).
-  // The latter is the "constraints feel like physics" path — adding the
-  // key brings the agent alive without a daemon restart.
-  const tryBringChatAgentUp = (): { brought: boolean; reason?: string } => {
+  // Bringup is split into a helper so it runs in two scenarios: at boot (when
+  // a backend is already available) and on a `secret.set` event for an API key
+  // (when the principal sets it after install). The latter is the "constraints
+  // feel like physics" path — adding the key brings the agent alive without a
+  // daemon restart.
+  const tryBringChatAgentUp = async (): Promise<{ brought: boolean; reason?: string }> => {
     // Idempotent: a `secret.set` event that races with another bringup
     // attempt sees chat already running and short-circuits cleanly.
     if (chat) return { brought: true };
-    // Build whichever provider adapters have keys on disk; the router
-    // refuses to start if the currently selected model's provider is
-    // missing. Either-or, not both-required — a host with only an OpenAI
-    // key (or only an Anthropic key) is a valid v1 install.
-    const anthropicKey = readSecret(paths.secretsDir, "ANTHROPIC_API_KEY");
-    const openaiKey = readSecret(paths.secretsDir, "OPENAI_API_KEY");
-    const adapters: RouterAdapters = {};
-    if (anthropicKey) adapters.anthropic = createAnthropicAdapter({ apiKey: anthropicKey });
-    if (openaiKey) adapters.openai = createOpenAIAdapter({ apiKey: openaiKey });
-    if (!adapters.anthropic && !adapters.openai) {
-      return {
-        brought: false,
-        reason:
-          "No LLM API key stored. Set ANTHROPIC_API_KEY (for claude-*) or OPENAI_API_KEY (for gpt-*/o*) via `olle secret set <NAME>` — chat will come alive automatically.",
-      };
-    }
-    const desiredModel = readDefaultModel(paths.defaultModelFile);
-    // Fall back to whichever provider IS loaded if the desired model's
-    // provider has no key on disk. "Constraints feel like physics" — a
-    // host with one key shouldn't refuse to boot just because the
-    // persisted default points at a different provider. The user keeps
-    // their stated preference; we just temporarily use a runnable model
-    // until the missing key arrives.
-    let bootModel = desiredModel;
-    try {
-      const desiredProvider = providerForModel(desiredModel);
-      if (!adapters[desiredProvider]) {
-        const fallbackProvider = adapters.anthropic ? "anthropic" : "openai";
-        bootModel = fallbackForProvider(fallbackProvider);
-        if (!opts.quiet) {
-          console.log(
-            `olle: ${desiredModel} requires ${desiredProvider} key (missing) — booting on ${bootModel} until it arrives`,
-          );
-        }
+
+    // ── Detection ladder ────────────────────────────────────────────────
+    // Choose the LLM backend in priority order:
+    //   1. Secret-file API key (ANTHROPIC_API_KEY / OPENAI_API_KEY) → API mode.
+    //   2. Env-var API key → import to the secrets file (one source of truth)
+    //      then API mode. The user's own key on their own box; importing it
+    //      silently keeps a zero-click flow zero-click.
+    //   3. Logged-in `claude` CLI → CLI mode (whole-turn delegation over MCP).
+    //   4. Logged-in `codex` CLI → CLI mode.
+    //   5. Nothing → disabled, with a reason naming what was tried and the fix.
+    // Transport-agnostic: a spawned child rides the same secret/probe
+    // resolution — there is no human-only path.
+    // Read file keys; import any env-var key into the file first (one source
+    // of truth — readSecret only consults the file). Looped over the provider
+    // pair so a third provider key is one array entry, not a third pasted block.
+    const apiKeys: Record<"ANTHROPIC_API_KEY" | "OPENAI_API_KEY", string | undefined> = {
+      ANTHROPIC_API_KEY: readSecret(paths.secretsDir, "ANTHROPIC_API_KEY"),
+      OPENAI_API_KEY: readSecret(paths.secretsDir, "OPENAI_API_KEY"),
+    };
+    for (const name of Object.keys(apiKeys) as (keyof typeof apiKeys)[]) {
+      const envVal = process.env[name];
+      if (!apiKeys[name] && envVal) {
+        importEnvSecret(name, envVal);
+        apiKeys[name] = envVal;
       }
-    } catch {
-      // Unknown prefix in the persisted default. Let the router throw
-      // below with its own diagnostic; we don't try to repair garbage.
     }
-    let localRouter: RouterLlm;
-    try {
-      localRouter = createRouterLlm({ adapters, defaultModel: bootModel });
-    } catch (err) {
-      // Even the fallback failed (e.g. persisted default has an unknown
-      // prefix). Surface the router's diagnostic.
-      return { brought: false, reason: (err as Error).message };
+    const adapters: RouterAdapters = {};
+    if (apiKeys.ANTHROPIC_API_KEY)
+      adapters.anthropic = createAnthropicAdapter({ apiKey: apiKeys.ANTHROPIC_API_KEY });
+    if (apiKeys.OPENAI_API_KEY)
+      adapters.openai = createOpenAIAdapter({ apiKey: apiKeys.OPENAI_API_KEY });
+
+    let localRouter: RouterLlm | undefined;
+    let cliBrain: CliBrain | undefined;
+    if (adapters.anthropic || adapters.openai) {
+      // ── API mode ──
+      const desiredModel = readDefaultModel(paths.defaultModelFile);
+      // Fall back to whichever provider IS loaded if the desired model's
+      // provider has no key on disk. "Constraints feel like physics" — a
+      // host with one key shouldn't refuse to boot just because the persisted
+      // default points at a different provider.
+      let bootModel = desiredModel;
+      try {
+        const desiredProvider = providerForModel(desiredModel);
+        if (!adapters[desiredProvider]) {
+          const fallbackProvider = adapters.anthropic ? "anthropic" : "openai";
+          bootModel = fallbackForProvider(fallbackProvider);
+          if (!opts.quiet) {
+            console.log(
+              `olle: ${desiredModel} requires ${desiredProvider} key (missing) — booting on ${bootModel} until it arrives`,
+            );
+          }
+        }
+      } catch {
+        // Unknown prefix in the persisted default. Let the router throw below
+        // with its own diagnostic; we don't try to repair garbage.
+      }
+      try {
+        localRouter = createRouterLlm({ adapters, defaultModel: bootModel });
+      } catch (err) {
+        return { brought: false, reason: (err as Error).message };
+      }
+    } else {
+      // ── CLI ladder ── probe claude then codex (or the test override).
+      const candidates: CliBrain[] = opts.cliBrainOverride
+        ? [opts.cliBrainOverride]
+        : [createClaudeCliBrain(), createCodexCliBrain()];
+      const tried: string[] = [];
+      for (const brain of candidates) {
+        let probe;
+        try {
+          probe = await brain.probe(AbortSignal.timeout(20_000));
+        } catch (err) {
+          tried.push(`${brain.provider}: probe error (${(err as Error).message ?? err})`);
+          continue;
+        }
+        if (probe.status === "ready") {
+          cliBrain = brain;
+          if (!opts.quiet) {
+            console.log(
+              `olle: no API key — using ${brain.provider} CLI backend${probe.version ? ` (${probe.version})` : ""}`,
+            );
+          }
+          break;
+        }
+        const hint = probe.loginHint
+          ? ` — ${probe.loginHint}`
+          : probe.detail
+            ? ` — ${probe.detail}`
+            : "";
+        tried.push(`${brain.provider}: ${probe.status}${hint}`);
+      }
+      if (!cliBrain) {
+        return { brought: false, reason: buildNoBackendReason(tried) };
+      }
     }
     const rootLoopAgentId = rootAgentId;
     // Construction is split into two phases:
@@ -365,8 +506,12 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     let localManager: AgentManager | undefined;
     let localChat: AgentLoop | undefined;
     let localHealth: ChatHealthMonitor | undefined;
+    let localDispatch: ToolDispatch | undefined;
     try {
-      const llm = localRouter;
+      // In CLI mode the generic Llm-typed plumbing (manager, model probe) is
+      // satisfied by the cli-as-llm shim; the whole-turn delegation itself
+      // takes `cliBrain` directly on startAgentLoop below.
+      const llm = cliBrain ? cliBrainToLlm(cliBrain) : localRouter!;
       // Spilled tool-output store. Owned by the daemon so chat-loop
       // truncation and the read_tool_result recovery tool share one row
       // surface — same physics on write and read.
@@ -402,7 +547,9 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         threadsDir: paths.threadsDir,
         secretsDir: paths.secretsDir,
         hostContext: buildHostContextPrompt(paths, hostId),
-        resolveModel: (agentId) => resolveBootModel(store, agentId),
+        // Clamped to the live backend — an unserved thinking-model memory
+        // degrades to the backend default instead of bricking the child loop.
+        resolveModel: (agentId) => chosenModelFor(agentId),
         resolveEffort: (agentId, model) => resolveReasoningEffort(store, agentId, model),
         toolTruncate,
       });
@@ -482,7 +629,9 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         // World legibility — agents read their own ledger, runs, threads,
         // budget, and self-state through these. Same query layer the CLI
         // uses (no privileged human read surface).
-        ...buildObservabilityTools({ store }),
+        // effectiveModel keeps query_self's thinkingModel honest — it reports
+        // the model the backend will actually run, not a hardcoded default.
+        ...buildObservabilityTools({ store, effectiveModel: effectiveModelFor }),
         // Decision-inbox surface — same Inbox the askUp chain writes to and
         // the CLI (`olle inbox`) reads from. mail_list is always-loaded
         // (orientation tool); mail_respond is deferred (only needed when
@@ -548,6 +697,20 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       // Children inherit the same tool set so they can themselves spawn,
       // read extension files, etc. Scope still gates what they get to use.
       localManager.setCoreTools(coreTools);
+      // MCP-bridge execution surface — the headless twin of the chat loop's
+      // tool dispatch. Built here because it needs the same live coreTools +
+      // extensions + truncation store, and shares the audit-event + scope
+      // gate. Useful in both API and CLI mode (a CLI harness exercises it;
+      // an API-mode host still exposes it for out-of-loop tool runs).
+      localDispatch = createToolDispatch({
+        bus,
+        store,
+        hostId,
+        coreTools: () => coreTools,
+        extensions,
+        secretsDir: paths.secretsDir,
+        toolTruncate,
+      });
       if (process.env.OLLE_MODEL && !opts.quiet) {
         const resolved = resolveBootModel(store, rootLoopAgentId);
         console.log(
@@ -568,17 +731,26 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
         threadsDir: paths.threadsDir,
         secretsDir: paths.secretsDir,
         toolTruncate,
+        // CLI mode: hand the loop the brain + how to spawn `olle mcp-bridge`
+        // so delegated turns reach OLL-E's tools over MCP. Absent in API mode
+        // — the loop drives runAgent as before.
+        ...(cliBrain && {
+          cliBrain,
+          olleInvocation: resolveOlleInvocation(),
+          socketPath: paths.socketFile,
+        }),
         // The agent's self-chosen model + effort (private memories), resolved
         // per-thread at thread creation rather than once at loop start, so a
         // `set_thinking_model` / `set_reasoning_effort` switch applies on the
         // next NEW thread without a daemon restart; active threads keep what
         // they started with. The `OLLE_MODEL` env override (rescue hatch)
         // takes precedence — see resolveBootModel.
-        resolveModel: () => resolveBootModel(store, rootLoopAgentId),
-        resolveEffort: () => {
-          const model = resolveBootModel(store, rootLoopAgentId) ?? llm.defaultModel;
-          return resolveReasoningEffort(store, rootLoopAgentId, model);
-        },
+        // Clamped to the live backend (see chosenModelFor above): the model
+        // a thread freezes is one the backend can actually serve, so display
+        // surfaces reporting effectiveModelFor never diverge from execution.
+        resolveModel: () => chosenModelFor(rootLoopAgentId),
+        resolveEffort: () =>
+          resolveReasoningEffort(store, rootLoopAgentId, effectiveModelFor(rootLoopAgentId)),
         // Boot prompt branches on whether identity has been seeded yet
         // (LOG 2026-04-28). Resolve at turn-time, not daemon-start-time:
         // fresh installs can seed identity during the first conversation,
@@ -624,7 +796,16 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     chatAgentId = rootLoopAgentId;
     chatHealth = localHealth;
     managerHolder.ref = localManager;
-    router = localRouter;
+    toolDispatchHolder.ref = localDispatch;
+    // Undefined in CLI mode — router stays absent, and the model.set /
+    // secret.set handlers guard on `if (!router)`.
+    if (localRouter) router = localRouter;
+    // Exactly one of router / activeCliBrain is set per bringup; the
+    // model-truth closures read whichever is live.
+    activeCliBrain = cliBrain;
+    // A fresh bringup starts from a live backend — clear any stale auth-lost
+    // flag so status reflects the new loop.
+    cliAuthLostReason = undefined;
     return { brought: true };
   };
 
@@ -672,7 +853,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // event with no subscriber yet. The event is dropped, but the file
   // is on disk, and `tryBringChatAgentUp` re-reads the secrets dir, so
   // the dropped-event path still ends with chat alive.
-  const initial = tryBringChatAgentUp();
+  const initial = await tryBringChatAgentUp();
   if (!initial.brought) {
     chatDisabledReason = initial.reason;
     if (!opts.quiet) {
@@ -680,6 +861,55 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     }
     installBouncer();
   }
+
+  // Tear the running chat loop down and reinstall the bouncer. Used by the
+  // CLI→API upgrade below: the manager owns the root loop, so its shutdown
+  // stops the loop; we then null the outer state so a re-bringup starts clean.
+  const teardownChat = (): void => {
+    try {
+      chatHealth?.stop();
+    } catch {
+      /* best-effort */
+    }
+    try {
+      managerHolder.ref?.shutdown();
+    } catch {
+      /* best-effort */
+    }
+    chat = undefined;
+    chatAgentId = undefined;
+    chatHealth = undefined;
+    managerHolder.ref = undefined;
+    toolDispatchHolder.ref = undefined;
+    // The CLI brain this loop delegated to is gone with it; a re-bringup
+    // (CLI→API upgrade) commits the new backend. `router` is left as-is —
+    // it was never set in CLI mode, and the upgrade path replaces it.
+    activeCliBrain = undefined;
+    // The CLI loop this flag described is gone. Clear it so status stops
+    // reporting a stale needs-login after a teardown or failed re-bringup —
+    // the real disabled reason is chatDisabledReason (see chatStatus).
+    cliAuthLostReason = undefined;
+    installBouncer();
+  };
+
+  // CLI backend lost auth mid-turn (chat.cli-auth-lost). Reflect needs-login
+  // in status without tearing the loop down: the loop stays up and re-attempts
+  // each turn (a re-login makes the next turn work). Bounded — no retry timer.
+  bus.subscribe<{ provider?: string; loginHint?: string }>("chat.cli-auth-lost", (ev) => {
+    if (!chat) return;
+    const p = ev.payload ?? {};
+    cliAuthLostReason = `CLI backend ${p.provider ?? "?"} needs login${p.loginHint ? ` — ${p.loginHint}` : ""}`;
+    if (!opts.quiet) console.error(`olle: ${cliAuthLostReason}`);
+  });
+  // A completed delegated turn proves the backend is live again — clear the flag.
+  // Only the root loop's own turns count: another agent/thread's turn-end says
+  // nothing about the root CLI backend's login state. (Refining further to
+  // CLI-mode-only turns has no reliable payload marker today; the actor filter
+  // is the load-bearing part.)
+  bus.subscribe("chat.turn-end", (ev) => {
+    if (ev.actorId !== rootAgentId) return;
+    if (cliAuthLostReason !== undefined) cliAuthLostReason = undefined;
+  });
 
   // Hot-reload: when the principal stores an LLM API key after install,
   // wake chat (if down) or hot-add the provider's adapter to the router
@@ -689,9 +919,45 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
   // Key rotation on the SAME provider with chat already up is still a
   // restart concern: the running adapter captured the prior key and we
   // don't swap it out under the agent's feet. `olle daemon restart`.
-  bus.subscribe<{ name?: string }>("secret.set", (ev) => {
+  bus.subscribe<{ name?: string }>("secret.set", async (ev) => {
     const name = ev.payload?.name;
     if (name !== "ANTHROPIC_API_KEY" && name !== "OPENAI_API_KEY") return;
+    if (chat && !router) {
+      // Running in CLI mode and a real API key just arrived — prefer the API
+      // brain. But confirm the API backend can actually be built BEFORE tearing
+      // the working CLI loop down. Teardown is irreversible here: the ladder now
+      // prefers the just-written key, so a failed re-bringup can't fall back to
+      // CLI. A bad persisted model (createRouterLlm throws) would otherwise
+      // downgrade a live backend to fully-disabled chat.
+      const preflight = canBuildApiRouter(paths.secretsDir, paths.defaultModelFile);
+      if (preflight.reason) {
+        // Do NOT tear down — the CLI loop keeps serving turns. Surface why the
+        // upgrade was skipped so the user can fix the model/key and restart.
+        if (!opts.quiet) {
+          console.error(
+            `olle: ${name} received but the API backend can't build (${preflight.reason}) — keeping the CLI backend`,
+          );
+        }
+        return;
+      }
+      // Confirmed buildable — the swap is safe. Tear the CLI loop down and
+      // re-bring-up: the ladder finds the secret-file key and takes the API
+      // branch. Simpler than hot-swapping under a live loop, and the CLI was
+      // always the fallback, not the choice.
+      if (!opts.quiet) {
+        console.log(`olle: ${name} received — upgrading from CLI backend to API mode`);
+      }
+      teardownChat();
+      const up = await tryBringChatAgentUp();
+      if (up.brought) {
+        chatDisabledReason = undefined;
+        removeBouncer();
+        if (!opts.quiet) console.log(`olle: ${name} received — API chat agent live`);
+      } else if (up.reason) {
+        chatDisabledReason = up.reason;
+      }
+      return;
+    }
     if (chat && router) {
       // Chat is up — hot-add the adapter if it wasn't already loaded.
       // (Same-provider re-set is the rotation case noted above; we don't
@@ -729,7 +995,7 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
       return;
     }
     if (chat) return;
-    const r = tryBringChatAgentUp();
+    const r = await tryBringChatAgentUp();
     if (r.brought) {
       chatDisabledReason = undefined;
       removeBouncer();
@@ -846,6 +1112,65 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     agentManager: managerHolder.ref,
     shutdown,
   };
+}
+
+/** How to spawn this OLL-E build's `mcp-bridge` subcommand. Dev (running the
+ *  `.ts` via bun): the CLI entry needs to be the first argv, so the bridge is
+ *  `bun src/cli/index.ts mcp-bridge …`. Compiled binary: argv[0] IS `olle`, so
+ *  no prefix — `olle mcp-bridge …`. The heuristic keys on argv[1] ending in
+ *  `.ts` (only true when running from source). */
+function resolveOlleInvocation(): { command: string; argvPrefix: string[] } {
+  const dev = process.argv[1]?.endsWith(".ts") ?? false;
+  if (dev) {
+    const cliEntry = fileURLToPath(new URL("../cli/index.ts", import.meta.url));
+    return { command: process.execPath, argvPrefix: [cliEntry] };
+  }
+  return { command: process.execPath, argvPrefix: [] };
+}
+
+/** Build the chat-disabled reason from the CLI ladder's probe results, so
+ *  the user reads what was tried and the fix (set an API key, or log the CLI
+ *  in). */
+/** Confirm an API-mode router can be built from the keys currently on disk,
+ *  WITHOUT committing it. The CLI→API upgrade uses this to check the
+ *  replacement before tearing down a working CLI loop — teardown is
+ *  irreversible there, so a bad persisted model must not downgrade a live
+ *  backend to disabled. Mirrors the detection ladder's API-mode construction;
+ *  the ladder stays the source of truth and this only validates. Returns a
+ *  reason when construction would fail, or no reason on success. */
+function canBuildApiRouter(
+  secretsDir: string,
+  defaultModelFile: string,
+): { reason?: string } {
+  const adapters: RouterAdapters = {};
+  const aKey = readSecret(secretsDir, "ANTHROPIC_API_KEY");
+  const oKey = readSecret(secretsDir, "OPENAI_API_KEY");
+  if (aKey) adapters.anthropic = createAnthropicAdapter({ apiKey: aKey });
+  if (oKey) adapters.openai = createOpenAIAdapter({ apiKey: oKey });
+  if (!adapters.anthropic && !adapters.openai) return { reason: "no API key on disk" };
+  const desired = readDefaultModel(defaultModelFile);
+  let bootModel = desired;
+  try {
+    if (!adapters[providerForModel(desired)]) {
+      bootModel = fallbackForProvider(adapters.anthropic ? "anthropic" : "openai");
+    }
+  } catch {
+    // Unknown prefix in the persisted default — let createRouterLlm surface
+    // the diagnostic below.
+  }
+  try {
+    createRouterLlm({ adapters, defaultModel: bootModel });
+    return {};
+  } catch (err) {
+    return { reason: (err as Error).message };
+  }
+}
+
+function buildNoBackendReason(cliProbes: string[]): string {
+  const apiHint =
+    "Set ANTHROPIC_API_KEY (for claude-*) or OPENAI_API_KEY (for gpt-*/o*) via `olle secret set <NAME>` — chat comes alive automatically.";
+  const cli = cliProbes.length ? ` CLI fallback tried — ${cliProbes.join("; ")}.` : "";
+  return `No LLM backend available. ${apiHint}${cli}`;
 }
 
 function resolveMeshPort(override?: number): number {

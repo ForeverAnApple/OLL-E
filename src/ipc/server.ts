@@ -36,6 +36,7 @@ import { setBudget } from "../ledger/index.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
 import { readDefaultModel, writeDefaultModel } from "../daemon/model-preference.ts";
 import { resolveBootModel } from "../memory/model.ts";
+import type { ToolDispatch } from "../mcp/contract.ts";
 
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
@@ -83,13 +84,23 @@ export interface IpcServerOptions {
    *  up (router not constructed) — `model.set` still persists, so the
    *  next bringup picks it up. */
   modelControl?: {
-    /** Returns the current model name. Reads from the router when alive,
-     *  otherwise falls back to the persisted file. */
+    /** Returns the live backend's default model — router or CLI brain when
+     *  alive, otherwise the persisted file. */
     current(): string;
+    /** The model the next NEW thread for `agentId` (root when omitted) will
+     *  actually run: the agent's chosen model clamped to the live backend,
+     *  else the backend's own default. This is the truth every display
+     *  surface reports; optional so partial wirings (tests) still work. */
+    effective?(agentId?: string): string;
     /** Validate that `model` has a buildable provider before persisting.
      *  Throws when the model maps to a provider with no loaded adapter. */
     validate(model: string): void;
   };
+  /** Daemon-side tool execution surface the MCP bridge RPC (`tools.list` /
+   *  `tools.call`) proxies into. Absent on daemons with no CLI-brain backend
+   *  wired — the two arms then return a clean "unavailable" error rather than
+   *  a crash. See src/mcp/contract.ts. */
+  toolDispatch?: ToolDispatch;
 }
 
 export interface IpcServer {
@@ -424,12 +435,18 @@ async function dispatch(
         return;
       }
       case "model.get": {
-        // Report what the next NEW thread will actually run with — which is
-        // resolveBootModel (OLLE_MODEL override → thinking-model memory),
-        // exactly the precedence chat.ts freezes at thread birth. The router
-        // default is only the fall-through when the agent has no thinking-model
-        // memory; reporting it unconditionally is the bug where `/model` shows
-        // the stale host default after a `set_thinking_model` switch.
+        // Report what the next NEW thread will actually run with. The daemon
+        // owns that truth (modelControl.effective — the chosen model clamped
+        // to the live backend, else the backend's own default); the manual
+        // composition below is only the fall-through for servers wired
+        // without it. Reporting an unclamped choice — or a hardcoded
+        // provider default — is the statusbar bug where a host serving
+        // turns on OpenAI or a CLI brain still displayed the Anthropic
+        // default.
+        if (opts.modelControl?.effective) {
+          send({ id: req.id, ok: true, value: { model: opts.modelControl.effective() } });
+          return;
+        }
         const thinking =
           opts.store && opts.rootAgentId
             ? resolveBootModel(opts.store, opts.rootAgentId)
@@ -582,7 +599,16 @@ async function dispatch(
           send({ id: req.id, ok: false, error: { message: "agentId required" } });
           return;
         }
-        send({ id: req.id, ok: true, value: agentSelf(opts.store, agentId) });
+        // effectiveModel keeps thinkingModel honest for agents with no
+        // explicit choice — the live backend's model, not a hardcoded
+        // provider default.
+        send({
+          id: req.id,
+          ok: true,
+          value: agentSelf(opts.store, agentId, {
+            effectiveModel: opts.modelControl?.effective?.(agentId),
+          }),
+        });
         return;
       }
       case "observability.events":
@@ -798,6 +824,62 @@ async function dispatch(
               error: { message: (err as Error).message ?? String(err) },
             }),
           );
+        return;
+      }
+      // MCP bridge surface — `olle mcp-bridge` proxies a CLI harness's
+      // tools/list and tools/call here so the harness runs OLL-E's own
+      // tools through the same scope gate + audit events the chat loop
+      // uses. Both arms need the daemon-wired ToolDispatch. See src/mcp/.
+      case "tools.list": {
+        if (!opts.toolDispatch) {
+          send({ id: req.id, ok: false, error: { message: "tool dispatch unavailable" } });
+          return;
+        }
+        const agentId = req.params?.agentId as string | undefined;
+        if (!agentId) {
+          send({ id: req.id, ok: false, error: { message: "agentId required" } });
+          return;
+        }
+        const specs = await opts.toolDispatch.list(agentId);
+        send({ id: req.id, ok: true, value: specs });
+        return;
+      }
+      case "tools.call": {
+        if (!opts.toolDispatch) {
+          send({ id: req.id, ok: false, error: { message: "tool dispatch unavailable" } });
+          return;
+        }
+        const p = (req.params ?? {}) as {
+          agentId?: unknown;
+          threadId?: unknown;
+          name?: unknown;
+          input?: unknown;
+          parentEventId?: unknown;
+        };
+        if (typeof p.agentId !== "string" || !p.agentId) {
+          send({ id: req.id, ok: false, error: { message: "agentId required" } });
+          return;
+        }
+        if (typeof p.threadId !== "string" || !p.threadId) {
+          send({ id: req.id, ok: false, error: { message: "threadId required" } });
+          return;
+        }
+        if (typeof p.name !== "string" || !p.name) {
+          send({ id: req.id, ok: false, error: { message: "name required" } });
+          return;
+        }
+        if (typeof p.input !== "object" || p.input === null || Array.isArray(p.input)) {
+          send({ id: req.id, ok: false, error: { message: "input must be an object" } });
+          return;
+        }
+        const result = await opts.toolDispatch.call({
+          agentId: p.agentId,
+          threadId: p.threadId,
+          name: p.name,
+          input: p.input as Record<string, unknown>,
+          ...(typeof p.parentEventId === "string" && { parentEventId: p.parentEventId }),
+        });
+        send({ id: req.id, ok: true, value: result });
         return;
       }
       default:

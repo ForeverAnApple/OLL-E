@@ -130,6 +130,19 @@ export interface Usage {
   totalTokens: number;
 }
 
+/** A fresh zeroed Usage accumulator. Co-located with the type so a new field
+ *  can't be zero-initialized in some call sites and forgotten in others
+ *  (a missed field starts an accumulator from `undefined` → NaN token totals). */
+export function zeroUsage(): Usage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    totalTokens: 0,
+  };
+}
+
 export interface Completion {
   content: ContentBlock[];
   stopReason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "refusal";

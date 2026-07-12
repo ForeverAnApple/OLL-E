@@ -17,6 +17,7 @@ import { telegram } from "./templates/telegram.ts";
 import { telegramCommunication } from "./templates/telegram-communication.ts";
 import { freshrss } from "./templates/freshrss.ts";
 import { web } from "./templates/web.ts";
+import { localLlm } from "./templates/local-llm.ts";
 
 export type { StarterTemplate };
 
@@ -30,6 +31,7 @@ const STARTERS: Record<string, StarterTemplate> = {
   "telegram-communication": telegramCommunication,
   freshrss,
   web,
+  "local-llm": localLlm,
 };
 
 export function listStarters(): StarterTemplate[] {

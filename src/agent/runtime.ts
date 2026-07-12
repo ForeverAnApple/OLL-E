@@ -18,7 +18,7 @@ import type {
   ToolSpec,
   Usage,
 } from "../llm/index.ts";
-import { clampEffort, maxOutputTokens } from "../llm/index.ts";
+import { clampEffort, maxOutputTokens, zeroUsage } from "../llm/index.ts";
 import {
   enforceMessageBudget,
   maybeTruncateOne,
@@ -173,13 +173,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentResult> {
   }
 
   const messages: Message[] = [...opts.messages];
-  const total: Usage = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadInputTokens: 0,
-    cacheCreationInputTokens: 0,
-    totalTokens: 0,
-  };
+  const total: Usage = zeroUsage();
 
   for (let turn = 0; turn < maxTurns; turn++) {
     if (opts.signal?.aborted) throw abortError(opts.signal);
@@ -389,7 +383,7 @@ function filterVisibleTools(
   return tools.filter((t) => t.alwaysLoaded === true || isLoaded(t.name));
 }
 
-function redactToolResult(tool: ToolDef, result: unknown): unknown {
+export function redactToolResult(tool: ToolDef, result: unknown): unknown {
   if (tool.sensitiveOutput) return "[redacted]";
   const fields = tool.sensitiveOutputFields;
   if (!fields || fields.length === 0) return result;

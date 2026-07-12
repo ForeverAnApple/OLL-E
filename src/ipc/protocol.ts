@@ -37,7 +37,9 @@ export type Method =
   | "team.join"
   | "team.leave"
   | "team.status"
-  | "observability.teams";
+  | "observability.teams"
+  | "tools.list"
+  | "tools.call";
 
 export function isRequest(v: unknown): v is Request {
   if (!v || typeof v !== "object") return false;

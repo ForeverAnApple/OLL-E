@@ -250,6 +250,24 @@ Budgets stay USD-denominated because principals back them with real money. The a
 
 Ledger is keyed `(owner_agent_id, agent_id, provider, model, period)` so team-level or mesh-level rollups in v1+ are schema-free; the new `(actor_id, at)` and `(thread_id, at)` indexes serve the observability layer.
 
+## Provider detection ladder and CLI-brain mode
+
+At chat bringup the daemon picks the LLM backend by walking a ladder (`tryBringChatAgentUp`, `src/daemon/daemon.ts`):
+
+1. **Secret-file API key** — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` on disk → **API mode** (the router + adapters described above).
+2. **Env-var API key** — no file key but the key is in `process.env` → import it to the secrets file (mode 0600) and proceed as API mode. Silent by design: it's the user's own key on their own box, and one source of truth stays the file. `readSecret` never consults env.
+3. **`claude` CLI probe** (`createClaudeCliBrain().probe()`) → **CLI mode** with claude.
+4. **`codex` CLI probe** → CLI mode with codex.
+5. **Disabled** — a reason naming what was tried (needs-login vs not-installed) and the fix.
+
+**CLI-brain mode.** When no API key is present but a logged-in coding-agent CLI is, an agent turn is **whole-turn-delegated** to that official harness instead of driving `runAgent`. The CLI owns its inner LLM↔tool loop; OLL-E's own tools reach it over **MCP** via the bridge: the harness spawns `olle mcp-bridge --agent <id> --thread <id> [--socket <path>]` (an MCP stdio server, `src/cli/mcp-bridge.ts`), which proxies `tools/list` and `tools/call` back into the daemon's `tools.list` / `tools.call` IPC RPCs. Those RPCs call a `ToolDispatch` (`src/mcp/dispatch.ts`) — the headless twin of the chat loop's per-tool dispatch: same scope/tier gate (`checkTool`), same input validation, redaction, secret-scrub, and truncation, and the same durable `chat.tool-call` / `chat.tool-result` / `tool.denied` audit events on the same thread. The dispatch is deliberately NOT per-thread-loadout-aware — the loaded set is a prompt-context economy for the API path; a CLI harness carries its own context budget, and execution never consulted it.
+
+Delegated turns **record tokens but bill $0**: the CLI reports usage, the ledger writes it under a `*-cli` provider, and `priceTokens` prices any `*-cli` provider at $0 — a subscription turn spends the plan, not metered dollars (subscription physics; see LOG 2026-07-11). The tradeoff: OLL-E's SOUL/cache economy and exact API accounting don't apply on the CLI path — usage is whatever the harness self-reports.
+
+**Session resume is in-memory, per thread.** The CLI's own session id is held on the `Thread` and resumed on the next turn (no re-sent system prompt). A daemon restart drops it; the next turn opens a fresh CLI session and re-sends a rendered transcript of prior messages. When a real API key later lands (`secret.set`), the daemon tears the CLI loop down and re-brings-up in API mode — the CLI was always the fallback, not the choice.
+
+**Auth-loss keep-alive.** A delegated turn whose CLI reports lost auth publishes durable `chat.cli-auth-lost { provider, loginHint? }` alongside the usual `chat.error`. The daemon flips `status.chat` to a needs-login reason without tearing the loop down; the next successful `chat.turn-end` clears it. Bounded — no auto-retry timer; a re-login makes the next turn work.
+
 ## Caching
 
 Prompt caching is on by default through the Anthropic adapter (`src/llm/anthropic.ts`). Four ephemeral cache breakpoints, all dumb-but-effective:
@@ -367,7 +385,8 @@ Trigger declarations are themselves authority statements for their `type` field 
 ### Core bundle (shipped in binary, not an extension)
 
 - LLM provider adapters (Anthropic, OpenAI) via API key config
-- Pricing config (`src/llm/pricing.ts`) — single source of truth for token prices; effective-dated eras, USD computed on read at the rate in effect at spend time
+- CLI-brain backends + MCP bridge (`src/llm/cli-brain/`, `src/mcp/`, `src/cli/mcp-bridge.ts`) — when no API key is present, a logged-in `claude`/`codex` CLI backs the chat loop via whole-turn delegation; see "Provider detection ladder and CLI-brain mode"
+- Pricing config (`src/llm/pricing.ts`) — single source of truth for token prices; effective-dated eras, USD computed on read at the rate in effect at spend time (`*-cli` providers price at $0 — subscription physics)
 - Store / event bus / scheduler
 - Decision-inbox router
 - CLI chat handler (channel-of-first-contact)
@@ -381,7 +400,7 @@ Trigger declarations are themselves authority statements for their `type` field 
 
 ### Starter templates (shipped read-only; agents clone and modify)
 
-Nine ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting what it does, the exact secrets and how to acquire them, and an install→set-secret→register→smoke walkthrough written for the agent to narrate conversationally. `install_starter` / `list_starters` return `hasSetupGuide` and nudge reading it before asking for secrets — so onboarding a channel is a conversation, not a guess.
+Ten ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting what it does, the exact secrets and how to acquire them, and an install→set-secret→register→smoke walkthrough written for the agent to narrate conversationally. `install_starter` / `list_starters` return `hasSetupGuide` and nudge reading it before asking for secrets — so onboarding a channel is a conversation, not a guess.
 
 - `discord` — bot gateway + message send/receive; hardened with RESUME + backoff, heartbeat-ACK zombie detection, 429 retry
 - `discord-communication` — wake-word chat behavior over the discord gateway; standing-job channel routing (lazy `getOrDeriveRoute`)
@@ -390,6 +409,7 @@ Nine ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting wh
 - `github` — webhook receiver + API calls (issues, PRs, comments); `github_activity` since-based delta tool
 - `freshrss` — Google Reader API (ClientLogin); `freshrss_unread` / `freshrss_feeds` (operational), `freshrss_mark_read` (strategic)
 - `web` — one `web_fetch(url)` tool (operational): SSRF-guarded fetch (private/link-local/CGNAT/loopback ranges blocked, DNS pre-resolution, manual redirect re-validation), hand-rolled HTML→markdown, 2MB download cap + `maxResultBytes` spill. No `web_search` — search needs a provider key and ranking opinions; separate proposal
+- `local-llm` — adapter for a local OpenAI-compatible server (llama.cpp, vLLM, LM Studio): `local_llm_generate` chat completion (auto-picks the model when the server serves exactly one, surfaces `reasoning_content` from thinking models) and `local_llm_models` (both operational); `baseUrl` in config, optional Bearer key via the `LOCAL_LLM_API_KEY` secret. Deliberately no SSRF guard — `baseUrl` is operator config aimed at localhost, never tool input. A tool, not a brain swap: the chat loop's provider adapters stay core
 - `cron-trigger`
 - `claude-code` — subprocess invocation
 - `http-webhook-trigger` (v0.1), `slack` (v0.1), `codex` (v0.1)

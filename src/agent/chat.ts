@@ -29,6 +29,10 @@ import type { Store } from "../store/db.ts";
 import type { Ledger } from "../ledger/index.ts";
 import type { ExtensionHost } from "../extensions/index.ts";
 import type { Llm, Message, ReasoningEffort, SystemSegment, Usage } from "../llm/index.ts";
+import { zeroUsage } from "../llm/index.ts";
+import type { CliBrain } from "../llm/cli-brain/types.ts";
+import { flattenMessages } from "../llm/cli-brain/render.ts";
+import { bridgeInvocation } from "../mcp/contract.ts";
 import type { ToolDef } from "../extensions/types.ts";
 import { askUp, type Inbox } from "../inbox/index.ts";
 import { checkTool } from "../permissions/index.ts";
@@ -113,6 +117,23 @@ export interface AgentLoopOptions {
     maxBytesPerCall?: number;
     maxBytesPerMessage?: number;
   };
+  /** CLI-brain backend. When set, a turn is whole-turn-delegated to a
+   *  logged-in coding-agent CLI (claude/codex) instead of driving runAgent:
+   *  the CLI owns its inner LLM<->tool loop and reaches OLL-E's tools over
+   *  MCP via the bridge (see olleInvocation). Absent = normal API path;
+   *  everything below (loadout, catalog, per-turn tool wrapping) is unused on
+   *  the CLI path but still computed cheaply. The usage the CLI reports is
+   *  folded into the same ledger row recordSpend writes — priced $0 for the
+   *  `*-cli` providers (subscription physics). */
+  cliBrain?: CliBrain;
+  /** How to spawn this OLL-E build's `mcp-bridge` subcommand so the CLI
+   *  harness can reach the daemon's tools. dev: {command: bun, argvPrefix:
+   *  [cliEntry]}; compiled: {command: binPath, argvPrefix: []}. Required
+   *  when `cliBrain` is set. */
+  olleInvocation?: { command: string; argvPrefix: string[] };
+  /** IPC socket the mcp-bridge dials — threaded through the bridge argv so a
+   *  test daemon under a temp OLLE_HOME resolves the right socket. */
+  socketPath?: string;
 }
 
 interface Thread {
@@ -160,6 +181,13 @@ interface Thread {
    *  thread runtime state, re-resolved on restart. */
   model?: string;
   effort?: ReasoningEffort;
+  /** Per-thread CLI-brain session state (whole-turn-delegation path only).
+   *  `sessionId` resumes the CLI's own session on the next turn. In-memory
+   *  only — a restart drops it, so the next turn opens a fresh CLI session.
+   *  The transcript-resend gate keys on there being no live `sessionId` plus
+   *  `thread.messages.length > 1` (a fresh session on a thread that already
+   *  has history), not on this state. */
+  cliSession?: { sessionId?: string };
 }
 
 export interface AgentLoop {
@@ -366,14 +394,13 @@ async function runTurn(
   // success and error paths closes the hole where a failed multi-round-
   // trip turn silently dropped the completed rounds' real spend (and
   // under-decremented the budget). On success it equals result.totalUsage.
-  const turnUsage: Usage = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadInputTokens: 0,
-    cacheCreationInputTokens: 0,
-    totalTokens: 0,
-  };
+  const turnUsage: Usage = zeroUsage();
   let spendRecorded = false;
+  // In CLI-brain mode opts.llm is the cli-as-llm shim, but be explicit: the
+  // provider/model recorded is the brain's (so pricing hits the $0 `*-cli`
+  // path) even if a test passes a mock llm alongside a real cliBrain.
+  const spendProvider = opts.cliBrain?.provider ?? opts.llm.provider;
+  const spendModel = thread.model ?? opts.cliBrain?.defaultModel ?? opts.llm.defaultModel;
   const recordSpend = (): { usdMicros: number } | undefined => {
     if (spendRecorded || !opts.ledger || turnUsage.totalTokens === 0) return undefined;
     spendRecorded = true;
@@ -381,8 +408,8 @@ async function runTurn(
       actorId: opts.agentId,
       threadId: thread.id,
       ownerAgentId: opts.ownerAgentId,
-      provider: opts.llm.provider,
-      model: thread.model ?? opts.llm.defaultModel,
+      provider: spendProvider,
+      model: spendModel,
       inputTokens: turnUsage.inputTokens,
       outputTokens: turnUsage.outputTokens,
       cacheReadTokens: turnUsage.cacheReadInputTokens,
@@ -476,6 +503,160 @@ async function runTurn(
     const budgetBlock = paidBudgetBlock(opts, thread.id, origin);
     if (budgetBlock) {
       if (agentDir) saveThread(agentDir, thread, redactions);
+      return;
+    }
+    // ── CLI-brain whole-turn delegation ──────────────────────────────────
+    // When a CLI backend is wired, the turn is handed to the harness (which
+    // runs its own LLM<->tool loop, reaching OLL-E's tools over MCP through
+    // the bridge/dispatch). We compose the system prompt, resume or open the
+    // CLI session, record the reported usage ($0 for subscription providers),
+    // and emit the same assistant-text / turn-end envelope the API path does.
+    // Tool-call/tool-result audit events come from the dispatch layer, not
+    // here — re-emitting would double-count.
+    if (opts.cliBrain) {
+      const cliBrain = opts.cliBrain;
+      const inv = opts.olleInvocation;
+      if (!inv) {
+        throw new Error("cliBrain set but olleInvocation missing — cannot build the MCP bridge");
+      }
+      const system = (systemSegments ?? []).map((s) => s.text).join("\n\n");
+      const resumeSessionId = thread.cliSession?.sessionId;
+      // Fresh session on a thread that already has history (in-memory session
+      // dropped by a restart): re-send the prior transcript so the harness has
+      // context. The just-pushed user message is the prompt, so exclude it.
+      const priorTranscript =
+        !resumeSessionId && thread.messages.length > 1
+          ? renderTranscript(thread.messages.slice(0, -1))
+          : undefined;
+      const bridge = bridgeInvocation(inv.command, inv.argvPrefix, {
+        agentId: opts.agentId,
+        threadId: thread.id,
+        ...(opts.socketPath && { socketPath: opts.socketPath }),
+      });
+      const cliResult = await cliBrain.runTurn({
+        system,
+        prompt: text,
+        ...(priorTranscript && { priorTranscript }),
+        ...(resumeSessionId && { resumeSessionId }),
+        bridge,
+        ...(thread.model && { model: thread.model }),
+        ...(thread.effort && { effort: thread.effort }),
+        signal: turnAbort.signal,
+        onTextDelta: (d) =>
+          opts.bus.publish({
+            type: "chat.assistant-delta",
+            hostId: opts.hostId,
+            actorId: opts.agentId,
+            parentEventId: origin.id,
+            threadId: thread.id,
+            durable: false,
+            payload: { text: d },
+          }),
+      });
+      // Fold usage into the accumulator so recordSpend writes one ledger row
+      // in both the success and error paths (priced $0 for `*-cli`).
+      turnUsage.inputTokens += cliResult.usage.inputTokens;
+      turnUsage.outputTokens += cliResult.usage.outputTokens;
+      turnUsage.cacheReadInputTokens += cliResult.usage.cacheReadInputTokens;
+      turnUsage.cacheCreationInputTokens += cliResult.usage.cacheCreationInputTokens;
+      turnUsage.totalTokens += cliResult.usage.totalTokens;
+      opts.bus.publish({
+        type: "chat.usage",
+        hostId: opts.hostId,
+        actorId: opts.agentId,
+        parentEventId: origin.id,
+        threadId: thread.id,
+        durable: false,
+        payload: { ...cliResult.usage },
+      });
+      if (cliResult.error) {
+        recordSpend();
+        // Drop a dead resume session id so the next turn opens fresh (re-sending
+        // the transcript) instead of retrying the same wedged `--resume` id
+        // forever. Keep transient/quota failures' session — the id is still
+        // valid there, the backend just hiccuped.
+        if (
+          thread.cliSession &&
+          cliResult.error.code !== "transient" &&
+          cliResult.error.code !== "quota"
+        ) {
+          thread.cliSession = {};
+        }
+        // Auth loss = the backend went dark. Durable signal the daemon
+        // watches to flip chat into a needs-login state (constraints feel
+        // like physics — the CLI logged out, the agent reflects that).
+        if (cliResult.error.code === "auth_required") {
+          opts.bus.publish({
+            type: "chat.cli-auth-lost",
+            hostId: opts.hostId,
+            actorId: opts.agentId,
+            parentEventId: origin.id,
+            threadId: thread.id,
+            durable: true,
+            payload: {
+              provider: cliBrain.provider,
+              ...(cliResult.error.loginHint && { loginHint: cliResult.error.loginHint }),
+            },
+          });
+        }
+        opts.bus.publish({
+          type: "chat.error",
+          hostId: opts.hostId,
+          actorId: opts.agentId,
+          parentEventId: origin.id,
+          threadId: thread.id,
+          durable: true,
+          payload: {
+            error: cliResult.error.message,
+            ...(cliResult.error.loginHint && { loginHint: cliResult.error.loginHint }),
+          },
+        });
+        if (agentDir) saveThread(agentDir, thread, redactions);
+        return;
+      }
+      thread.messages.push({ role: "assistant", content: cliResult.text });
+      thread.cliSession = {
+        ...(cliResult.sessionId && { sessionId: cliResult.sessionId }),
+      };
+      // Only advance the mail high-water mark when the system prompt (which
+      // carries the resolution sidebar) was actually sent. Resume turns skip
+      // the system prompt, so the agent never saw those resolutions — advancing
+      // here would silently mark them "seen" and they'd never render/deliver.
+      // (The API path advances unconditionally because it always sends system.)
+      if (!resumeSessionId && sidebar.mailHwmAfterRead != null) {
+        thread.mailHwm = Math.max(thread.mailHwm, sidebar.mailHwmAfterRead);
+      }
+      const recorded = recordSpend();
+      if (cliResult.text) {
+        opts.bus.publish({
+          type: "chat.assistant-text",
+          hostId: opts.hostId,
+          actorId: opts.agentId,
+          parentEventId: origin.id,
+          threadId: thread.id,
+          durable: true,
+          payload: { text: cliResult.text },
+        });
+      }
+      if (agentDir) saveThread(agentDir, thread, redactions);
+      opts.bus.publish({
+        type: "chat.turn-end",
+        hostId: opts.hostId,
+        actorId: opts.agentId,
+        parentEventId: origin.id,
+        threadId: thread.id,
+        durable: true,
+        payload: {
+          stopReason: cliResult.stopReason,
+          model: thread.model ?? spendModel,
+          inputTokens: cliResult.usage.inputTokens,
+          outputTokens: cliResult.usage.outputTokens,
+          cacheReadTokens: cliResult.usage.cacheReadInputTokens,
+          cacheCreationTokens: cliResult.usage.cacheCreationInputTokens,
+          totalTokens: cliResult.usage.totalTokens,
+          usdMicros: recorded?.usdMicros ?? 0,
+        },
+      });
       return;
     }
     const result = await runAgent({
@@ -977,11 +1158,35 @@ function relativeAgo(ms: number): string {
  *  ctx whose `extensionId` is the contributing extension's id, regardless
  *  of what the chat agent's shared toolCtx carries. Without this every
  *  extension tool would see whatever sentinel chat.ts plugged in. */
-function wrapExtensionTool(tool: ToolDef, extensionId: string): ToolDef {
+export function wrapExtensionTool(tool: ToolDef, extensionId: string): ToolDef {
   return {
     ...tool,
     execute: (args, ctx) => tool.execute(args, { ...ctx, extensionId }),
   } as ToolDef;
+}
+
+/** Render a message list into a plain-text transcript for the CLI-brain
+ *  path. Only used when a fresh CLI session opens on a thread that already
+ *  has history (post-restart) — the harness has no transcript flag, so we
+ *  fold prior turns into the prompt. Roles get a `User:`/`Assistant:` label;
+ *  tool blocks collapse to short markers (the durable audit lives in the
+ *  event log). */
+function renderTranscript(messages: Message[]): string {
+  return flattenMessages(messages, {
+    renderBlock: (block) => {
+      if (block.type === "text") return block.text;
+      if (block.type === "tool_use") return `[called ${block.name}]`;
+      if (block.type === "tool_result") {
+        const c = block.content;
+        return `[tool result: ${typeof c === "string" ? c : JSON.stringify(c)}]`;
+      }
+      return "";
+    },
+    label: (role, text) => {
+      const l = role === "user" ? "User" : role === "assistant" ? "Assistant" : role;
+      return `${l}: ${text}`;
+    },
+  });
 }
 
 /** Build a new thread's loaded set pre-populated with the names of every
@@ -1025,7 +1230,7 @@ export function wrapRegisterForAutoLoad(tool: ToolDef, deps: RegisterAutoLoadDep
   } as ToolDef;
 }
 
-function loadAgentScope(store: Store, agentId: string): AgentScope {
+export function loadAgentScope(store: Store, agentId: string): AgentScope {
   const row = store.select().from(tables.agents).where(eq(tables.agents.id, agentId)).all()[0];
   return (row?.scope as AgentScope) ?? {};
 }

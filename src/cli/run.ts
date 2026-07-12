@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
 import { startDaemon } from "../daemon/daemon.ts";
+import { MCP_BRIDGE_SUBCOMMAND } from "../mcp/contract.ts";
+import { cmdMcpBridge } from "./mcp-bridge.ts";
 import { enrichPathFromLoginShell } from "../daemon/path-env.ts";
 import { resolvePaths } from "../paths.ts";
 import { connectIpc } from "../ipc/client.ts";
@@ -119,6 +121,9 @@ export async function runCli(args: string[]): Promise<void> {
       return;
     case "budget":
       await cmdBudget(rest);
+      return;
+    case MCP_BRIDGE_SUBCOMMAND:
+      await cmdMcpBridge(rest);
       return;
     default:
       console.error(`Unknown command: ${cmd}`);

@@ -28,6 +28,7 @@ describe("starter templates", () => {
       "discord-communication",
       "freshrss",
       "github",
+      "local-llm",
       "telegram",
       "telegram-communication",
       "web",
@@ -46,7 +47,7 @@ describe("starter templates", () => {
     // register no tools, so they carry no catalog. The six that register tools
     // must: catalog binds prose to a category, and the category must be the
     // extension name on each ToolDef or the prose never binds.
-    const toolStarters = ["discord", "telegram", "github", "freshrss", "claude-code", "web"];
+    const toolStarters = ["discord", "telegram", "github", "freshrss", "claude-code", "web", "local-llm"];
     for (const name of toolStarters) {
       const s = getStarter(name)!;
       const mf = JSON.parse(s.files["manifest.json"]!);
@@ -74,7 +75,7 @@ describe("starter templates", () => {
 
   it("every starter ships a non-empty SETUP.md", () => {
     const starters = listStarters();
-    expect(starters.length).toBe(9);
+    expect(starters.length).toBe(10);
     for (const s of starters) {
       const setup = s.files["SETUP.md"];
       expect(setup, `${s.name} missing SETUP.md`).toBeDefined();
