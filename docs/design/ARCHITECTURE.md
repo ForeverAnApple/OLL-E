@@ -381,7 +381,7 @@ Trigger declarations are themselves authority statements for their `type` field 
 
 ### Starter templates (shipped read-only; agents clone and modify)
 
-Eight ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting what it does, the exact secrets and how to acquire them, and an install→set-secret→register→smoke walkthrough written for the agent to narrate conversationally. `install_starter` / `list_starters` return `hasSetupGuide` and nudge reading it before asking for secrets — so onboarding a channel is a conversation, not a guess.
+Nine ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting what it does, the exact secrets and how to acquire them, and an install→set-secret→register→smoke walkthrough written for the agent to narrate conversationally. `install_starter` / `list_starters` return `hasSetupGuide` and nudge reading it before asking for secrets — so onboarding a channel is a conversation, not a guess.
 
 - `discord` — bot gateway + message send/receive; hardened with RESUME + backoff, heartbeat-ACK zombie detection, 429 retry
 - `discord-communication` — wake-word chat behavior over the discord gateway; standing-job channel routing (lazy `getOrDeriveRoute`)
@@ -389,6 +389,7 @@ Eight ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting w
 - `telegram-communication` — structural port of `discord-communication` for Telegram, plus live replies: presence fires on `chat.input` publish, `chat.assistant-delta` streams through `telegram_stream` on a 1s latest-state-wins tick, turn-end finalizes in place with `telegram_send` as the never-drop fallback
 - `github` — webhook receiver + API calls (issues, PRs, comments); `github_activity` since-based delta tool
 - `freshrss` — Google Reader API (ClientLogin); `freshrss_unread` / `freshrss_feeds` (operational), `freshrss_mark_read` (strategic)
+- `web` — one `web_fetch(url)` tool (operational): SSRF-guarded fetch (private/link-local/CGNAT/loopback ranges blocked, DNS pre-resolution, manual redirect re-validation), hand-rolled HTML→markdown, 2MB download cap + `maxResultBytes` spill. No `web_search` — search needs a provider key and ranking opinions; separate proposal
 - `cron-trigger`
 - `claude-code` — subprocess invocation
 - `http-webhook-trigger` (v0.1), `slack` (v0.1), `codex` (v0.1)

@@ -16,6 +16,7 @@ import { github } from "./templates/github.ts";
 import { telegram } from "./templates/telegram.ts";
 import { telegramCommunication } from "./templates/telegram-communication.ts";
 import { freshrss } from "./templates/freshrss.ts";
+import { web } from "./templates/web.ts";
 
 export type { StarterTemplate };
 
@@ -28,6 +29,7 @@ const STARTERS: Record<string, StarterTemplate> = {
   telegram,
   "telegram-communication": telegramCommunication,
   freshrss,
+  web,
 };
 
 export function listStarters(): StarterTemplate[] {

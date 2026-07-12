@@ -1304,6 +1304,12 @@ The `ExtensionApi` contract shipped compiled away: no document, tool, or prompt 
 
 ---
 
+## 2026-07-11 — `web` starter: one `web_fetch(url)` tool
+
+Agents needed the public web (4 of 5 peer runtimes surveyed ship fetch; digests summarizing headlines want article bodies) and the alternative was each agent hand-rolling an unguarded fetch. Operational tier — read-only. Hand-rolled HTML→markdown, Bun built-ins only: the no-third-party-deps physics is load-bearing, not a nuisance. Download cap plus the existing `maxResultBytes` spill; SSRF guard blocks private/link-local/CGNAT/loopback ranges with DNS pre-resolution and manual redirect re-validation per hop (DNS-rebind TOCTOU between lookup and fetch is an accepted, commented limitation at this tier). `web_search` deliberately excluded — search needs a provider key and ranking opinions; that's a future proposal, not a fetch.
+
+---
+
 ## 2026-07-11 — Docs-as-files delivery for the API reference
 
 Boot writes the embedded reference (Bun text import, the same binary-embed mechanism the migrations use) to `~/.olle/extensions/.docs/extension-api.md` — host-actor commit, only when content changed, so a binary upgrade shows up as a readable diff in the extensions repo: the world's physics changed and the change is visible history. The stable system segment gains a two-line router pointing at it (~40 resting tokens, cached). Rejected alternatives, for the record: catalog inlining (pays the token cost every turn inside the prefix self-modification already thrashes), a dedicated docs tool (a new tool whose entire behavior is "read a file"), memory rows (the contract is a world fact, identical for every agent and versioned with the binary — not identity; memories hold what an agent *learned about* authoring, not the reference itself). One mechanical discovery: `read_extension_file`'s name validation rejected dotted names, so `.docs` is an explicit read-only allowance — `write_extension` still can't touch it, and extension discovery already skips dot-entries.

@@ -30,6 +30,7 @@ describe("starter templates", () => {
       "github",
       "telegram",
       "telegram-communication",
+      "web",
     ]);
     for (const s of listStarters()) {
       const mfRaw = s.files["manifest.json"];
@@ -49,7 +50,7 @@ describe("starter templates", () => {
 
   it("every starter ships a non-empty SETUP.md", () => {
     const starters = listStarters();
-    expect(starters.length).toBe(8);
+    expect(starters.length).toBe(9);
     for (const s of starters) {
       const setup = s.files["SETUP.md"];
       expect(setup, `${s.name} missing SETUP.md`).toBeDefined();
