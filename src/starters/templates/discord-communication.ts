@@ -7,7 +7,7 @@ export const discordCommunication: StarterTemplate = {
     "manifest.json": JSON.stringify(
       {
         name: "discord-communication",
-        version: "0.1.0",
+        version: "0.2.0",
         description: "Wake-word + DM bridge between Discord and the chat agent.",
         capabilities: ["bridge:discord-chat"],
         callsTools: ["discord_send"],
@@ -18,7 +18,7 @@ export const discordCommunication: StarterTemplate = {
           "chat.turn-end",
           "chat.error",
         ],
-        eventWrites: ["chat.input"],
+        eventWrites: ["chat.input", "delivery.succeeded", "delivery.failed"],
         config: {
           wakeWord: "olle",
           watchedChannels: [] as string[],
@@ -98,6 +98,11 @@ const turnExplicitSend = new Set<string>();
 // ids): any discord:<channelId>:... threadId with no stored route delivers
 // channel-only, no reply_to.
 const DISCORD_THREAD_RE = /^discord:([^:]+):/;
+
+// Standing-job threads are discord:<channelId>:job:<jobId>. jobId is not a
+// payload field at the turn-end emit site — it only lives in the threadId,
+// so delivery-audit events parse it back out.
+const JOB_THREAD_RE = /:job:([^:]+)$/;
 
 let cfg: Config | null = null;
 let wakeRe: RegExp | null = null;
@@ -219,6 +224,7 @@ export function register(api: any) {
     const actor = turnActors.get(threadId);
     turnActors.delete(threadId);
     const explicit = turnExplicitSend.delete(threadId);
+    const jobId = JOB_THREAD_RE.exec(threadId)?.[1];
     try {
       // If the agent already called discord_send explicitly this turn, the
       // prose was already delivered (or intentionally omitted). Don't
@@ -231,9 +237,30 @@ export function register(api: any) {
           sendArgs,
           actor ? { asAgent: actor } : undefined,
         );
+        // Delivery landed. Durable audit so the agent can see its own reach
+        // via query_events. Nothing-to-say / explicit-send emits nothing —
+        // no bridge delivery was attempted.
+        api.publish(
+          "delivery.succeeded",
+          { channel: "discord", threadId, destination: route.channelId, ...(jobId ? { jobId } : {}) },
+          { durable: true, threadId },
+        );
       }
     } catch (err) {
       console.error("[discord-communication] discord_send failed:", (err as Error).message);
+      // Durable failure audit: without this a dropped reply is invisible to
+      // query_events and the agent never learns its message didn't land.
+      api.publish(
+        "delivery.failed",
+        {
+          channel: "discord",
+          threadId,
+          destination: route.channelId,
+          ...(jobId ? { jobId } : {}),
+          error: (err as Error).message,
+        },
+        { durable: true, threadId },
+      );
     } finally {
       evictDerived(threadId);
     }

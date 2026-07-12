@@ -1298,6 +1298,12 @@ Three prior entries parked agent-direct task authoring behind extension packagin
 
 ---
 
+## 2026-07-11 — Delivery-audit events from the channel bridges
+
+A Telegram or Discord delivery failure was a `console.error` — invisible to `query_events`, the inbox, and the agent itself, so a standing job could "succeed" while its digest landed nowhere. Both communication bridges now publish durable `delivery.succeeded` / `delivery.failed` at turn-end delivery, payload `{ channel, threadId, destination, jobId?, error? }` with `jobId` parsed from the `:job:` thread suffix (it exists nowhere else at the emit site). Deliberately minimal: an event convention plus two template edits — no new query surface, no core changes — so observability parity holds by construction (`query_events` for agents, `olle events` for the human). The quiet-cancel/explicit branch emits nothing, because no bridge delivery was attempted. The convention is documented in the extension API reference for future bridges.
+
+---
+
 ## 2026-07-11 — Revoke `api` after unload
 
 `purgeRegistry` unsubscribed, stopped triggers, and evicted tools — but an `api` captured in a timer or promise chain could still `publish`/`callTool` after unload: events attributed to a dead registration, a provenance lie in a system whose federation story *is* provenance (pi-mono's staleness-poisoning, adapted). A per-load `revoked` flag is now checked by every api action method plus the task-emit wrapper; post-unload calls throw `extensions: "<name>" was unloaded; re-register before acting`, while a revoked trigger's `emit` drops silently (it fires from background timers, where a throw would crash the timer loop rather than inform anyone). Flag over Proxy: a handful of explicit guard lines, no reflection magic, same fail-closed result. Reload mints a fresh record, so the new api works while stale references keep throwing. Corollary contract: `unload()` runs after revocation and must not call api methods.

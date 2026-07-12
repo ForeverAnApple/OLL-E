@@ -185,6 +185,8 @@ A standing job is a cron'd natural-language instruction — how the agent makes 
 
 Bridges parse any `^(discord|telegram):<id>:` thread they hold no stored inbound route for and deliver channel-only (no `reply_to`) — one parse contract (`CHANNEL_THREAD_PREFIX_RE`) shared by tool, scheduler, and bridges.
 
+**Delivery is audited.** After attempting to deliver a turn's output, each bridge publishes a durable `delivery.succeeded` or `delivery.failed` event — payload `{ channel, threadId, destination, jobId?, error? }`, `jobId` parsed from the `:job:` thread suffix. A standing job whose digest lands nowhere is no longer invisible: the failure sits in `query_events` / `olle events` next to the `schedule.fired` that caused it. The convention is part of the bridge contract; future channel bridges emit the same pair.
+
 **Misfire policy: skip missed-while-down.** Arming computes the next *future* fire; a daemon asleep across a scheduled time does not replay it on boot. A standing job's value is fresh-at-fire-time, so a missed fire is dropped rather than replayed stale — no catch-up burst.
 
 New durable events: `schedule.armed`, `schedule.cancelled`, `schedule.fired`.

@@ -8,7 +8,7 @@ export const telegramCommunication: StarterTemplate = {
     "manifest.json": JSON.stringify(
       {
         name: "telegram-communication",
-        version: "0.2.0",
+        version: "0.3.0",
         description: "Wake-word + DM bridge between Telegram and the chat agent, with live streamed replies.",
         capabilities: ["bridge:telegram-chat"],
         callsTools: ["telegram_send", "telegram_stream"],
@@ -20,7 +20,7 @@ export const telegramCommunication: StarterTemplate = {
           "chat.turn-end",
           "chat.error",
         ],
-        eventWrites: ["chat.input"],
+        eventWrites: ["chat.input", "delivery.succeeded", "delivery.failed"],
         config: {
           wakeWord: "olle",
           watchedChats: [] as string[],
@@ -115,6 +115,11 @@ const STREAM_TICK_MS = 1_000;
 // Loose bridge parse contract: any telegram:<chatId>:... threadId with no
 // stored route delivers chat-only, no reply_to.
 const TELEGRAM_THREAD_RE = /^telegram:([^:]+):/;
+
+// Standing-job threads are telegram:<chatId>:job:<jobId>. jobId is not a
+// payload field at the turn-end emit sites — it only lives in the threadId,
+// so delivery-audit events parse it back out.
+const JOB_THREAD_RE = /:job:([^:]+)$/;
 
 let cfg: Config | null = null;
 let wakeRe: RegExp | null = null;
@@ -291,6 +296,7 @@ export function register(api: any) {
     const opts = actorOpts(threadId);
     turnActors.delete(threadId);
     const explicit = turnExplicitSend.delete(threadId);
+    const jobId = JOB_THREAD_RE.exec(threadId)?.[1];
     try {
       if (text && !explicit) {
         const args: Record<string, unknown> = { session: threadId, chat_id: route.chatId, phase: "finalize", text };
@@ -304,15 +310,36 @@ export function register(api: any) {
           if (route.originMessageId) sendArgs.reply_to = route.originMessageId;
           await api.callTool("telegram_send", sendArgs, opts);
         }
+        // Delivery landed (stream or the send floor). Durable audit so the
+        // agent can see its own reach via query_events.
+        api.publish(
+          "delivery.succeeded",
+          { channel: "telegram", threadId, destination: route.chatId, ...(jobId ? { jobId } : {}) },
+          { durable: true, threadId },
+        );
       } else {
         // Nothing to say (or the agent already sent explicitly) — tear
-        // down presence and any partial quietly.
+        // down presence and any partial quietly. No delivery was attempted,
+        // so no delivery-audit event.
         void api
           .callTool("telegram_stream", { session: threadId, chat_id: route.chatId, phase: "cancel" }, opts)
           .catch(() => {});
       }
     } catch (err) {
       console.error("[telegram-communication] delivery failed:", (err as Error).message);
+      // Durable failure audit: without this a dropped reply is invisible to
+      // query_events and the agent never learns its message didn't land.
+      api.publish(
+        "delivery.failed",
+        {
+          channel: "telegram",
+          threadId,
+          destination: route.chatId,
+          ...(jobId ? { jobId } : {}),
+          error: (err as Error).message,
+        },
+        { durable: true, threadId },
+      );
     } finally {
       evictDerived(threadId);
     }
