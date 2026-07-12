@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { buildMetaTools, normalizeFiles } from "../src/tools/meta.ts";
 import { ensureRepo, git } from "../src/extensions/git.ts";
+import { syncExtensionDocs } from "../src/extensions/docs.ts";
 import type { ExtensionHost } from "../src/extensions/index.ts";
 import type { OllePaths } from "../src/paths.ts";
 
@@ -288,6 +289,64 @@ describe("write_extension — working tree matches the reported commit", () => {
       // Nothing written, nothing committed.
       expect(readdirSync(join(extDir, "freshrss"))).toEqual(["manifest.json"]);
       expect(git(extDir, ["rev-parse", "HEAD"]).stdout.trim()).toBe(before);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("read_extension_file — .docs allowance", () => {
+  function seed() {
+    const root = mkdtempSync(join(tmpdir(), "olle-docs-read-"));
+    const extDir = join(root, "extensions");
+    mkdirSync(extDir, { recursive: true });
+    ensureRepo(extDir);
+    syncExtensionDocs(extDir);
+    return { root, extDir };
+  }
+
+  function tools(extDir: string) {
+    return buildMetaTools({
+      extensions: mockExtensions(),
+      extensionsDir: extDir,
+      authorName: "agent-1",
+    });
+  }
+
+  it("reads the synced extension API reference", async () => {
+    const { root, extDir } = seed();
+    try {
+      const readFile = tools(extDir).find((t) => t.name === "read_extension_file")!;
+      const res = (await readFile.execute(
+        { name: ".docs", path: "extension-api.md" },
+        CTX,
+      )) as { content: string; bytes: number };
+      expect(res.bytes).toBeGreaterThan(0);
+      expect(res.content.length).toBeGreaterThan(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("write_extension still rejects the .docs name", async () => {
+    const { root, extDir } = seed();
+    try {
+      const write = tools(extDir).find((t) => t.name === "write_extension")!;
+      await expect(
+        write.execute({ name: ".docs", files: { "x.md": "hi" } }, CTX),
+      ).rejects.toThrow(/invalid name/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects path traversal out of .docs", async () => {
+    const { root, extDir } = seed();
+    try {
+      const readFile = tools(extDir).find((t) => t.name === "read_extension_file")!;
+      await expect(
+        readFile.execute({ name: ".docs", path: "../secrets/x" }, CTX),
+      ).rejects.toThrow(/escapes extension dir/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

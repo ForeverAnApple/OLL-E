@@ -1304,6 +1304,12 @@ The `ExtensionApi` contract shipped compiled away: no document, tool, or prompt 
 
 ---
 
+## 2026-07-11 — Docs-as-files delivery for the API reference
+
+Boot writes the embedded reference (Bun text import, the same binary-embed mechanism the migrations use) to `~/.olle/extensions/.docs/extension-api.md` — host-actor commit, only when content changed, so a binary upgrade shows up as a readable diff in the extensions repo: the world's physics changed and the change is visible history. The stable system segment gains a two-line router pointing at it (~40 resting tokens, cached). Rejected alternatives, for the record: catalog inlining (pays the token cost every turn inside the prefix self-modification already thrashes), a dedicated docs tool (a new tool whose entire behavior is "read a file"), memory rows (the contract is a world fact, identical for every agent and versioned with the binary — not identity; memories hold what an agent *learned about* authoring, not the reference itself). One mechanical discovery: `read_extension_file`'s name validation rejected dotted names, so `.docs` is an explicit read-only allowance — `write_extension` still can't touch it, and extension discovery already skips dot-entries.
+
+---
+
 ## 2026-07-11 — Delivery-audit events from the channel bridges
 
 A Telegram or Discord delivery failure was a `console.error` — invisible to `query_events`, the inbox, and the agent itself, so a standing job could "succeed" while its digest landed nowhere. Both communication bridges now publish durable `delivery.succeeded` / `delivery.failed` at turn-end delivery, payload `{ channel, threadId, destination, jobId?, error? }` with `jobId` parsed from the `:job:` thread suffix (it exists nowhere else at the emit site). Deliberately minimal: an event convention plus two template edits — no new query surface, no core changes — so observability parity holds by construction (`query_events` for agents, `olle events` for the human). The quiet-cancel/explicit branch emits nothing, because no bridge delivery was attempted. The convention is documented in the extension API reference for future bridges.

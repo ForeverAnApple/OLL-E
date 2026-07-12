@@ -51,6 +51,8 @@ Each host runs one long-lived **daemon** process. Any number of **thin clients**
   config.toml            # host config (principals, budgets, paths, secrets ref)
   extensions/            # git repo; agents write here; hot-reloaded
     .git/
+    .docs/
+      extension-api.md   # API reference, synced from the binary at boot (host-actor commit)
     discord/             # starter or agent-authored
       manifest.json
       index.ts
@@ -370,7 +372,7 @@ Trigger declarations are themselves authority statements for their `type` field 
 - Decision-inbox router
 - CLI chat handler (channel-of-first-contact)
 - Scratch filesystem tool
-- Meta-tools: `write_extension`, `run_smoke_test`, `register_extension`, `revert_extension`, `read_extension_file`, `extension_history`, `query_host_context`
+- Meta-tools: `write_extension`, `run_smoke_test`, `register_extension`, `revert_extension`, `read_extension_file`, `extension_history`, `query_host_context`. `read_extension_file` also reaches `.docs/` (the boot-synced API reference); `write_extension` cannot — the reference is read-only to agents
 - Loadout meta-tools: `load_tools`, `unload_tools` — bring deferred tool schemas into / out of a thread's context (see "Tool catalog and lazy loading")
 - Observability tools: `query_my_usage`, `query_my_budget`, `query_my_runs`, `query_my_threads`, `query_self`, `query_events` — agents read their own world; CLI uses the same query layer
 - Tool-result recovery: `read_tool_result` — fetch a slice of a spilled tool output by handle (see "Tool-result truncation")

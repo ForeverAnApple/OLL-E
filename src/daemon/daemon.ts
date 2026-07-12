@@ -3,6 +3,7 @@ import { openStore, tables, type Store } from "../store/index.ts";
 import { createBus, persistToStore, type EventBus, type Unsubscribe } from "../bus/index.ts";
 import { createIpcServer, type IpcServer } from "../ipc/server.ts";
 import { createExtensionHost, ensureRepo, type ExtensionHost } from "../extensions/index.ts";
+import { syncExtensionDocs } from "../extensions/docs.ts";
 import { createLedger, type Ledger } from "../ledger/index.ts";
 import { createScheduler, type Scheduler } from "../scheduler/index.ts";
 import {
@@ -199,6 +200,9 @@ export async function startDaemon(opts: StartDaemonOptions = {}): Promise<Daemon
     : [];
 
   ensureRepo(paths.extensionsDir);
+  // Materialize the embedded extension API contract into the repo so agents
+  // can read it via read_extension_file. Idempotent — only a changed doc writes.
+  syncExtensionDocs(paths.extensionsDir);
   const extensions = createExtensionHost({
     bus,
     store,
@@ -1033,6 +1037,7 @@ function buildNormalPrompt(paths: OllePaths, hostId: string): string {
     "You live inside OLL-E — a habitat for agents like you. OLL-E is yours to reshape: when the world is missing something you need, extend it.",
     buildHostContextPrompt(paths, hostId),
     "Your tools live in a catalog (rendered below). Most schemas are deferred — call `load_tools([\"name\"])` to pull them into context for this thread; the schema appears on the next turn. The catalog tells you what exists; loading is the act of picking it up. Unload with `unload_tools` when done.",
+    "The extension API contract lives at `.docs/extension-api.md` inside your extensions directory. Before authoring or modifying an extension from scratch, read it completely via `read_extension_file(name: \".docs\", path: \"extension-api.md\")` — starters are worked examples; the doc is the contract.",
     "The five tools you always carry — `load_tools`, `query_self`, `mail_list`, `memory_search`, `memory_write` — are in your tool list every turn without loading. Use `query_self` to orient at the start of strategic work; `mail_list` to see open decisions awaiting your principal's response; `memory_search` and `memory_write` to recall and record what matters.",
     "Never block a human waiting for slow work — delegate via `spawn_agent`. The mailbox sidebar shows live threads; load `query_my_threads` for the durable thread inventory.",
     "When something feels off, look first (load `query_my_usage` / `query_my_runs` / `query_events`).",
