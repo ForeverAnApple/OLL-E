@@ -72,6 +72,9 @@ describe("web starter — pure helpers", () => {
       "fe80::1",
       "::ffff:10.0.0.1",
       "::ffff:169.254.169.254",
+      "::ffff:7f00:1", // hex form of ::ffff:127.0.0.1 — the SSRF bypass this closes
+      "::ffff:a00:1", // hex form of ::ffff:10.0.0.1
+      "64:ff9b::7f00:1", // NAT64 wrapping 127.0.0.1
     ];
     for (const ip of priv) {
       expect(isPrivateAddress(ip), `${ip} should be private`).toBe(true);
@@ -89,6 +92,7 @@ describe("web starter — pure helpers", () => {
       "100.128.0.1", // just above 100.64/10
       "2606:2800:220:1:248:1893:25c8:1946",
       "::ffff:8.8.8.8",
+      "::ffff:5db8:d822", // hex form of ::ffff:93.184.216.34 (public)
     ];
     for (const ip of pub) {
       expect(isPrivateAddress(ip), `${ip} should be public`).toBe(false);
@@ -126,7 +130,12 @@ describe("web starter — web_fetch via extension host", () => {
         abort: new AbortController().signal,
         secrets: {},
       };
-      for (const url of ["http://127.0.0.1:1/", "http://localhost/x", "http://10.0.0.1/"]) {
+      for (const url of [
+        "http://127.0.0.1:1/",
+        "http://localhost/x",
+        "http://10.0.0.1/",
+        "http://[::ffff:7f00:1]/", // hex IPv4-mapped loopback — the closed bypass
+      ]) {
         await expect(tool.execute({ url }, ctx as never), url).rejects.toThrow(/SSRF/);
       }
     } finally {

@@ -32,6 +32,7 @@ import {
   history as gitHistory,
   revertSubtree,
 } from "../extensions/git.ts";
+import { DOCS_SUBPATH } from "../extensions/docs.ts";
 import { validateManifestWithWarnings } from "../extensions/manifest.ts";
 import { getStarter, hasSetupGuide, installStarter, listStarters } from "../starters/index.ts";
 
@@ -281,7 +282,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
     category: "extension authoring",
     shortClause: "read manifest / index.ts / smoke.ts before editing",
     description:
-      "Read a file from a named extension's directory (e.g. manifest.json, index.ts, smoke.ts). Use this to inspect your own habitat before editing — reading beats guessing at error strings. The special name \".docs\" reads the shared docs dir — read `read_extension_file(name: \".docs\", path: \"extension-api.md\")` for the extension API contract before authoring from scratch. Paths are relative to the extension dir and must not escape it.",
+      `Read a file from a named extension's directory (e.g. manifest.json, index.ts, smoke.ts). Use this to inspect your own habitat before editing — reading beats guessing at error strings. The special name "${DOCS_SUBPATH}" reads the shared docs dir — read read_extension_file(name: "${DOCS_SUBPATH}", path: "extension-api.md") for the extension API contract before authoring from scratch. Paths are relative to the extension dir and must not escape it.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -295,10 +296,10 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
       additionalProperties: false,
     },
     execute: async ({ name, path }) => {
-      // `.docs` is the one dotted name allowed — it holds the shared extension
-      // API reference synced at boot. write_extension still rejects it (its
-      // regex forbids a leading dot), so this stays read-only.
-      if (name !== ".docs" && !/^[a-z0-9][a-z0-9-_]*$/.test(name)) {
+      // DOCS_SUBPATH is the one dotted name allowed — it holds the shared
+      // extension API reference synced at boot. write_extension still rejects it
+      // (its regex forbids a leading dot), so this stays read-only.
+      if (name !== DOCS_SUBPATH && !/^[a-z0-9][a-z0-9-_]*$/.test(name)) {
         throw new Error(`read_extension_file: invalid extension name "${name}"`);
       }
       const base = join(extensionsDir, name);

@@ -111,4 +111,15 @@ describe("extension-api.md", () => {
     expect(doc).toContain("ext:<name>:<id>");
     expect(doc).toContain("smokeTest");
   });
+
+  test("warns that execute's ctx.secrets is empty on agent-invoked calls", () => {
+    // The runtime hands agent-invoked execute() a shared ctx with secrets: {}
+    // (chat.ts). A tool reading ctx.secrets passes smoke (smoke ctx IS populated)
+    // then gets undefined live. Pin the footgun and the api.secrets fix so the
+    // doc can't silently regress to the old "ctx.secrets = your manifest.secrets".
+    expect(doc).toContain("ctx.secrets` is empty on agent-invoked");
+    expect(doc).toMatch(/api\.secrets` closure/);
+    // The old, false claim must not reappear.
+    expect(doc).not.toContain("ctx.secrets      - YOUR manifest.secrets");
+  });
 });

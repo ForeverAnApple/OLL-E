@@ -102,15 +102,31 @@ function isPrivateV4(ip: string): boolean {
 // Expand a (possibly ::-compressed) IPv6 literal into 16 bytes. Returns null
 // for anything malformed — callers treat null as "not classified private".
 function expandV6(addr: string): number[] | null {
+  // A trailing dotted-quad is the standard textual form for the last 32 bits
+  // (x:x:x:x:x:x:d.d.d.d, e.g. ::ffff:127.0.0.1). Fold it into two hex groups
+  // up front so the rest of the expansion — and the byte-level checks that
+  // read the result — see one uniform 16-bit-group representation. Without
+  // this, parseInt("127.0.0.1", 16) would silently truncate to 127.
+  let work = addr;
+  const v4Tail = work.match(/(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4Tail) {
+    const octets = v4Tail[1].split(".").map(Number);
+    if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) {
+      return null;
+    }
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    work = work.slice(0, v4Tail.index) + hi + ":" + lo;
+  }
   let head: string[];
   let tail: string[];
-  if (addr.includes("::")) {
-    const halves = addr.split("::");
+  if (work.includes("::")) {
+    const halves = work.split("::");
     if (halves.length !== 2) return null;
     head = halves[0] ? halves[0].split(":") : [];
     tail = halves[1] ? halves[1].split(":") : [];
   } else {
-    head = addr.split(":");
+    head = work.split(":");
     tail = [];
   }
   const missing = 8 - (head.length + tail.length);
@@ -133,11 +149,23 @@ function isPrivateV6(ip: string): boolean {
   let addr = ip.toLowerCase();
   const pct = addr.indexOf("%"); // strip zone id
   if (pct >= 0) addr = addr.slice(0, pct);
-  // IPv4-mapped (::ffff:x.x.x.x) — unwrap and re-check as IPv4.
-  const mapped = addr.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return isPrivateV4(mapped[1]);
   const bytes = expandV6(addr);
   if (!bytes) return false;
+  // Embedded-IPv4 ranges carry a real v4 address in the last 4 bytes, so
+  // classify by that address — not the v6 wrapper. Working at the byte level
+  // catches every textual form once expandV6 has normalized it: dotted
+  // (::ffff:127.0.0.1) and hex (::ffff:7f00:1) alike. This closes the
+  // hex-form loopback bypass that a string regex on the dotted form missed.
+  //   ::ffff:0:0/96  IPv4-mapped  (bytes 0-9 zero, bytes 10-11 = 0xff)
+  //   64:ff9b::/96   NAT64        (bytes 0-11 = 00 64 ff 9b 00..00)
+  const mappedV4 = bytes.slice(0, 10).every((b) => b === 0) && bytes[10] === 0xff && bytes[11] === 0xff;
+  const nat64 =
+    bytes[0] === 0x00 &&
+    bytes[1] === 0x64 &&
+    bytes[2] === 0xff &&
+    bytes[3] === 0x9b &&
+    bytes.slice(4, 12).every((b) => b === 0);
+  if (mappedV4 || nat64) return isPrivateV4(bytes.slice(12).join("."));
   if (bytes.every((b, i) => (i < 15 ? b === 0 : b === 1))) return true; // ::1
   if (bytes.every((b) => b === 0)) return true; // ::
   if ((bytes[0] & 0xfe) === 0xfc) return true; // fc00::/7 unique-local
@@ -294,8 +322,7 @@ interface FetchCtx {
   abort?: AbortSignal;
 }
 
-async function webFetch(args: { url: string }, ctx: FetchCtx) {
-  const config = loadConfig();
+async function webFetch(args: { url: string }, ctx: FetchCtx, config: WebConfig) {
   const timeoutSignal = AbortSignal.timeout(config.timeoutMs);
   const signal = ctx?.abort ? AbortSignal.any([timeoutSignal, ctx.abort]) : timeoutSignal;
 
@@ -343,6 +370,9 @@ async function webFetch(args: { url: string }, ctx: FetchCtx) {
 }
 
 export function register(api: any) {
+  // Parse manifest config once at register time; it is immutable for the
+  // process lifetime, so re-reading it on every web_fetch call is wasted I/O.
+  const config = loadConfig();
   api.registerTool({
     name: "web_fetch",
     description:
@@ -359,7 +389,7 @@ export function register(api: any) {
       required: ["url"],
       additionalProperties: false,
     },
-    execute: webFetch,
+    execute: (args: { url: string }, ctx: FetchCtx) => webFetch(args, ctx, config),
   });
 }
 `,

@@ -178,10 +178,31 @@ api.registerTool({
     // ctx.extensionId  - the extension that OWNS this tool
     // ctx.actorId      - who is calling (agent id, or caller extension id via callTool)
     // ctx.abort        - AbortSignal; honor it in long fetches
-    // ctx.secrets      - YOUR manifest.secrets, freshly resolved (rotation propagates without reload)
+    // ctx.secrets      - EMPTY {} when an agent calls your tool. Do NOT read secrets here.
+    //                    Read them from the `api.secrets` closure in register() instead (below).
     return { ok: true };         // JSON-serializable
   },
 });
+```
+
+**FOOTGUN — `ctx.secrets` is empty on agent-invoked `execute`.** When the agent calls your tool from a chat turn, the runtime hands `execute` a shared ctx with `secrets: {}` — your manifest secrets are NOT there. (They *are* resolved for smoke, triggers, task handlers, and `callTool` targets, so a tool that reads `ctx.secrets.MY_TOKEN` passes smoke and then gets `undefined` on every live call — a bug that only shows in production.) The one correct place to read a secret in a tool is the `api.secrets` closure captured in `register()`, exactly as every starter does:
+
+```ts
+export function register(api) {
+  const token = api.secrets.MY_TOKEN;   // resolved at load; capture it here
+  api.registerTool({
+    name: "myext_send",
+    description: "...",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    async execute(args) {
+      // use the captured `token` — never args' ctx.secrets
+      const r = await fetch("https://api.example.com/send", {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      return { ok: r.ok };
+    },
+  });
+}
 ```
 
 **First-wins name collision.** A tool name is a single slot in the host registry. If the name is taken — by another extension or a double-register from your own — your registration is **dropped with a warning** and a non-durable `tool.collision-rejected` event; `register()` does not throw. Namespace your tools (`myext_fetch`, not `fetch`).
