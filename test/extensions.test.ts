@@ -1053,3 +1053,143 @@ describe("secrets + scratch dir", () => {
     expect(existsSync(join(tmp, "secret-ext", ".scratch"))).toBe(true);
   });
 });
+
+describe("api revocation after unload", () => {
+  const UNLOADED = /was unloaded; re-register before acting/;
+
+  // Extensions stash their api / emit on globalThis so the test can act on
+  // the reference after unload. Clear the stashes so tests don't cross-talk.
+  type CapturedApi = {
+    publish: (type: string, payload: unknown) => void;
+    callTool: (name: string, args: unknown) => Promise<unknown>;
+    on: (event: string, handler: () => void) => unknown;
+    registerTool: (tool: unknown) => void;
+  };
+  const stash = () =>
+    globalThis as unknown as {
+      __ext_captured?: CapturedApi;
+      __ext_apis?: CapturedApi[];
+      __ext_emit?: (payload: unknown) => void;
+    };
+  afterEach(() => {
+    const g = stash();
+    delete g.__ext_captured;
+    delete g.__ext_apis;
+    delete g.__ext_emit;
+  });
+
+  it("revokes every captured api method after unload", async () => {
+    const r = rig();
+    writeExt(tmp, "stasher", {
+      manifest: { name: "stasher", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          globalThis.__ext_captured = api;
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("stasher");
+    await host.unload("stasher");
+
+    const captured = stash().__ext_captured!;
+    expect(() => captured.publish("x", {})).toThrow(UNLOADED);
+    await expect(captured.callTool("y", {})).rejects.toThrow(UNLOADED);
+    expect(() => captured.on("z", () => {})).toThrow(UNLOADED);
+    expect(() =>
+      captured.registerTool({
+        name: "revoked_tool",
+        description: "d",
+        inputSchema: { type: "object" },
+        execute: () => "ok",
+      }),
+    ).toThrow(UNLOADED);
+  });
+
+  it("mints a fresh api on reload while the old one stays revoked", async () => {
+    const r = rig();
+    writeExt(tmp, "reloader", {
+      manifest: { name: "reloader", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          (globalThis.__ext_apis ||= []).push(api);
+          api.registerTool({
+            name: "reloader_tool",
+            description: "d",
+            inputSchema: { type: "object" },
+            execute: () => "ok",
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("reloader");
+    await host.reload("reloader");
+
+    const apis = stash().__ext_apis!;
+    expect(apis).toHaveLength(2);
+    const [oldApi, newApi] = apis;
+
+    // The pre-reload reference is dead...
+    expect(() => oldApi!.publish("x", {})).toThrow(UNLOADED);
+    // ...while the reload's own registration landed and its api still acts.
+    expect(host.tools().find((t) => t.tool.name === "reloader_tool")).toBeDefined();
+    expect(() =>
+      newApi!.registerTool({
+        name: "reloader_tool_2",
+        description: "d",
+        inputSchema: { type: "object" },
+        execute: () => "ok",
+      }),
+    ).not.toThrow();
+  });
+
+  it("revokes the api when register throws (failed-load rollback)", async () => {
+    const r = rig();
+    writeExt(tmp, "thrower", {
+      manifest: { name: "thrower", version: "0.1.0", eventReads: ["chat.input"] },
+      index: `
+        export function register(api) {
+          globalThis.__ext_captured = api;
+          api.on("chat.input", () => {});
+          throw new Error("register blew up");
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await expect(host.load("thrower")).rejects.toThrow(/register blew up/);
+
+    const captured = stash().__ext_captured!;
+    expect(() => captured.publish("x", {})).toThrow(UNLOADED);
+  });
+
+  it("silences a trigger's captured emit after unload", async () => {
+    const r = rig();
+    const seen: unknown[] = [];
+    r.bus.subscribe("tick", (ev) => {
+      seen.push(ev.payload);
+    });
+    writeExt(tmp, "ticker", {
+      manifest: { name: "ticker", version: "0.1.0" },
+      index: `
+        export function register(api) {
+          api.registerTrigger({
+            name: "ticker",
+            type: "tick",
+            start(emit) {
+              globalThis.__ext_emit = emit;
+              emit({ n: 1 });
+            },
+          });
+        }
+      `,
+    });
+    const host = createExtensionHost({ ...r, extensionsDir: tmp });
+    await host.load("ticker");
+    expect(seen).toEqual([{ n: 1 }]);
+
+    await host.unload("ticker");
+    stash().__ext_emit!({ n: 2 }); // fired after unload — dropped, not published
+    expect(seen).toEqual([{ n: 1 }]);
+  });
+});

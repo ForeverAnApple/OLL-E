@@ -1298,6 +1298,12 @@ Three prior entries parked agent-direct task authoring behind extension packagin
 
 ---
 
+## 2026-07-11 — Revoke `api` after unload
+
+`purgeRegistry` unsubscribed, stopped triggers, and evicted tools — but an `api` captured in a timer or promise chain could still `publish`/`callTool` after unload: events attributed to a dead registration, a provenance lie in a system whose federation story *is* provenance (pi-mono's staleness-poisoning, adapted). A per-load `revoked` flag is now checked by every api action method plus the task-emit wrapper; post-unload calls throw `extensions: "<name>" was unloaded; re-register before acting`, while a revoked trigger's `emit` drops silently (it fires from background timers, where a throw would crash the timer loop rather than inform anyone). Flag over Proxy: a handful of explicit guard lines, no reflection magic, same fail-closed result. Reload mints a fresh record, so the new api works while stale references keep throwing. Corollary contract: `unload()` runs after revocation and must not call api methods.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.

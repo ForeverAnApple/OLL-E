@@ -9,8 +9,9 @@
 //  5. Track failure counts; on >=2 failures within 5 minutes mark crashed
 //     and emit extension.crashed so the inbox can offer revert.
 //
-// Hot-reload: unload(old) → reload(same name). We rely on Bun's dynamic
-// import and bust the module cache via a query-string cache-buster.
+// Hot-reload: unload(old) → reload(same name). Bun's ESM cache is keyed by
+// resolved path and ignores query strings, so we bust it by staging a fresh
+// copy under a uniquely-named dir (see stage()) rather than a query-string.
 
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -141,6 +142,11 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   const toolsByName = new Map<string, RegisteredToolEntry>();
   const triggersByExt = new Map<string, RegisteredTriggerEntry[]>();
   const tasksByExt = new Map<string, RegisteredTaskEntry[]>();
+  // One record per load, keyed by extensionId. Captured by closure into that
+  // load's api + trigger emits; purgeRegistry flips `revoked` so every stale
+  // reference throws. A reload builds a fresh record, so the new api works
+  // while the old captured one stays revoked.
+  const revocations = new Map<string, { revoked: boolean }>();
   const failureLog = new Map<string, number[]>();
   const threshold = opts.failureThreshold ?? 2;
   const windowMs = opts.failureWindowMs ?? 5 * 60 * 1000;
@@ -213,7 +219,12 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     await mod.smokeTest(opts.bus, { secrets: resolveManifestSecrets(manifest) });
   }
 
-  function makeApi(manifest: Manifest, extensionId: string, extDir: string): {
+  function makeApi(
+    manifest: Manifest,
+    extensionId: string,
+    extDir: string,
+    revocation: { revoked: boolean },
+  ): {
     api: ExtensionApi;
     unsubs: Unsubscribe[];
   } {
@@ -221,6 +232,17 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     const resolved = resolveManifestSecrets(manifest);
     const scratchDir = join(extDir, ".scratch");
     mkdirSync(scratchDir, { recursive: true });
+
+    // After unload, every action method on this api throws. purgeRegistry has
+    // already dropped the registrations; a stale reference acting now would
+    // register into a dead slot or emit under an unloaded identity.
+    const assertLive = () => {
+      if (revocation.revoked) {
+        throw new Error(
+          `extensions: "${manifest.name}" was unloaded; re-register before acting`,
+        );
+      }
+    };
 
     // Fresh resolver captured into each tool entry so cross-extension
     // callTool sees target's own secrets, never the caller's. Re-reads
@@ -253,6 +275,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       secrets: resolved,
       scratchDir,
       registerTool(tool) {
+        assertLive();
         // First-wins: a tool name is a single slot in the registry.
         // Rejecting a duplicate keeps toolsByName and toolsByExt
         // consistent — drift between the two is what wedged the LLM tool
@@ -307,11 +330,13 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
         toolsByName.set(tool.name, entry);
       },
       registerTrigger(trigger) {
+        assertLive();
         let list = triggersByExt.get(extensionId);
         if (!list) triggersByExt.set(extensionId, (list = []));
         list.push({ extensionId, trigger });
       },
       registerTask(task: TaskRegistration) {
+        assertLive();
         if (!opts.scheduler || !opts.defaultTaskAgentId) {
           throw new Error(
             `extensions: registerTask called by "${manifest.name}" but host has no scheduler wired`,
@@ -336,6 +361,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
               agentId,
               secrets: resolved,
               emit: (type, payload, emitOpts) => {
+                assertLive();
                 assertEventWrite(type, "emit");
                 ctx.emit(type, payload, emitOpts);
               },
@@ -356,6 +382,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
         list.push({ taskId, unregister });
       },
       on(event: string, handler: (ev: Event) => void | Promise<void>) {
+        assertLive();
         assertEventRead(event, "subscribe to");
         const un = opts.bus.subscribe(event, handler);
         unsubs.push(un);
@@ -372,6 +399,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
           parentEventId?: string;
         },
       ) {
+        assertLive();
         assertEventWrite(type, "publish");
         opts.bus.publish({
           type,
@@ -386,6 +414,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
         });
       },
       async callTool<I, O>(name: string, args: I, callOpts?: CallToolOptions): Promise<O> {
+        assertLive();
         // Gate 1: allowlist. No exceptions — even self-calls have to
         // declare the intent in the manifest. Makes cross-ext coupling
         // visible in git and reviewable at install time.
@@ -500,7 +529,11 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     return { api, unsubs };
   }
 
-  async function startTriggers(extensionId: string, manifest: Manifest): Promise<void> {
+  async function startTriggers(
+    extensionId: string,
+    manifest: Manifest,
+    revocation: { revoked: boolean },
+  ): Promise<void> {
     // A trigger declared with `type: X` is itself the authority statement
     // that this extension emits X events; cross-checking against
     // manifest.eventWrites would be double bookkeeping that only ever
@@ -511,6 +544,9 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     const resolved = resolveManifestSecrets(manifest);
     for (const entry of list) {
       const emit = (payload: unknown) => {
+        // A trigger that keeps firing after unload would emit under a dead
+        // identity; drop the emit silently rather than resurrect it.
+        if (revocation.revoked) return;
         opts.bus.publish({
           type: entry.trigger.type,
           payload,
@@ -529,6 +565,13 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
    *  failed-load rollback — same job, two callers. Does NOT touch the
    *  `loaded` map or the DB row; the caller decides those. */
   async function purgeRegistry(extensionId: string, name: string): Promise<void> {
+    // Revoke first: every api reference and trigger emit captured this
+    // object, so flipping it neutralizes stale callers even before their
+    // registrations are torn down below. Drop the map entry — the closures
+    // hold the object, so a fresh load can mint a new record under the id.
+    const revocation = revocations.get(extensionId);
+    if (revocation) revocation.revoked = true;
+    revocations.delete(extensionId);
     for (const un of subs.get(name) ?? []) {
       try {
         un();
@@ -583,7 +626,11 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       throw new Error(`extensions: ${name} has no register()`);
     }
 
-    const { api, unsubs } = makeApi(manifest, extensionId, extDir);
+    // One revocation record per load; purgeRegistry flips it on unload/rollback.
+    const revocation = { revoked: false };
+    revocations.set(extensionId, revocation);
+
+    const { api, unsubs } = makeApi(manifest, extensionId, extDir, revocation);
     // Track subs *before* register runs so a partial register (e.g. one
     // that subscribes to several events, then throws on the next api.on
     // because of a manifest gate) is fully reachable by purgeRegistry.
@@ -595,7 +642,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     // next load attempt collides with orphaned tools/subs/triggers.
     try {
       await impl.register(api);
-      await startTriggers(extensionId, manifest);
+      await startTriggers(extensionId, manifest, revocation);
     } catch (err) {
       await purgeRegistry(extensionId, name);
       markStatus(opts.store, extensionId, "inactive");

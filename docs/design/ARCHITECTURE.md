@@ -399,6 +399,8 @@ Eight ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting w
 
 CLI: `olle extension history <name>`, `olle extension revert <name> [--to <sha>]`.
 
+Unload also revokes the extension's `api`: references captured in timers or promise chains throw `extensions: "<name>" was unloaded; re-register before acting` (revoked trigger emits drop silently) instead of publishing as a dead registration. Corollary: `unload()` runs after revocation and must not call api methods.
+
 ## Cross-host mesh (v0)
 
 **Claim model only. No remote code execution.** The substrate is the most-agentic shape we can ship (LOG 2026-05-13): peer-mesh, leaderless arbitration, every cell sovereign. Centralization is a behavior an extension grows on top, not a shape the binary forces.
