@@ -451,7 +451,11 @@ async function runTurn(
     // the tools block (which the LLM provider caches separately), NOT
     // in this catalog text — the catalog must stay stable across
     // load_tools calls within a thread or it'll invalidate the prefix.
-    const catalogBlock = renderToolCatalog(turnStartTools, listStarters());
+    const catalogBlock = renderToolCatalog(
+      turnStartTools,
+      listStarters(),
+      opts.extensions?.catalogProse(),
+    );
     // Mailbox sidebar — situational awareness block appended to the
     // system prompt each turn. Two sections:
     //   1. Other threads with activity (delegation cue).

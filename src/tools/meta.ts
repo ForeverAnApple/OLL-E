@@ -32,7 +32,7 @@ import {
   history as gitHistory,
   revertSubtree,
 } from "../extensions/git.ts";
-import { validateManifest } from "../extensions/manifest.ts";
+import { validateManifestWithWarnings } from "../extensions/manifest.ts";
 import { getStarter, hasSetupGuide, installStarter, listStarters } from "../starters/index.ts";
 
 export interface MetaToolsOptions {
@@ -190,7 +190,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
       files: Record<string, string> | Array<{ path: string; content: string }> | string;
       commitMessage?: string;
     },
-    { commit: string | null }
+    { commit: string | null; warnings?: string[] }
   > = {
     name: "write_extension",
     tier: "strategic",
@@ -230,10 +230,16 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
         mkdirSync(join(full, ".."), { recursive: true });
         writeFileSync(full, body, "utf8");
       }
-      // Validate manifest if present.
+      // Validate manifest if present. Warnings (unknown keys, malformed
+      // catalog) are non-fatal — surface them so the agent can fix a typo'd
+      // gate at write time instead of discovering it silently gated nothing.
       const manifestPath = join(dir, "manifest.json");
+      let warnings: string[] = [];
       if (existsSync(manifestPath)) {
-        validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")), name);
+        warnings = validateManifestWithWarnings(
+          JSON.parse(readFileSync(manifestPath, "utf8")),
+          name,
+        ).warnings;
       }
       const commit = commitSubtree({
         cwd: extensionsDir,
@@ -241,7 +247,7 @@ export function buildMetaTools(opts: MetaToolsOptions): ToolDef[] {
         message: commitMessage ?? `agent write: ${name}`,
         authorName,
       });
-      return { commit };
+      return warnings.length > 0 ? { commit, warnings } : { commit };
     },
   };
 

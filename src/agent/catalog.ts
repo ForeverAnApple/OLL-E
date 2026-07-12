@@ -12,7 +12,7 @@
 // "What schemas are loaded right now" is encoded by the tools block itself
 // (which the LLM provider caches separately), not by this catalog text.
 
-import type { ToolDef } from "../extensions/types.ts";
+import type { ExtensionCatalogProse, ToolDef } from "../extensions/types.ts";
 import type { StarterTemplate } from "../starters/index.ts";
 
 /** Default category for tools that don't declare one. Rendered last. */
@@ -145,9 +145,16 @@ const DEFAULT_CATEGORY: { tagline: string; body: string } = {
 export function renderToolCatalog(
   tools: ToolDef[],
   starters: StarterTemplate[] = [],
+  extensionProse: ExtensionCatalogProse[] = [],
 ): string {
   const grouped = groupByCategory(tools);
   const ordered = orderedCategories(grouped);
+  // First-loaded wins per category. catalogProse() supplies deterministically
+  // ordered entries; taking the first keeps the catalog stable across calls.
+  const extProseByCategory = new Map<string, ExtensionCatalogProse>();
+  for (const p of extensionProse) {
+    if (!extProseByCategory.has(p.category)) extProseByCategory.set(p.category, p);
+  }
   const parts: string[] = [];
   parts.push("## Available tools");
   parts.push(
@@ -157,12 +164,19 @@ export function renderToolCatalog(
       "Unload with `unload_tools` when done.",
   );
   for (const category of ordered) {
-    const prose = CATEGORY_PROSE[category] ?? DEFAULT_CATEGORY;
+    // Precedence: core prose wins (extensions may not rewrite core
+    // categories) → extension prose for its own category → default fallback.
+    const core = CATEGORY_PROSE[category];
+    const ext = extProseByCategory.get(category);
+    const prose = core ?? (ext ? { tagline: ext.tagline, body: ext.body } : DEFAULT_CATEGORY);
     parts.push(`### ${category} — ${prose.tagline}\n${prose.body}\n`);
+    // Manifest toolClauses only apply to extension-owned categories; a core
+    // category never carries them (core prose won above).
+    const toolClauses = core ? undefined : ext?.toolClauses;
     const lines: string[] = [];
     const members = grouped.get(category)!;
     for (const t of members) {
-      lines.push(`  - ${t.name} — ${clauseFor(t)}`);
+      lines.push(`  - ${t.name} — ${clauseFor(t, toolClauses)}`);
     }
     parts.push(lines.join("\n"));
   }
@@ -234,8 +248,11 @@ function orderedCategories(grouped: Map<string, ToolDef[]>): string[] {
   return out;
 }
 
-function clauseFor(t: ToolDef): string {
+function clauseFor(t: ToolDef, toolClauses?: Record<string, string>): string {
+  // Order: ToolDef.shortClause > manifest catalog.tools clause > description.
   if (t.shortClause) return t.shortClause;
+  const manifestClause = toolClauses?.[t.name];
+  if (manifestClause) return manifestClause;
   // Fall back to the description, truncated. Keeps catalog entries tight
   // when a tool author hasn't written a purposive clause.
   const desc = t.description ?? "";

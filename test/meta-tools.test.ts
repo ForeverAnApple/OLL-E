@@ -62,6 +62,7 @@ function mockExtensions(): ExtensionHost {
       },
     ],
     triggers: () => [],
+    catalogProse: () => [],
   };
 }
 
@@ -273,6 +274,31 @@ describe("write_extension — working tree matches the reported commit", () => {
         error?: string;
       };
       expect(smokeRes.ok).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces manifest warnings (unknown key) in the write_extension result", async () => {
+    const { root, extDir } = seed();
+    try {
+      const write = tools(extDir).find((t) => t.name === "write_extension")!;
+      const res = (await write.execute(
+        {
+          name: "freshrss",
+          files: {
+            "manifest.json": JSON.stringify({
+              name: "freshrss",
+              version: "0.1.0",
+              eventRead: ["chat.turn-end"],
+            }),
+          },
+        },
+        CTX,
+      )) as { commit: string | null; warnings?: string[] };
+      expect(res.commit).toBeTruthy();
+      expect(res.warnings).toBeDefined();
+      expect(res.warnings!.some((w) => w.includes('unknown key "eventRead"'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -8,7 +8,37 @@ export function readManifest(dir: string): Manifest {
   return validateManifest(parsed, dir);
 }
 
+/** Known manifest keys. `config` is on the list — it's a valid, unparsed
+ *  passthrough (extensions re-read manifest.json raw for it), so it must not
+ *  trigger an unknown-key warning even though it never lands in Manifest. */
+const KNOWN_KEYS = new Set([
+  "name",
+  "version",
+  "description",
+  "author",
+  "secrets",
+  "capabilities",
+  "callsTools",
+  "eventReads",
+  "eventWrites",
+  "catalog",
+  "config",
+]);
+
+/** Throwing wrapper — the historical signature. Discards warnings; callers
+ *  that want them use `validateManifestWithWarnings`. */
 export function validateManifest(value: unknown, context = "(unknown)"): Manifest {
+  return validateManifestWithWarnings(value, context).manifest;
+}
+
+/** Validate a manifest, collecting non-fatal warnings (unknown keys, a
+ *  malformed `catalog`) instead of throwing on them. Genuinely invalid
+ *  manifests (not an object, bad name, missing version) still throw. */
+export function validateManifestWithWarnings(
+  value: unknown,
+  context = "(unknown)",
+): { manifest: Manifest; warnings: string[] } {
+  const warnings: string[] = [];
   if (!value || typeof value !== "object") {
     throw new Error(`manifest[${context}]: not an object`);
   }
@@ -18,6 +48,11 @@ export function validateManifest(value: unknown, context = "(unknown)"): Manifes
   }
   if (typeof v.version !== "string") {
     throw new Error(`manifest[${context}]: version required`);
+  }
+  for (const key of Object.keys(v)) {
+    if (!KNOWN_KEYS.has(key)) {
+      warnings.push(`manifest[${context}]: unknown key "${key}" (ignored)`);
+    }
   }
   const out: Manifest = { name: v.name, version: v.version };
   if (typeof v.description === "string") out.description = v.description;
@@ -37,5 +72,29 @@ export function validateManifest(value: unknown, context = "(unknown)"): Manifes
   if (Array.isArray(v.eventWrites) && v.eventWrites.every((x) => typeof x === "string")) {
     out.eventWrites = v.eventWrites as string[];
   }
-  return out;
+  if (v.catalog !== undefined) {
+    const c = v.catalog;
+    if (
+      c &&
+      typeof c === "object" &&
+      typeof (c as Record<string, unknown>).tagline === "string" &&
+      typeof (c as Record<string, unknown>).blurb === "string"
+    ) {
+      const cat = c as { tagline: string; blurb: string; tools?: unknown };
+      const parsed: Manifest["catalog"] = { tagline: cat.tagline, blurb: cat.blurb };
+      if (
+        cat.tools &&
+        typeof cat.tools === "object" &&
+        Object.values(cat.tools).every((x) => typeof x === "string")
+      ) {
+        parsed.tools = cat.tools as Record<string, string>;
+      }
+      out.catalog = parsed;
+    } else {
+      warnings.push(
+        `manifest[${context}]: catalog is malformed (needs string "tagline" and "blurb") — dropped`,
+      );
+    }
+  }
+  return { manifest: out, warnings };
 }

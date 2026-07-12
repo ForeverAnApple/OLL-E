@@ -7,9 +7,17 @@ export const claudeCode: StarterTemplate = {
     "manifest.json": JSON.stringify(
       {
         name: "claude-code",
-        version: "0.1.0",
+        version: "0.1.1",
         description: "Invoke the claude CLI as a subprocess on a workspace.",
         capabilities: ["tool:claude_code"],
+        catalog: {
+          tagline: "delegating code to Claude Code",
+          blurb:
+            "Shell out to a headless Claude Code session to author or edit\n" +
+            "code in a workspace path. Reach here when a coding task is worth\n" +
+            "handing to a dedicated agent with filesystem access rather than\n" +
+            "doing it inline.",
+        },
         config: {
           command: "claude",
         },
@@ -67,6 +75,7 @@ export function register(api) {
   const cfg = loadConfig();
   api.registerTool({
     name: "claude_code",
+    category: "claude-code",
     description:
       "Run the claude CLI with a prompt inside a verified absolute working directory and return its stdout. Useful for delegating code changes. If this fails, inspect query_host_context for cwd/PATH and command availability before retrying.",
     tier: "strategic",

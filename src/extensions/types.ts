@@ -26,6 +26,27 @@ export interface Manifest {
   /** Event types this extension may emit via api.publish(), triggers, or
    *  task ctx.emit(). Use "*" only for deliberately broad bridge layers. */
   eventWrites?: string[];
+  /** Catalog prose for this extension's tools. `tagline` + `blurb` render
+   *  under the category heading in the agent's tool catalog; `tools` maps a
+   *  tool name to a one-line clause used when the ToolDef lacks a
+   *  `shortClause`. Malformed catalog (missing tagline/blurb) is warned and
+   *  dropped, never a load failure. Binds to the categories the extension's
+   *  own tools declare (use `category: "<extension-name>"` on each ToolDef). */
+  catalog?: {
+    tagline: string;
+    blurb: string;
+    tools?: Record<string, string>;
+  };
+}
+
+/** One rendered catalog-prose entry, derived from a loaded extension's
+ *  `manifest.catalog` bound to a category its tools populate. Consumed by
+ *  `renderToolCatalog` as its `extensionProse` argument. */
+export interface ExtensionCatalogProse {
+  category: string;
+  tagline: string;
+  body: string;
+  toolClauses?: Record<string, string>;
 }
 
 export interface ToolDef<I = unknown, O = unknown> {

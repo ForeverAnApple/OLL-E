@@ -7,10 +7,18 @@ export const freshrss: StarterTemplate = {
     "manifest.json": JSON.stringify(
       {
         name: "freshrss",
-        version: "0.1.0",
+        version: "0.1.1",
         description: "FreshRSS (Google Reader API) adapter: unread digest, feed list, mark-read.",
         secrets: ["FRESHRSS_USER", "FRESHRSS_API_PASSWORD"],
         capabilities: ["tool:freshrss"],
+        catalog: {
+          tagline: "reading your RSS feeds",
+          blurb:
+            "Pull unread items, list subscribed feeds, and mark items read\n" +
+            "over a FreshRSS instance. Reach here to build a digest of what's\n" +
+            "new, see which feeds you follow, or clear items once you've acted\n" +
+            "on them.",
+        },
         config: {
           // Base URL of your FreshRSS instance, no trailing /api path.
           // e.g. https://rss.example.com
@@ -105,6 +113,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "freshrss_unread",
+    category: "freshrss",
     description:
       "Unread-items digest from FreshRSS, newest first, stripped to compact shapes for a daily digest. Filters out already-read items. Read-only.",
     inputSchema: {
@@ -142,6 +151,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "freshrss_feeds",
+    category: "freshrss",
     description: "List subscribed feeds with their ids and titles. Read-only.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     async execute() {
@@ -158,6 +168,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "freshrss_mark_read",
+    category: "freshrss",
     description:
       "Mark one or more items as read by their FreshRSS item ids (the id field from freshrss_unread). Mutates reader state — confirm the ids before calling.",
     tier: "strategic",

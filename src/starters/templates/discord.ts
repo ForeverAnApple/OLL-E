@@ -7,11 +7,20 @@ export const discord: StarterTemplate = {
     "manifest.json": JSON.stringify(
       {
         name: "discord",
-        version: "0.1.0",
+        version: "0.1.1",
         description: "Discord gateway adapter: channel-message + member-join triggers, REST tools.",
         secrets: ["DISCORD_TOKEN"],
         capabilities: ["channel:discord", "trigger:channel-message", "trigger:member-join"],
         eventWrites: ["channel-message", "member-join"],
+        catalog: {
+          tagline: "reaching people on Discord",
+          blurb:
+            "Send messages, add reactions, pull recent channel history, and\n" +
+            "list a guild's channels over the Discord gateway. Reach here to\n" +
+            "reply in a channel or thread, react to a message, or read context\n" +
+            "before composing. This is the pipe; discord-communication drives\n" +
+            "live chat on top of it.",
+        },
         config: {
           // 1 (GUILDS) | 2 (GUILD_MEMBERS) | 512 (GUILD_MESSAGES) |
           // 4096 (DIRECT_MESSAGES) | 32768 (MESSAGE_CONTENT) = 37379.
@@ -342,6 +351,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "discord_send",
+    category: "discord",
     description: "Send a message to a Discord channel or thread. Set reply_to to attach a reply reference.",
     inputSchema: {
       type: "object",
@@ -366,6 +376,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "discord_react",
+    category: "discord",
     description: "Add a reaction to a message. emoji is unicode (e.g. \\\"👍\\\") or custom \\\"name:id\\\".",
     tier: "strategic",
     inputSchema: {
@@ -389,6 +400,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "discord_fetch_context",
+    category: "discord",
     description: "Fetch recent messages in a channel or thread — useful for building chat preamble before calling the chat agent.",
     inputSchema: {
       type: "object",
@@ -410,6 +422,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "discord_list_channels",
+    category: "discord",
     description: "List channels the bot can see in a guild.",
     inputSchema: {
       type: "object",

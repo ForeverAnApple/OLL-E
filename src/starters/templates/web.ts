@@ -15,10 +15,18 @@ export const web: StarterTemplate = {
     "manifest.json": JSON.stringify(
       {
         name: "web",
-        version: "0.1.0",
+        version: "0.1.1",
         description:
           "SSRF-guarded single-URL fetch: web_fetch returns a public web page as markdown or text.",
         capabilities: ["tool:web"],
+        catalog: {
+          tagline: "fetching the public web",
+          blurb:
+            "Pull a single public URL and read it back as markdown (HTML) or\n" +
+            "text (json/plain). Reach here to check a page, read documentation,\n" +
+            "or grab a reference the conversation needs — it fetches exactly the\n" +
+            "one URL you give it, never crawls, never posts.",
+        },
         config: {
           // Hard wall-clock cap per fetch (ms).
           timeoutMs: 15000,

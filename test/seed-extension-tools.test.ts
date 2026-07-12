@@ -28,6 +28,7 @@ function fakeExtensionHost(toolsByExt: Record<string, ToolDef[]>): ExtensionHost
         tools.map((tool) => ({ extensionId, tool })),
       ),
     triggers: () => [],
+    catalogProse: () => [],
   };
 }
 

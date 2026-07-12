@@ -41,6 +41,30 @@ describe("starter templates", () => {
     }
   });
 
+  it("every tool-registering starter ships catalog prose and categorized tools", () => {
+    // Bridges (discord-communication, telegram-communication) and cron-trigger
+    // register no tools, so they carry no catalog. The six that register tools
+    // must: catalog binds prose to a category, and the category must be the
+    // extension name on each ToolDef or the prose never binds.
+    const toolStarters = ["discord", "telegram", "github", "freshrss", "claude-code", "web"];
+    for (const name of toolStarters) {
+      const s = getStarter(name)!;
+      const mf = JSON.parse(s.files["manifest.json"]!);
+      expect(mf.catalog, `${name} missing catalog`).toBeDefined();
+      expect(typeof mf.catalog.tagline).toBe("string");
+      expect(mf.catalog.tagline.length).toBeGreaterThan(0);
+      expect(typeof mf.catalog.blurb).toBe("string");
+      expect(mf.catalog.blurb.length).toBeGreaterThan(0);
+      // Every registerTool call in the index carries category: "<name>".
+      const index = s.files["index.ts"]!;
+      const registerCount = (index.match(/api\.registerTool\(/g) ?? []).length;
+      const categoryCount = (
+        index.match(new RegExp(`category: "${name}"`, "g")) ?? []
+      ).length;
+      expect(categoryCount, `${name} has uncategorized tools`).toBe(registerCount);
+    }
+  });
+
   it("each starter has an index.ts and smoke.ts", () => {
     for (const s of listStarters()) {
       expect(s.files["index.ts"]).toBeDefined();

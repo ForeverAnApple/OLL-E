@@ -135,4 +135,94 @@ describe("renderToolCatalog", () => {
     expect(out).toContain("reading a secret's value");
     expect(out).toContain("never acceptable");
   });
+
+  it("prefers extension prose over the default blurb for its category", () => {
+    const tools = [tool("web_fetch", "web", "")];
+    const prose = [
+      { category: "web", tagline: "fetching the public web", body: "Pull a URL." },
+    ];
+    const out = renderToolCatalog(tools, [], prose);
+    expect(out).toContain("### web — fetching the public web");
+    expect(out).toContain("Pull a URL.");
+    // The default extension blurb must NOT appear for this category.
+    expect(out).not.toContain("### web — tools contributed by extensions");
+  });
+
+  it("never lets extension prose override a core category", () => {
+    const tools = [tool("memory_search", "memory", "recall")];
+    const prose = [
+      { category: "memory", tagline: "HIJACKED", body: "extension tried to rewrite core" },
+    ];
+    const out = renderToolCatalog(tools, [], prose);
+    expect(out).toContain("### memory — your persistent self");
+    expect(out).not.toContain("HIJACKED");
+    expect(out).not.toContain("extension tried to rewrite core");
+  });
+
+  it("clause fallback order: shortClause > manifest toolClauses > description", () => {
+    const withShort: ToolDef = {
+      name: "has_short",
+      description: "long description",
+      category: "web",
+      shortClause: "from shortClause",
+      inputSchema: { type: "object" },
+      execute: () => undefined,
+    };
+    const noShort: ToolDef = {
+      name: "no_short",
+      description: "from description",
+      category: "web",
+      inputSchema: { type: "object" },
+      execute: () => undefined,
+    };
+    const prose = [
+      {
+        category: "web",
+        tagline: "the web",
+        body: "web tools",
+        toolClauses: { has_short: "manifest clause A", no_short: "manifest clause B" },
+      },
+    ];
+    const out = renderToolCatalog([withShort, noShort], [], prose);
+    // shortClause wins over the manifest clause.
+    expect(out).toContain("- has_short — from shortClause");
+    // manifest clause wins over description when shortClause is absent.
+    expect(out).toContain("- no_short — manifest clause B");
+    expect(out).not.toContain("from description");
+  });
+
+  it("falls back to description when neither shortClause nor a manifest clause exists", () => {
+    const t: ToolDef = {
+      name: "bare",
+      description: "just the description",
+      category: "web",
+      inputSchema: { type: "object" },
+      execute: () => undefined,
+    };
+    const prose = [{ category: "web", tagline: "web", body: "b", toolClauses: { other: "x" } }];
+    const out = renderToolCatalog([t], [], prose);
+    expect(out).toContain("- bare — just the description");
+  });
+
+  it("first-loaded extension prose wins on a category conflict", () => {
+    const tools = [tool("t", "shared", "")];
+    const prose = [
+      { category: "shared", tagline: "FIRST", body: "first body" },
+      { category: "shared", tagline: "SECOND", body: "second body" },
+    ];
+    const out = renderToolCatalog(tools, [], prose);
+    expect(out).toContain("### shared — FIRST");
+    expect(out).not.toContain("SECOND");
+  });
+
+  it("stays stable across calls with extension prose supplied (cache invariant)", () => {
+    const tools = [tool("web_fetch", "web", "")];
+    const starters = [starter("web", "fetch")];
+    const prose = [
+      { category: "web", tagline: "fetching the public web", body: "Pull a URL.", toolClauses: { web_fetch: "grab a page" } },
+    ];
+    expect(renderToolCatalog(tools, starters, prose)).toBe(
+      renderToolCatalog(tools, starters, prose),
+    );
+  });
 });

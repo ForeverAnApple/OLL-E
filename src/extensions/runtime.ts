@@ -32,6 +32,7 @@ import type { AgentScope } from "../store/schema.ts";
 import type {
   CallToolOptions,
   ExtensionApi,
+  ExtensionCatalogProse,
   ExtensionModule,
   LoadedExtension,
   Manifest,
@@ -110,6 +111,12 @@ export interface ExtensionHost {
   attribute(err: unknown): string | undefined;
   tools(): Array<{ extensionId: string; tool: ToolDef }>;
   triggers(): Array<{ extensionId: string; trigger: TriggerDef }>;
+  /** Catalog prose contributed by loaded extensions. Each loaded extension
+   *  with a `manifest.catalog` yields one entry per category its own tools
+   *  populate. Deterministically ordered (by extension name, then category)
+   *  so the rendered catalog stays stable across calls — it lives in the
+   *  cached identity prefix. */
+  catalogProse(): ExtensionCatalogProse[];
 }
 
 interface RegisteredToolEntry {
@@ -838,6 +845,38 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   function triggers(): RegisteredTriggerEntry[] {
     return [...triggersByExt.values()].flat();
   }
+  function catalogProse(): ExtensionCatalogProse[] {
+    const out: ExtensionCatalogProse[] = [];
+    // Sort loaded extensions by name so ordering is deterministic across
+    // process restarts and load order — the catalog is cached and must not
+    // shuffle for a fixed loaded set.
+    const sortedLoaded = [...loaded.values()].sort((a, b) =>
+      a.manifest.name.localeCompare(b.manifest.name),
+    );
+    for (const ext of sortedLoaded) {
+      const catalog = ext.manifest.catalog;
+      if (!catalog) continue;
+      const entries = toolsByExt.get(ext.id) ?? [];
+      // Distinct categories this extension's own tools declare — the catalog
+      // binds only to categories it actually populates. Sorted for stability.
+      const categories = [
+        ...new Set(
+          entries
+            .map((e) => e.tool.category)
+            .filter((c): c is string => typeof c === "string" && c.length > 0),
+        ),
+      ].sort();
+      for (const category of categories) {
+        out.push({
+          category,
+          tagline: catalog.tagline,
+          body: catalog.blurb,
+          toolClauses: catalog.tools,
+        });
+      }
+    }
+    return out;
+  }
 
   return {
     list,
@@ -852,6 +891,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     attribute,
     tools,
     triggers,
+    catalogProse,
   };
 }
 

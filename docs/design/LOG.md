@@ -1304,6 +1304,12 @@ The `ExtensionApi` contract shipped compiled away: no document, tool, or prompt 
 
 ---
 
+## 2026-07-11 — Manifest `catalog` field + validation warnings; starters backfilled
+
+Extension-contributed tool categories rendered with a generic fallback blurb while core categories got rich purposive prose — grown extensions were second-class in the catalog, which is exactly backwards for a world where integrations are grown, never installed. Manifests gain an optional `catalog` (`{tagline, blurb, tools?}`, agent-native markdown, warn-and-drop on malformation) that the renderer prefers over the default; core `CATEGORY_PROSE` still wins for core categories, so an extension can't rewrite the loadout or memory doctrine. The prose binds to the categories the extension's own tools declare — which surfaced the real gap: zero starter tools declared `category` at all, so all six tool-registering starters got `category` + catalog prose backfilled. `validateManifest` grew a warnings variant surfaced through `write_extension` (unknown keys warn, never fail; `config` stays a known unparsed passthrough per the adversarial review — no starter reads it through validation). `catalogProse()` returns deterministically ordered entries because the catalog sits in the cached identity prefix — render stability is a billing invariant, not a nicety.
+
+---
+
 ## 2026-07-11 — `web` starter: one `web_fetch(url)` tool
 
 Agents needed the public web (4 of 5 peer runtimes surveyed ship fetch; digests summarizing headlines want article bodies) and the alternative was each agent hand-rolling an unguarded fetch. Operational tier — read-only. Hand-rolled HTML→markdown, Bun built-ins only: the no-third-party-deps physics is load-bearing, not a nuisance. Download cap plus the existing `maxResultBytes` spill; SSRF guard blocks private/link-local/CGNAT/loopback ranges with DNS pre-resolution and manual redirect re-validation per hop (DNS-rebind TOCTOU between lookup and fetch is an accepted, commented limitation at this tier). `web_search` deliberately excluded — search needs a provider key and ranking opinions; that's a future proposal, not a fetch.

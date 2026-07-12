@@ -7,10 +7,19 @@ export const github: StarterTemplate = {
     "manifest.json": JSON.stringify(
       {
         name: "github",
-        version: "0.1.0",
+        version: "0.1.1",
         description: "GitHub REST adapter: create_issue, add_comment, list_issues, close_issue, activity.",
         secrets: ["GH_TOKEN"],
         capabilities: ["tool:github"],
+        catalog: {
+          tagline: "acting on GitHub repos",
+          blurb:
+            "Open, comment on, list, and close issues, and pull a compact\n" +
+            "activity digest over the GitHub REST API. Reach here to file or\n" +
+            "triage an issue, leave a comment, or check what changed since you\n" +
+            "last looked. List before opening so you don't duplicate an issue\n" +
+            "that already exists.",
+        },
         config: {
           apiBase: "https://api.github.com",
           userAgent: "olle-github-adapter",
@@ -64,6 +73,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "github_create_issue",
+    category: "github",
     description: "Open a new issue in a repo. Attach body, labels, assignees as needed.",
     tier: "strategic",
     inputSchema: {
@@ -88,6 +98,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "github_add_comment",
+    category: "github",
     description: "Add a comment to an existing issue or PR.",
     tier: "strategic",
     inputSchema: {
@@ -110,6 +121,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "github_list_issues",
+    category: "github",
     description: "List issues in a repo filtered by state/labels. Useful for dedup before opening new ones.",
     inputSchema: {
       type: "object",
@@ -131,6 +143,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "github_close_issue",
+    category: "github",
     description: "Close an issue. Optional reason: completed or not_planned.",
     tier: "strategic",
     inputSchema: {
@@ -153,6 +166,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "github_activity",
+    category: "github",
     description:
       "Compact activity digest for a repo since an ISO timestamp: recently-updated issues (incl. PRs) and new commits, stripped to small shapes suitable for a daily digest. Read-only.",
     inputSchema: {

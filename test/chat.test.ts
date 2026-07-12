@@ -91,6 +91,7 @@ function fakeLiveExtensionHost(opts: {
         ? [{ extensionId: opts.extensionName, tool: opts.tool }]
         : [],
     triggers: () => [],
+    catalogProse: () => [],
   };
 }
 

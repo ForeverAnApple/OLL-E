@@ -10,6 +10,7 @@ export { readManifest, validateManifest } from "./manifest.ts";
 export { ensureRepo, commitSubtree, history, revertSubtree, git } from "./git.ts";
 export type {
   ExtensionApi,
+  ExtensionCatalogProse,
   ExtensionModule,
   ExtensionStatus,
   LoadedExtension,

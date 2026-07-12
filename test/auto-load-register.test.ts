@@ -37,6 +37,7 @@ function fakeExtensionHost(opts: {
         tools.map((tool) => ({ extensionId, tool })),
       ),
     triggers: () => [],
+    catalogProse: () => [],
   };
 }
 

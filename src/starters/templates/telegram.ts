@@ -8,11 +8,20 @@ export const telegram: StarterTemplate = {
     "manifest.json": JSON.stringify(
       {
         name: "telegram",
-        version: "0.2.0",
+        version: "0.2.1",
         description: "Telegram Bot adapter: channel-message trigger + REST tools via long polling, with streaming replies and presence.",
         secrets: ["TELEGRAM_BOT_TOKEN"],
         capabilities: ["channel:telegram", "trigger:channel-message"],
         eventWrites: ["channel-message"],
+        catalog: {
+          tagline: "reaching people on Telegram",
+          blurb:
+            "Send messages, stream a reply as it's written, show typing\n" +
+            "presence, and read recently-seen chat context over the Telegram\n" +
+            "Bot API. Reach here to reply in a chat, keep a long answer live as\n" +
+            "it forms, or check what was just said. This is the pipe;\n" +
+            "telegram-communication drives live chat on top of it.",
+        },
         config: {
           apiBase: "https://api.telegram.org",
           // Long-poll hold time in seconds. Telegram holds the getUpdates
@@ -488,6 +497,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "telegram_send",
+    category: "telegram",
     description:
       "Send a message to a Telegram chat. Text is markdown — **bold**, *italic*, \`code\`, fenced code blocks, [links](url), > quotes, # headings, bullets render natively; anything else is escaped. Falls back to plain text if Telegram rejects the markup. Long messages split on whitespace. Set reply_to to a message id to attach a reply.",
     inputSchema: {
@@ -515,6 +525,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "telegram_typing",
+    category: "telegram",
     description:
       "Show a chat action ('typing' by default; also upload_photo, upload_document, record_voice, …) in a Telegram chat. Displays for ~5 seconds or until the bot's next message; re-call to keep it alive. telegram_stream manages presence automatically — call this only for one-off work outside a stream session.",
     inputSchema: {
@@ -537,6 +548,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "telegram_stream",
+    category: "telegram",
     description:
       "Progressive delivery of one in-flight reply. phase='start' shows presence the moment work begins (native 'Thinking…' draft bubble in private chats, typing indicator in groups). phase='update' streams the full accumulated text so far (throttled internally; plain text until finalize). phase='finalize' renders markdown and delivers the final message(s). phase='cancel' tears the session down. session is any stable id for the reply — the telegram-communication bridge uses its thread id.",
     inputSchema: {
@@ -717,6 +729,7 @@ export function register(api: any) {
 
   api.registerTool({
     name: "telegram_fetch_context",
+    category: "telegram",
     description:
       "Return recent messages this adapter has SEEN in a chat since it loaded. HONEST LIMITATION: the Telegram Bot API has no message-history endpoint, so this is only an in-memory ring buffer of messages that arrived while the adapter was running. It cannot fetch older history and is empty after a reload.",
     inputSchema: {
