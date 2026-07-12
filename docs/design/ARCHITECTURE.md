@@ -354,8 +354,8 @@ The unified flow for adding capabilities — channels, tools, trigger types, any
 1. **Propose**: agent posts a decision-inbox item describing the purpose, dependencies, secrets required, cost estimate.
 2. **Approve**: principal replies `approve`; secrets (API tokens) come in via a reply or a separate `olle secret set` call.
 3. **Author**: agent writes files into `~/.olle/extensions/<name>/`. Uses a starter template (if one matches) or generates from scratch. Auto-committed to the local git repo with actor attribution.
-4. **Smoke test**: extension exports `smokeTest()` — a read-only or idempotent probe. Runs automatically. Must pass before activation.
-5. **Hot-load**: daemon detects new/changed extension, validates manifest, loads into runtime. If load throws or smoke fails → extension is left on disk, marked inactive, inbox item emitted with error detail.
+4. **Smoke test**: extension exports `smokeTest()` — a read-only or idempotent probe. Runs automatically. Must pass **if present**; a missing `smoke.ts` is legal and passes — deliberate, for tool-only extensions with nothing external to probe. Write one whenever the extension touches secrets, config, or a wire format.
+5. **Hot-load**: on explicit `register_extension` (or boot discovery) the daemon validates the manifest and loads into runtime — there is no fs watcher. If load throws or smoke fails → extension is left on disk, marked inactive, inbox item emitted with error detail.
 6. **Live**: extension now participates in event routing; its tools/triggers available.
 
 Manifests are the visible authority boundary for extensions. `callsTools` lists cross-extension tool calls; `eventReads` lists bus event types the extension may subscribe to; `eventWrites` lists event types the extension may emit imperatively (via `api.publish` or task-handler `emit`). A broader event surface is authored as a normal manifest edit and passes through the same smoke + hot-load path.

@@ -1298,6 +1298,12 @@ Three prior entries parked agent-direct task authoring behind extension packagin
 
 ---
 
+## 2026-07-11 — Agent-grade extension API reference (`src/extensions/docs/extension-api.md`)
+
+The `ExtensionApi` contract shipped compiled away: no document, tool, or prompt line told an agent `register(api)` exists, what `ToolDef` carries, or the five `callTool` gates — starters were the accidental docs, and `registerTask`/`callTool`/`validate`/`maxResultBytes` were exercised by zero worked examples. An agent authoring an extension flew on priors plus error-message archaeology. One hand-written 582-line reference (pi-mono's editorial pattern: complete quick-start artifact first, types as inline comments in runnable snippets, Safe/Unsafe footgun pairs, five complete single-concept examples) now documents the whole surface, including deliberate physics previously discoverable only by failure: smoke-less tool-only extensions are legal, no third-party deps with the decision-inbox escape hatch, api revocation after unload, the gate error strings verbatim. A guard test pins the load-bearing strings so the doc can't silently rot. Same commit repairs ARCHITECTURE's smoke-mandatory and fs-watch drift (code was right; the doc lied). Kept hand-written adjacent to `types.ts` — generation machinery hasn't earned its place.
+
+---
+
 ## 2026-07-11 — Delivery-audit events from the channel bridges
 
 A Telegram or Discord delivery failure was a `console.error` — invisible to `query_events`, the inbox, and the agent itself, so a standing job could "succeed" while its digest landed nowhere. Both communication bridges now publish durable `delivery.succeeded` / `delivery.failed` at turn-end delivery, payload `{ channel, threadId, destination, jobId?, error? }` with `jobId` parsed from the `:job:` thread suffix (it exists nowhere else at the emit site). Deliberately minimal: an event convention plus two template edits — no new query surface, no core changes — so observability parity holds by construction (`query_events` for agents, `olle events` for the human). The quiet-cancel/explicit branch emits nothing, because no bridge delivery was attempted. The convention is documented in the extension API reference for future bridges.
