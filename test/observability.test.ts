@@ -517,4 +517,52 @@ describe("observability.agentSelf", () => {
     const { store } = rig();
     expect(agentSelf(store, "does-not-exist")).toBeNull();
   });
+
+  it("reports the caller-supplied effective model when the agent has no choice (non-Anthropic backend)", () => {
+    const { store, hostId } = rig();
+    const agentId = ulid();
+    store
+      .insert(tables.agents)
+      .values({ id: agentId, name: "nijika", hostId, createdAt: Date.now() })
+      .run();
+    // No thinking-model memory. The daemon says the live backend runs
+    // gpt-5.5 — agentSelf must report that, not the hardcoded Anthropic
+    // default (the statusbar lie on an OpenAI-only host).
+    const self = agentSelf(store, agentId, { effectiveModel: "gpt-5.5" })!;
+    expect(self.thinkingModel).toBe("gpt-5.5");
+    expect(self.thinkingModelIsDefault).toBe(true);
+  });
+
+  it("marks a clamped-away choice as default: the effective model wins over the memory", () => {
+    const { store, hostId } = rig();
+    const agentId = ulid();
+    store
+      .insert(tables.agents)
+      .values({ id: agentId, name: "kita", hostId, createdAt: Date.now() })
+      .run();
+    // Chose an Anthropic model, but the daemon's effective resolution says
+    // the backend can't serve it (no anthropic adapter) and runs gpt-5.5.
+    store
+      .insert(tables.memories)
+      .values({
+        id: ulid(),
+        hlc: "1",
+        hostId,
+        actorId: agentId,
+        scope: "private",
+        scopeRef: agentId,
+        role: "thinking-model",
+        depth: 1,
+        title: "thinking-model",
+        bodyMd: "claude-opus-4-8\n\nwritten while an anthropic key existed",
+        tags: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      })
+      .run();
+    const self = agentSelf(store, agentId, { effectiveModel: "gpt-5.5" })!;
+    expect(self.thinkingModel).toBe("gpt-5.5");
+    // The agent's own choice is not what runs — that IS "default" posture.
+    expect(self.thinkingModelIsDefault).toBe(true);
+  });
 });

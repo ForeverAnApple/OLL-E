@@ -1358,6 +1358,12 @@ A review of the just-landed CLI-brain feature found real bugs; fixed surgically 
 
 ---
 
+## 2026-07-11 — Model display truth
+
+The chat statusbar (and `olle status` / `query_self`) showed `claude-opus-4-7` on hosts serving turns through the OpenAI adapter or a CLI brain. Three surfaces each invented their own answer: `agentSelf` hardcoded the Anthropic default as its fallback, `model.get` fell back to the persisted file whenever no router existed (all of CLI mode), and the chat REPL preferred the store-only `thinkingModel` over `model.get`. Root fix: the daemon owns one resolution — the chosen model (`OLLE_MODEL` → thinking-model memory) clamped to the live backend, else that backend's own default — shared by the chat loop's thread-birth `resolveModel` and every read surface (`modelControl.effective` → `model.get`, `observability.self`, `query_self`), so display and execution cannot diverge. The clamp is behavior, not just display: a memory naming a model whose provider has no loaded adapter used to freeze into new threads and error every LLM call; it now degrades to the backend default while the memory persists and reapplies once its provider's key lands (constraints feel like physics). In CLI mode the choice passes through unclamped because the harness receives it (`--model`) — there it *is* what runs. The statusbar additionally re-reads the model from each `chat.turn-end`, the per-turn billed truth.
+
+---
+
 - **Adding an entry**: date-stamp, label the decision area, record the decision and the reasoning. Keep entries short — one paragraph per decision is usually enough.
 - **Reversing a decision**: add a new entry; link to the entry being reversed. Do not edit the reversed entry.
 - **When in doubt**: write the entry. Future contributors (human or agent) will be grateful for the context.

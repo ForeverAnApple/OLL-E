@@ -39,12 +39,12 @@ export async function runInkChat(): Promise<void> {
     .catch(() => null);
   const agentName =
     self?.displayName?.trim() || self?.name?.trim() || "agent";
-  // The header must show the model the agent actually THINKS in — its
-  // thinking-model memory (what `olle status` reports and what turns are
-  // billed on), not the host default from `model.get`. The two differ
-  // whenever the agent has run set_thinking_model. Fall back to model.get
-  // only when self is unavailable.
-  const headerModel = self?.thinkingModel?.trim() || initialModel;
+  // `model.get` is the daemon's effective-model truth: the thinking-model
+  // memory clamped to the live backend, else the backend's own default
+  // (OpenAI router, CLI brain — not a hardcoded Anthropic name). Prefer it;
+  // self.thinkingModel is the same resolution delivered through
+  // observability.self, kept only as the fallback when model.get fails.
+  const headerModel = initialModel || self?.thinkingModel?.trim() || "";
   const initialThreadId = mintThreadId();
 
   const app = render(

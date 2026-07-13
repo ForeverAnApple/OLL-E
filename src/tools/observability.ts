@@ -29,6 +29,11 @@ import {
 
 export interface ObservabilityToolsOptions {
   store: Store;
+  /** Daemon's effective-model resolution — the model the live backend will
+   *  actually run for an agent (chosen model clamped to loaded adapters,
+   *  else the backend default). Passed into query_self so thinkingModel
+   *  reports the running truth instead of a hardcoded provider default. */
+  effectiveModel?: (agentId: string) => string;
 }
 
 const COMMON_TIME_PROPS = {
@@ -203,7 +208,12 @@ export function buildObservabilityTools(opts: ObservabilityToolsOptions): ToolDe
       },
       additionalProperties: false,
     },
-    execute: (args, ctx) => agentSelf(store, args.agentId ?? ctx.actorId),
+    execute: (args, ctx) => {
+      const agentId = args.agentId ?? ctx.actorId;
+      return agentSelf(store, agentId, {
+        effectiveModel: opts.effectiveModel?.(agentId),
+      });
+    },
   };
 
   const queryEvents: ToolDef<

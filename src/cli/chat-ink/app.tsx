@@ -51,7 +51,7 @@ export interface ChatAppProps {
   inboxOpen: number;
 }
 
-type Action =
+export type Action =
   | { type: "user-submit"; text: string }
   | { type: "enqueue-tray"; text: string }
   | { type: "drain-tray"; count: number }
@@ -73,7 +73,7 @@ type Action =
   | { type: "turn-busy"; busy: boolean }
   | { type: "inbox-count"; open: number };
 
-interface ChatState {
+export interface ChatState {
   scrollback: ScrollbackEntry[];
   streaming: string;
   /** Live thinking text for the current reasoning stretch. Visualization
@@ -121,7 +121,8 @@ function collapseThinking(state: ChatState): ChatState {
   };
 }
 
-function reducer(rawState: ChatState, action: Action): ChatState {
+// Exported for tests (statusbar model-tracking regression).
+export function reducer(rawState: ChatState, action: Action): ChatState {
   // Any action that isn't more thinking ends the current reasoning
   // stretch — visible text, tool activity, and terminal events all mean
   // the model moved on. Collapsing here (rather than in each arm) keeps
@@ -212,6 +213,11 @@ function reducer(rawState: ChatState, action: Action): ChatState {
       const cumulative = state.totalUsdMicros + action.usdMicros;
       return {
         ...state,
+        // turn-end carries the model the turn was actually billed on —
+        // authoritative, so the statusbar tracks reality across /model sets,
+        // set_thinking_model switches (next new thread), and CLI-brain
+        // delegation. Empty (malformed payload) keeps the current display.
+        model: action.model || state.model,
         scrollback: [...state.scrollback, {
           kind: "turn-end",
           id: mintEntryId(),

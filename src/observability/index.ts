@@ -503,7 +503,19 @@ export interface AgentSelf {
   reasoningEffort: string;
 }
 
-export function agentSelf(store: Store, agentId: string): AgentSelf | null {
+export function agentSelf(
+  store: Store,
+  agentId: string,
+  opts?: {
+    /** The model the live backend will actually run for this agent (daemon's
+     *  effective-model resolution: chosen clamped to the backend, else the
+     *  backend default). When absent — pure-store callers, tests — the
+     *  Anthropic default remains the fall-through, but any daemon-wired
+     *  surface should pass this so thinkingModel never names a model the
+     *  backend can't serve. */
+    effectiveModel?: string;
+  },
+): AgentSelf | null {
   const arows = store
     .select()
     .from(tables.agents)
@@ -555,10 +567,16 @@ export function agentSelf(store: Store, agentId: string): AgentSelf | null {
   }
 
   // The agent's self-chosen model + effort (private memories), reported as
-  // the configured choice rather than ledger history. Absent choice → host
-  // default model / "off" effort.
+  // the configured choice rather than ledger history. The caller-supplied
+  // effective model wins: it is the daemon's resolution of what the live
+  // backend actually runs (chosen model clamped to loaded adapters, else
+  // the backend's default) — without it an OpenAI-only or CLI-brain host
+  // would report the hardcoded Anthropic default here, the statusbar lie.
   const chosenModel = resolveBootModel(store, agentId);
-  const thinkingModel = chosenModel ?? ANTHROPIC_DEFAULT_MODEL;
+  const thinkingModel = opts?.effectiveModel ?? chosenModel ?? ANTHROPIC_DEFAULT_MODEL;
+  // "Default" = the agent's own choice is not what runs — either it never
+  // chose, or its choice was clamped away by the backend.
+  const thinkingModelIsDefault = chosenModel === undefined || thinkingModel !== chosenModel;
   const reasoningEffort = resolveReasoningEffort(store, agentId, thinkingModel) ?? "off";
 
   return {
@@ -573,7 +591,7 @@ export function agentSelf(store: Store, agentId: string): AgentSelf | null {
     tools: toolRows.map((t) => ({ name: t.name, extensionId: t.extensionId })),
     recentlyPricedModels,
     thinkingModel,
-    thinkingModelIsDefault: chosenModel === undefined,
+    thinkingModelIsDefault,
     reasoningEffort,
   };
 }
