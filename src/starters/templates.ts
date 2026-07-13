@@ -18,6 +18,7 @@ import { telegramCommunication } from "./templates/telegram-communication.ts";
 import { freshrss } from "./templates/freshrss.ts";
 import { web } from "./templates/web.ts";
 import { localLlm } from "./templates/local-llm.ts";
+import { slack } from "./templates/slack.ts";
 
 export type { StarterTemplate };
 
@@ -32,6 +33,7 @@ const STARTERS: Record<string, StarterTemplate> = {
   freshrss,
   web,
   "local-llm": localLlm,
+  slack,
 };
 
 export function listStarters(): StarterTemplate[] {

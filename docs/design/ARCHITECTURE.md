@@ -95,7 +95,7 @@ A source of events. Types in v0:
 - `cron` — fires on schedule. **Live** (LOG 2026-07-08): the standing-jobs subsystem persists `type='cron'` rows in the `triggers` table — the first real reader/writer of that schema, which had held zero rows ever — and arms them with `croner` timers. See "Standing jobs" below.
 - `poll` — fires when a polled endpoint changes (github issues, RSS, etc)
 - `webhook` — HTTP endpoint listens for inbound
-- `channel-message` — inbound from a chat adapter (Discord, Telegram, CLI, future Slack)
+- `channel-message` — inbound from a chat adapter (Discord, Telegram, Slack, CLI)
 - `internal-emit` — another task emitted an event
 
 ### Task
@@ -402,7 +402,7 @@ Trigger declarations are themselves authority statements for their `type` field 
 
 ### Starter templates (shipped read-only; agents clone and modify)
 
-Ten ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting what it does, the exact secrets and how to acquire them, and an install→set-secret→register→smoke walkthrough written for the agent to narrate conversationally. `install_starter` / `list_starters` return `hasSetupGuide` and nudge reading it before asking for secrets — so onboarding a channel is a conversation, not a guess.
+Eleven ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting what it does, the exact secrets and how to acquire them, and an install→set-secret→register→smoke walkthrough written for the agent to narrate conversationally. `install_starter` / `list_starters` return `hasSetupGuide` and nudge reading it before asking for secrets — so onboarding a channel is a conversation, not a guess.
 
 - `discord` — bot gateway + message send/receive; hardened with RESUME + backoff, heartbeat-ACK zombie detection, 429 retry
 - `discord-communication` — wake-word chat behavior over the discord gateway; standing-job channel routing (lazy `getOrDeriveRoute`)
@@ -412,11 +412,12 @@ Ten ship today. Each carries a `SETUP.md` (a fourth `files` key) documenting wha
 - `freshrss` — Google Reader API (ClientLogin); `freshrss_unread` / `freshrss_feeds` (operational), `freshrss_mark_read` (strategic)
 - `web` — one `web_fetch(url)` tool (operational): SSRF-guarded fetch (private/link-local/CGNAT/loopback ranges blocked, DNS pre-resolution, manual redirect re-validation), hand-rolled HTML→markdown, 2MB download cap + `maxResultBytes` spill. No `web_search` — search needs a provider key and ranking opinions; separate proposal
 - `local-llm` — adapter for a local OpenAI-compatible server (llama.cpp, vLLM, LM Studio): `local_llm_generate` chat completion (auto-picks the model when the server serves exactly one, surfaces `reasoning_content` from thinking models) and `local_llm_models` (both operational); `baseUrl` in config, optional Bearer key via the `LOCAL_LLM_API_KEY` secret. Deliberately no SSRF guard — `baseUrl` is operator config aimed at localhost, never tool input. A tool, not a brain swap: the chat loop's provider adapters stay core
+- `slack` — Socket Mode adapter: one outbound WebSocket, no public endpoint (NAT-friendly). Two tokens — app-level `xapp-` opens the socket, bot `xoxb-` makes Web API calls. Ack-first-then-process per envelope (~3s deadline); zero-gap socket refresh via a generation counter; last-inbound-frame staleness as the zombie detector. `slack_send` (`markdown_text` with plain-text fallback, chunked, threaded, ~1 msg/s/channel), `slack_stream` (native `chat.startStream`/`appendStream`/`stopStream` tier in-thread with recipient ids, else a throttled `chat.update` edit loop ≤1/1.2s), `slack_fetch_context` (in-memory ring buffer — `conversations.history` is Tier-1 throttled to 1 req/min for non-Marketplace apps since 2025), `slack_react`. Echo-filtered on `bot_id`/`bot_message`/self; `source: "slack"` on payloads
 - `cron-trigger`
 - `claude-code` — subprocess invocation
-- `http-webhook-trigger` (v0.1), `slack` (v0.1), `codex` (v0.1)
+- `http-webhook-trigger` (v0.1), `codex` (v0.1)
 
-`channel-message` payloads carry `source: "discord"|"telegram"` and each bridge filters on it, so a two-bridge host never relays its own cross-channel echoes. The generic RSS starter was cut — FreshRSS subsumes it.
+`channel-message` payloads carry `source: "discord"|"telegram"|"slack"` and each bridge filters on it, so a two-bridge host never relays its own cross-channel echoes. The generic RSS starter was cut — FreshRSS subsumes it.
 
 ### Rollback
 
