@@ -8,16 +8,31 @@ import type { DeliverTarget } from "./types.ts";
 /** The thread a fired job runs on. `cli` jobs get a private `cron:<jobId>`
  *  thread; channel jobs encode the destination in the thread id so the
  *  bridge can route delivery from the id alone, with no prior inbound
- *  message on the thread. */
-export function jobThreadId(deliver: DeliverTarget, jobId: string): string {
+ *  message on the thread.
+ *
+ *  `fireId` present ⇒ a fresh per-fire thread (the default fire mode): a new
+ *  id every fire, so the woken turn carries no transcript from prior fires.
+ *  Absent ⇒ the shared per-job thread every fire lands on.
+ *
+ *  The fire segment sits in DIFFERENT positions by design. On channel ids it
+ *  goes BEFORE `:job:<jobId>` because cloned bridge extensions in real users'
+ *  ~/.olle parse the jobId with an END-ANCHORED regex (`/:job:([^:]+)$/`);
+ *  `:job:<jobId>` must stay terminal or their delivery audit breaks. On cli
+ *  ids no such parse contract exists, so the fire segment simply appends. The
+ *  asymmetry is deliberate. */
+export function jobThreadId(deliver: DeliverTarget, jobId: string, fireId?: string): string {
   switch (deliver.kind) {
     case "discord":
-      return `discord:${deliver.channelId}:job:${jobId}`;
+      return fireId
+        ? `discord:${deliver.channelId}:fire:${fireId}:job:${jobId}`
+        : `discord:${deliver.channelId}:job:${jobId}`;
     case "telegram":
-      return `telegram:${deliver.chatId}:job:${jobId}`;
+      return fireId
+        ? `telegram:${deliver.chatId}:fire:${fireId}:job:${jobId}`
+        : `telegram:${deliver.chatId}:job:${jobId}`;
     case "cli":
     default:
-      return `cron:${jobId}`;
+      return fireId ? `cron:${jobId}:fire:${fireId}` : `cron:${jobId}`;
   }
 }
 

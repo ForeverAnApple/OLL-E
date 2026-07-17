@@ -10,12 +10,19 @@
 //
 // Misfire policy: skip-missed-while-down. Arming computes the next FUTURE
 // fire; a daemon that was asleep across a scheduled time does not replay it.
+//
+// Thread policy: fresh-per-fire by default. Each fire opens a new thread with
+// no memory of prior fires — a standing job's value is fresh-at-fire-time, so
+// an accumulating transcript is just a growing prompt full of stale context.
+// A job whose config opts into `threadMode:'shared'` lands every fire on its
+// one continuing thread instead.
 
 import { Cron } from "croner";
 import type { EventBus } from "../bus/index.ts";
 import type { Store } from "../store/db.ts";
 import { tables } from "../store/index.ts";
 import { eq } from "drizzle-orm";
+import { ulid } from "../id/index.ts";
 import { jobThreadId } from "./thread.ts";
 import { parseCronConfig, type CronJob } from "./types.ts";
 
@@ -53,7 +60,10 @@ export interface CronScheduler {
  *
  *  Exported standalone so tests drive a fire without waiting on a timer. */
 export function fireJob(deps: { bus: EventBus; hostId: string }, job: CronJob): void {
-  const threadId = jobThreadId(job.config.deliver, job.jobId);
+  // Fresh (the default) mints a per-fire id so each fire gets its own thread;
+  // shared omits it and reuses the job's one continuing thread.
+  const fireId = job.config.threadMode === "shared" ? undefined : ulid();
+  const threadId = jobThreadId(job.config.deliver, job.jobId, fireId);
   deps.bus.publish({
     type: "chat.input",
     hostId: deps.hostId,
@@ -61,7 +71,14 @@ export function fireJob(deps: { bus: EventBus; hostId: string }, job: CronJob): 
     durable: true,
     toAgentId: job.agentId,
     threadId,
-    payload: { text: job.config.instruction, standingJob: true, jobId: job.jobId },
+    payload: {
+      text: job.config.instruction,
+      standingJob: true,
+      jobId: job.jobId,
+      // Fresh fire transcripts have no future reader. The event log remains
+      // durable; this tells the agent loop it may bound runtime snapshots.
+      disposableThread: fireId !== undefined,
+    },
   });
   deps.bus.publish({
     type: "schedule.fired",

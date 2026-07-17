@@ -24,6 +24,13 @@ export interface CronTriggerConfig {
   deliver: DeliverTarget;
   /** IANA timezone (e.g. "America/New_York"). Omit for the host's local tz. */
   tz?: string;
+  /** How successive fires relate. `fresh` (the default) opens a new thread on
+   *  every fire, so the woken turn carries no memory of prior fires — a
+   *  standing job's value is fresh-at-fire-time, and an accumulating transcript
+   *  is a growing prompt full of stale context. `shared` routes every fire onto
+   *  the job's one continuing thread, so each fire sees the prior fires'
+   *  transcript — for jobs whose value IS the running context. */
+  threadMode?: "fresh" | "shared";
   /** actorId that created the job — provenance for the audit trail. */
   createdBy: string;
 }
@@ -66,6 +73,10 @@ export function parseCronConfig(row: TriggerRow): CronJob | null {
     instruction: c.instruction,
     deliver: c.deliver,
     tz: typeof c.tz === "string" ? c.tz : undefined,
+    // Anything missing or malformed becomes "fresh" — this is what makes the
+    // fresh-per-fire default retroactive across pre-existing rows with no
+    // threadMode field, without a migration.
+    threadMode: c.threadMode === "shared" ? "shared" : "fresh",
     createdBy: typeof c.createdBy === "string" ? c.createdBy : row.agentId,
   };
   return { jobId: row.id, agentId: row.agentId, config };

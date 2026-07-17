@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBus, persistToStore } from "../src/bus/index.ts";
@@ -674,6 +674,122 @@ describe("agent loop over the mailbox", () => {
       expect(sawMessages!.length).toBeGreaterThanOrEqual(3);
       expect(sawMessages!.at(-1)).toMatchObject({ role: "user", content: "follow up" });
       expect(sawMessages![0]).toMatchObject({ role: "user", content: "hello" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds completed fresh-job runtime state and snapshots", async () => {
+    const r = rig();
+    const dir = mkdtempSync(join(tmpdir(), "olle-threads-"));
+    try {
+      const loop = startAgentLoop({
+        bus: r.bus,
+        store: r.store,
+        hostId: r.hostId,
+        llm: mockLlm([
+          endTurn("ordinary"),
+          endTurn("one"),
+          endTurn("two"),
+          endTurn("three"),
+        ]),
+        agentId: r.agentId,
+        threadsDir: dir,
+        freshJobThreadRetention: 2,
+      });
+      const run = async (threadId: string, text: string): Promise<void> => {
+        const done = new Promise<void>((resolve) => {
+          const unsub = r.bus.subscribe("chat.turn-end", (event) => {
+            if (event.threadId !== threadId) return;
+            unsub();
+            resolve();
+          });
+        });
+        r.bus.publish({
+          type: "chat.input",
+          hostId: r.hostId,
+          actorId: "cli",
+          durable: true,
+          toAgentId: r.agentId,
+          threadId,
+          payload: { text, disposableThread: threadId !== "human-chat" },
+        });
+        await done;
+        // chat.turn-end is published inside runTurn; let drain's finally
+        // apply retention before inspecting the loop and filesystem.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      };
+
+      await run("human-chat", "keep me");
+      await run("cron:j1:fire:f1", "first fire");
+      await run("discord:channel:fire:f2:job:j2", "second fire");
+      await run("telegram:chat:fire:f3:job:j3", "third fire");
+
+      expect(loop.threads().sort()).toEqual([
+        "discord:channel:fire:f2:job:j2",
+        "human-chat",
+        "telegram:chat:fire:f3:job:j3",
+      ]);
+      expect(existsSync(join(dir, "root", "cron_j1_fire_f1.json"))).toBe(false);
+      expect(existsSync(join(dir, "root", "discord_channel_fire_f2_job_j2.json"))).toBe(true);
+      expect(existsSync(join(dir, "root", "telegram_chat_fire_f3_job_j3.json"))).toBe(true);
+      expect(existsSync(join(dir, "root", "human-chat.json"))).toBe(true);
+      loop.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prunes disposable snapshots left by a prior daemon and honors a zero cap", async () => {
+    const r = rig();
+    const dir = mkdtempSync(join(tmpdir(), "olle-threads-"));
+    const agentDir = join(dir, "root");
+    mkdirSync(agentDir, { recursive: true });
+    try {
+      for (const [id, savedAt, disposable] of [
+        ["old-fire", 1, true],
+        ["new-fire", 2, true],
+        ["human", 0, false],
+      ] as const) {
+        writeFileSync(
+          join(agentDir, `${id}.json`),
+          JSON.stringify({ id, messages: [], savedAt, disposable }),
+        );
+      }
+
+      const loop = startAgentLoop({
+        bus: r.bus,
+        store: r.store,
+        hostId: r.hostId,
+        llm: mockLlm([endTurn("gone")]),
+        agentId: r.agentId,
+        threadsDir: dir,
+        freshJobThreadRetention: 0,
+      });
+      expect(existsSync(join(agentDir, "old-fire.json"))).toBe(false);
+      expect(existsSync(join(agentDir, "new-fire.json"))).toBe(false);
+      expect(existsSync(join(agentDir, "human.json"))).toBe(true);
+
+      const done = new Promise<void>((resolve) => {
+        const unsub = r.bus.subscribe("chat.turn-end", () => {
+          unsub();
+          resolve();
+        });
+      });
+      r.bus.publish({
+        type: "chat.input",
+        hostId: r.hostId,
+        actorId: "scheduler",
+        durable: true,
+        toAgentId: r.agentId,
+        threadId: "fresh-zero",
+        payload: { text: "run", disposableThread: true },
+      });
+      await done;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(loop.threads()).toEqual([]);
+      expect(existsSync(join(agentDir, "fresh-zero.json"))).toBe(false);
+      loop.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

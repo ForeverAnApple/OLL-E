@@ -21,7 +21,7 @@
 // `<threadsDir>/<agentId-sanitized>/<threadId-sanitized>.json` after
 // each turn, loaded on first-touch.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { EventBus } from "../bus/index.ts";
 import type { Event } from "../bus/types.ts";
@@ -58,6 +58,10 @@ import {
 } from "./redaction.ts";
 import { getSecretsProvider } from "./secrets-provider.ts";
 import { listStarters } from "../starters/index.ts";
+
+/** Completed per-fire job threads kept for recent sidebar context. The event
+ * log remains durable after older snapshots and runtime state are evicted. */
+export const DEFAULT_FRESH_JOB_THREAD_RETENTION = 100;
 
 export interface AgentLoopOptions {
   bus: EventBus;
@@ -108,6 +112,9 @@ export interface AgentLoopOptions {
    *  MAIL_WAKE_DEBOUNCE_MS. Set to 0 to fire synchronously per event
    *  (useful in tests that don't want to await timers). */
   mailWakeDebounceMs?: number;
+  /** Completed fresh standing-job threads retained in memory and as snapshots
+   *  per agent. Active turns never count toward or get removed by this cap. */
+  freshJobThreadRetention?: number;
   /** Tool-result truncation hooks. When supplied, oversize tool outputs
    *  spill to the durable handle returned by `persist`; the runtime keeps
    *  per-thread state stable so replays produce byte-identical previews
@@ -138,6 +145,9 @@ export interface AgentLoopOptions {
 
 interface Thread {
   id: string;
+  /** This thread's snapshot has no future context reader and may be evicted
+   *  after its queued work completes. Set explicitly by its input event. */
+  disposable: boolean;
   messages: Message[];
   /** Text queued from chat.input events while the worker is busy. */
   pending: string[];
@@ -219,10 +229,17 @@ const MAIL_WAKE_DEBOUNCE_MS = 2_000;
 
 export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
   const threads = new Map<string, Thread>();
+  const freshJobThreadRetention = Math.max(
+    0,
+    Math.floor(opts.freshJobThreadRetention ?? DEFAULT_FRESH_JOB_THREAD_RETENTION),
+  );
   const agentDir = opts.threadsDir
     ? join(opts.threadsDir, sanitizeId(opts.agentId))
     : undefined;
   if (agentDir) mkdirSync(agentDir, { recursive: true });
+  const completedFreshJobThreads = agentDir
+    ? pruneDisposableSnapshots(agentDir, freshJobThreadRetention)
+    : new Set<string>();
 
   // Loop-start timestamp seeds each new thread's per-thread mailHwm so
   // we don't dump pre-existing history on a thread's first turn after
@@ -232,13 +249,14 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
   // mail_list({direction:"out", includeResolved:true}) is the durable audit.
   const loopStartMs = Date.now();
 
-  function getOrCreate(id: string): Thread {
+  function getOrCreate(id: string, disposable: boolean): Thread {
     let t = threads.get(id);
     if (t) return t;
     const loaded = agentDir ? tryLoadThread(agentDir, id) : null;
     t = {
       id,
-      messages: loaded ?? [],
+      disposable: disposable || loaded?.disposable === true,
+      messages: loaded?.messages ?? [],
       pending: [],
       pendingOrigin: [],
       inFlightInbox: [],
@@ -269,7 +287,10 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
     const p = ev.payload as { text?: string };
     if (typeof p?.text !== "string") return;
 
-    const thread = getOrCreate(ev.threadId);
+    const thread = getOrCreate(
+      ev.threadId,
+      (ev.payload as { disposableThread?: boolean }).disposableThread === true,
+    );
     // The publisher signals "I typed this while the agent was mid-turn
     // and I want it folded in" via `extendTurn: true`. When a turn is
     // actually in flight on this thread, route to the in-flight inbox
@@ -302,6 +323,13 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
         })
         .finally(() => {
           thread.worker = undefined;
+          retainCompletedFreshJobThread(
+            thread,
+            threads,
+            completedFreshJobThreads,
+            freshJobThreadRetention,
+            agentDir,
+          );
         });
     }
   });
@@ -361,6 +389,36 @@ export function startAgentLoop(opts: AgentLoopOptions): AgentLoop {
       return true;
     },
   };
+}
+
+function retainCompletedFreshJobThread(
+  completed: Thread,
+  threads: Map<string, Thread>,
+  retained: Set<string>,
+  limit: number,
+  agentDir: string | undefined,
+): void {
+  if (!completed.disposable) return;
+
+  // Reinsert so a reused id (unlikely, but legal input) becomes newest.
+  retained.delete(completed.id);
+  retained.add(completed.id);
+  while (retained.size > limit) {
+    const oldestId = retained.values().next().value as string | undefined;
+    if (!oldestId) return;
+    retained.delete(oldestId);
+    const oldest = threads.get(oldestId);
+    // A new event may have restarted this thread between completion and
+    // eviction. Never remove queued or running work.
+    if (oldest && (oldest.worker || oldest.pending.length > 0 || oldest.activeAbort)) continue;
+    threads.delete(oldestId);
+    if (!agentDir) continue;
+    try {
+      unlinkSync(threadFile(agentDir, oldestId));
+    } catch {
+      // Best-effort snapshot cleanup. Runtime state is bounded regardless.
+    }
+  }
 }
 
 async function drain(
@@ -1243,7 +1301,14 @@ function threadFile(agentDir: string, threadId: string): string {
   return join(agentDir, `${sanitizeId(threadId)}.json`);
 }
 
-function tryLoadThread(agentDir: string, threadId: string): Message[] | null {
+interface ThreadSnapshot {
+  id: string;
+  messages: Message[];
+  savedAt: number;
+  disposable?: boolean;
+}
+
+function tryLoadThread(agentDir: string, threadId: string): ThreadSnapshot | null {
   const f = threadFile(agentDir, threadId);
   if (!existsSync(f)) return null;
   try {
@@ -1251,7 +1316,13 @@ function tryLoadThread(agentDir: string, threadId: string): Message[] | null {
     if (!raw || typeof raw !== "object" || !Array.isArray((raw as { messages?: unknown }).messages)) {
       return null;
     }
-    return (raw as { messages: Message[] }).messages;
+    const snapshot = raw as Partial<ThreadSnapshot> & { messages: Message[] };
+    return {
+      id: typeof snapshot.id === "string" ? snapshot.id : threadId,
+      messages: snapshot.messages,
+      savedAt: typeof snapshot.savedAt === "number" ? snapshot.savedAt : 0,
+      disposable: snapshot.disposable === true,
+    };
   } catch {
     // Corrupt snapshot — start fresh. The events log is still canonical.
     return null;
@@ -1269,12 +1340,48 @@ function saveThread(
       : thread.messages;
     writeFileSync(
       threadFile(agentDir, thread.id),
-      JSON.stringify({ id: thread.id, messages, savedAt: Date.now() }),
+      JSON.stringify({
+        id: thread.id,
+        messages,
+        savedAt: Date.now(),
+        disposable: thread.disposable,
+      }),
       "utf8",
     );
   } catch {
     // Best-effort; in-memory thread remains intact.
   }
+}
+
+function pruneDisposableSnapshots(agentDir: string, limit: number): Set<string> {
+  const snapshots: Array<{ id: string; savedAt: number }> = [];
+  try {
+    for (const name of readdirSync(agentDir)) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const raw = JSON.parse(readFileSync(join(agentDir, name), "utf8")) as Partial<ThreadSnapshot>;
+        if (raw.disposable === true && typeof raw.id === "string") {
+          snapshots.push({ id: raw.id, savedAt: typeof raw.savedAt === "number" ? raw.savedAt : 0 });
+        }
+      } catch {
+        // Corrupt snapshots are ignored here and handled as empty on touch.
+      }
+    }
+  } catch {
+    return new Set();
+  }
+  snapshots.sort((a, b) => a.savedAt - b.savedAt);
+  const retained = new Set(snapshots.map((snapshot) => snapshot.id));
+  while (retained.size > limit) {
+    const oldestId = retained.values().next().value as string;
+    retained.delete(oldestId);
+    try {
+      unlinkSync(threadFile(agentDir, oldestId));
+    } catch {
+      // Best-effort; a later daemon start retries pruning.
+    }
+  }
+  return retained;
 }
 
 function emitStep(

@@ -121,6 +121,42 @@ describe("schedule_task", () => {
     expect(deliver).toEqual({ kind: "discord", channelId: "123" });
   });
 
+  it("rejects an invalid threadMode", async () => {
+    const { byName, seedAgent, ctx } = rig();
+    seedAgent("a1");
+    await expect(
+      run(
+        byName.get("schedule_task")!,
+        { cronExpr: "0 8 * * *", instruction: "x", deliver: { kind: "cli" }, threadMode: "sticky" },
+        ctx("a1"),
+      ),
+    ).rejects.toThrow(/threadMode must be/);
+  });
+
+  it("defaults threadMode to 'fresh' when omitted, stores 'shared' when given", async () => {
+    const { byName, store, seedAgent, ctx } = rig();
+    seedAgent("a1");
+    await run(
+      byName.get("schedule_task")!,
+      { cronExpr: "0 8 * * *", instruction: "default", deliver: { kind: "cli" } },
+      ctx("a1"),
+    );
+    await run(
+      byName.get("schedule_task")!,
+      { cronExpr: "0 9 * * *", instruction: "shared", deliver: { kind: "cli" }, threadMode: "shared" },
+      ctx("a1"),
+    );
+    const rows = store.select().from(tables.triggers).all();
+    const byInstruction = new Map(
+      rows.map((r) => {
+        const c = r.config as Record<string, unknown>;
+        return [c.instruction as string, c.threadMode] as const;
+      }),
+    );
+    expect(byInstruction.get("default")).toBe("fresh");
+    expect(byInstruction.get("shared")).toBe("shared");
+  });
+
   it("enforces the per-agent job cap", async () => {
     const { byName, store, hostId, seedAgent, ctx } = rig();
     seedAgent("a1");
@@ -167,6 +203,35 @@ describe("schedule_list", () => {
     const listed = (await run(byName.get("schedule_list")!, {}, ctx("a1"))) as Array<{ instruction: string }>;
     expect(listed).toHaveLength(1);
     expect(listed[0]!.instruction).toBe("a1 job");
+  });
+
+  it("reports threadMode, defaulting a pre-existing row with no field to 'fresh'", async () => {
+    const { byName, store, seedAgent, ctx } = rig();
+    seedAgent("a1");
+    // A row seeded directly with no threadMode field (as pre-change rows are).
+    store
+      .insert(tables.triggers)
+      .values({
+        id: ulid(),
+        agentId: "a1",
+        type: "cron",
+        config: { cronExpr: "0 8 * * *", instruction: "legacy", deliver: { kind: "cli" }, createdBy: "a1" },
+        scope: {},
+        createdAt: Date.now(),
+      })
+      .run();
+    await run(
+      byName.get("schedule_task")!,
+      { cronExpr: "0 9 * * *", instruction: "sticky", deliver: { kind: "cli" }, threadMode: "shared" },
+      ctx("a1"),
+    );
+    const listed = (await run(byName.get("schedule_list")!, {}, ctx("a1"))) as Array<{
+      instruction: string;
+      threadMode: string;
+    }>;
+    const modes = new Map(listed.map((r) => [r.instruction, r.threadMode] as const));
+    expect(modes.get("legacy")).toBe("fresh");
+    expect(modes.get("sticky")).toBe("shared");
   });
 });
 

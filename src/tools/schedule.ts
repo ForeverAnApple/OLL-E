@@ -32,6 +32,7 @@ interface ScheduleTaskArgs {
   cronExpr: string;
   instruction: string;
   deliver: DeliverTarget;
+  threadMode?: "fresh" | "shared";
 }
 
 interface ScheduleTaskResult {
@@ -44,6 +45,7 @@ interface ScheduleListRow {
   cronExpr: string;
   instruction: string;
   deliver: DeliverTarget;
+  threadMode: "fresh" | "shared";
   nextRun: string | null;
 }
 
@@ -72,6 +74,16 @@ function validateDeliver(raw: unknown): DeliverTarget {
         `schedule_task: deliver.kind must be 'cli', 'discord', or 'telegram' (got ${JSON.stringify(d.kind)})`,
       );
   }
+}
+
+/** Validate + normalize the thread mode. Missing → "fresh" (the default);
+ *  anything but the two known values is a precise agent-facing error. */
+function validateThreadMode(raw: unknown): "fresh" | "shared" {
+  if (raw === undefined || raw === null) return "fresh";
+  if (raw === "fresh" || raw === "shared") return raw;
+  throw new Error(
+    `schedule_task: threadMode must be 'fresh' or 'shared' (got ${JSON.stringify(raw)})`,
+  );
 }
 
 /** Reject anything but a valid 5-field cron. croner also accepts a 6-field
@@ -104,7 +116,7 @@ export function buildScheduleTools(opts: ScheduleToolsOptions): ToolDef[] {
     category: "scheduling",
     shortClause: "run a natural-language instruction on a repeating schedule",
     description:
-      "Register a standing job: a cron'd natural-language instruction the substrate fires for you on a schedule, waking a fresh turn each time. Use this to make yourself useful without being prompted — a morning digest, a periodic check, a recurring nudge. `cronExpr` is a 5-field cron (minute hour day-of-month month day-of-week; e.g. '0 8 * * *' = 8am daily); seconds are not supported. `instruction` is what you'll be told to do when it fires — write it as a clear directive to your future self ('Summarize yesterday's unread items and post the digest'). `deliver` says where the resulting turn runs and its output lands: {kind:'cli'} for the local terminal, {kind:'discord', channelId} or {kind:'telegram', chatId} to post into a channel with no prior message needed. The job runs as you, on your budget and tools. Fires start at the next scheduled time — a job set at 7:59 for '0 8 * * *' fires at 8:00. Returns {jobId, nextRun}.",
+      "Register a standing job: a cron'd natural-language instruction the substrate fires for you on a schedule, waking a fresh turn each time. Use this to make yourself useful without being prompted — a morning digest, a periodic check, a recurring nudge. `cronExpr` is a 5-field cron (minute hour day-of-month month day-of-week; e.g. '0 8 * * *' = 8am daily); seconds are not supported. `instruction` is what you'll be told to do when it fires — write it as a clear directive to your future self ('Summarize yesterday's unread items and post the digest'). `deliver` says where the resulting turn runs and its output lands: {kind:'cli'} for the local terminal, {kind:'discord', channelId} or {kind:'telegram', chatId} to post into a channel with no prior message needed. By default each fire wakes you on a brand-new thread with no memory of previous fires — right for jobs whose value is fresh-at-fire-time (a digest doesn't need last week's digests in context). Pass `threadMode:'shared'` to keep one continuing thread instead, so each fire sees the prior fires' transcript — reach for it only when the job's value IS the running context (it costs a prompt that grows with every fire). The job runs as you, on your budget and tools. Fires start at the next scheduled time — a job set at 7:59 for '0 8 * * *' fires at 8:00. Returns {jobId, nextRun}.",
     inputSchema: {
       type: "object",
       properties: {
@@ -130,6 +142,12 @@ export function buildScheduleTools(opts: ScheduleToolsOptions): ToolDef[] {
           required: ["kind"],
           additionalProperties: false,
         },
+        threadMode: {
+          type: "string",
+          enum: ["fresh", "shared"],
+          description:
+            "How successive fires relate. 'fresh' (default) opens a new thread each fire with no memory of prior fires; 'shared' reuses one continuing thread so each fire sees the prior transcript (growing prompt).",
+        },
       },
       required: ["cronExpr", "instruction", "deliver"],
       additionalProperties: false,
@@ -141,6 +159,7 @@ export function buildScheduleTools(opts: ScheduleToolsOptions): ToolDef[] {
       }
       const nextRun = validateCron(args.cronExpr);
       const deliver = validateDeliver(args.deliver);
+      const threadMode = validateThreadMode(args.threadMode);
 
       const existing = store
         .select({ id: tables.triggers.id })
@@ -158,6 +177,7 @@ export function buildScheduleTools(opts: ScheduleToolsOptions): ToolDef[] {
         cronExpr: args.cronExpr.trim(),
         instruction,
         deliver,
+        threadMode,
         createdBy: ctx.actorId,
       };
       store
@@ -215,6 +235,9 @@ export function buildScheduleTools(opts: ScheduleToolsOptions): ToolDef[] {
           cronExpr: config.cronExpr,
           instruction: config.instruction,
           deliver: config.deliver,
+          // Pre-existing rows have no threadMode field; report their effective
+          // behavior, which the fire path treats as "fresh".
+          threadMode: config.threadMode === "shared" ? "shared" : "fresh",
           nextRun,
         });
       }
