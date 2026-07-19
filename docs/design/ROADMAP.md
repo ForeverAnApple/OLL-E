@@ -40,6 +40,31 @@ Back-linked to their LOG entries; `grep '\[DEFERRED-' docs/design/LOG.md` is the
 - **Parent-read of child private memory; scratch-to-`task_runs` binding** — schema-touching, land with the memory-surface work. (LOG 2026-04-23.)
 - **Agent death / survival economics** — no population to select across in v0. (LOG 2026-04-23.)
 
+## Post-v0 — Isolation program
+
+The MVP-v0 phase is over. v0 proved the digest loop; the substrate now hosts agent-authored
+code, and that code runs *inside the daemon* — imported into its address space, handed every
+secret in plaintext, able to crash the process or exfiltrate anywhere. The isolation program
+closes that hole: agent-authored extensions become **untrusted by construction**.
+
+- **Per-agent microVMs.** Each agent's grown extensions run in that agent's own Firecracker
+  microVM (Linux/KVM first). The VM has **no network device** — all egress is forced through a
+  host-side credential broker. Secrets never enter the guest (REST or WebSocket); the broker
+  injects them at the edge, so a compromised extension has nothing to steal and nowhere to send
+  it. Smoke tests move into the guest, off the daemon's pre-gate path.
+- **Why this is capability worth building, not feature surface.** Isolation is agency
+  infrastructure: code that cannot hurt the host can be trusted with less approval friction,
+  which serves the more-agentic path. It is the deterministic environmental boundary that holds
+  when model-layer judgment doesn't — the same lesson Anthropic published from containing Claude
+  (LOG 2026-07-18).
+- **Pooling seam.** v1 is one VM per agent; a `placementFor(agentId, manifest)` seam lets 50-100
+  agents later share pooled guest VMs by group without schema redesign. Revisit at >8 concurrent
+  VMs.
+- **Fallback is observable, never silent.** A host without a working backend runs extensions
+  in-process (legacy) and emits a durable `extension.unisolated` event surfaced in `olle status`.
+  macOS (vfkit) and a bubblewrap fallback tier are designed behind the backend interface,
+  deferred until Linux microVM is proven.
+
 ## Explicit non-goals
 
 Carried from ARCHITECTURE "Seams intentionally unbuilt", plus what the push-first program ruled out:
@@ -48,5 +73,5 @@ Carried from ARCHITECTURE "Seams intentionally unbuilt", plus what the push-firs
 - **No generic RSS starter.** FreshRSS subsumes it — one adapter over the Google Reader API covers every feed the user already curates.
 - **No cross-agent scheduling in v1.** (See deferred above.)
 - **No remote code execution.** Cross-host is claim-model only; a task runs on whichever cell claims it, using that cell's own tools. (VISION load-bearing.)
-- **No web UI, no sandbox beyond process boundary, no Windows, no bidding/reputation/priority queues, no natural-language-only config** (files still exist; the agent edits them).
+- **No web UI, no Windows, no bidding/reputation/priority queues, no natural-language-only config** (files still exist; the agent edits them). (Sandboxing beyond the process boundary *was* a non-goal; lifted 2026-07-18 — see "Post-v0 — Isolation program" below and LOG 2026-07-18.)
 - **No privileged human dashboard.** Every CLI read command has a parallel agent-callable tool; the CLI is the human's tool surface, never a privileged path.

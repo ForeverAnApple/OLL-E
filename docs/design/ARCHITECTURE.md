@@ -433,6 +433,55 @@ CLI: `olle extension history <name>`, `olle extension revert <name> [--to <sha>]
 
 Unload also revokes the extension's `api`: references captured in timers or promise chains throw `extensions: "<name>" was unloaded; re-register before acting` (revoked trigger emits drop silently) instead of publishing as a dead registration. Corollary: `unload()` runs after revocation and must not call api methods.
 
+## MicroVM isolation (post-v0)
+
+Agent-authored extension code is **untrusted by construction** (LOG 2026-07-18). It runs inside a per-agent Firecracker microVM, not the daemon process. The invariant it enforces: **secrets never enter the guest, and the guest has no way to reach the network except through a host-mediated broker.** This is the deterministic environmental boundary that holds when model judgment doesn't — Anthropic's containment lesson ("if credentials never enter the sandbox, they can't be exfiltrated, regardless of the cause"). Per-agent VMs are the tier Anthropic reserves for untrusted code (Claude Cowork's full-VM-with-vsock), not over-engineering.
+
+### Topology
+
+```
+daemon (unprivileged host)                    per-agent microVM (no net device)
+┌───────────────────────────┐                 ┌──────────────────────────────┐
+│ extension host / registries│ vsock 5000 ↔   │ socat → /run/olle/ctl.sock   │
+│ scheduler (task_runs)     │ UDS (control)   │  guest shim (bun):           │
+│ ToolDispatch + gates      │◄───────────────►│   ExtensionApi RPC stubs     │
+│ VM supervisor             │                 │   in-guest smoke runner      │
+│ credential broker ────────┼ vsock 5001 ◄────┤   trigger sockets/timers     │
+│   SSRF floor + allowlist  │ UDS (egress)    │   fetch/WebSocket → broker    │
+│   placeholder substitute  │                 │   /data (scratch, own blkdev)│
+└───────────────────────────┘                 └──────────────────────────────┘
+```
+
+Transport is virtio-vsock exposed host-side as Unix domain sockets under `~/.olle/run/vm/<vmKey>/` (Bun can't open AF_VSOCK, so socat bridges vsock↔guest-UDS). The existing line-JSON IPC protocol (`src/ipc/protocol.ts`) rides the channel, made bidirectional: a frame with `method` is a request to the receiver, a frame with `ok`/`stream` is a response. The guest gets **no virtio-net device and no network driver** — deny-all egress by construction.
+
+### Identity binding
+
+Each VM's control UDS lives in a per-VM directory the supervisor mints, so every connection on it *is* that VM. Guest-originated `ext.call-tool` carries no self-asserted `agentId` — the host stamps the placement's owning agent before the existing `checkTool` gates. This structurally closes the trust gap the CLI mcp-bridge path still carries (a caller asserting its own agentId, `src/mcp/dispatch.ts`); the mcp-bridge half stays a follow-up.
+
+### Credential broker
+
+The one instance per VM is the only egress path. Contract, in order: parse URL → **SSRF floor** (private/loopback/link-local ranges refused regardless of allowlist; classifier lifted from the web starter into `src/net/ssrf.ts`) → **allowlist** match against a loaded manifest's `egress.hosts` (else durable `egress.denied`) → **DNS resolve + connect to the pinned IP** (closes the TOCTOU rebinding gap) → **substitute** `olle-secret://<NAME>` placeholders in URL/headers/text-body/WS-text-frames, only where `<NAME>` is declared for the pinned host → perform the request host-side (TLS terminates in the daemon). An unroutable placeholder is left intact and fails closed (upstream 401). Because the guest has no network device, the broker always makes the upstream TLS call itself — so masking needs no TLS-terminate flag and domain fronting is structurally impossible, both improvements over a bolt-on sandbox proxy.
+
+WebSockets are broker-owned: the guest `WebSocket` is an RPC stub; the broker holds the real socket, substitutes placeholders in outbound text frames (Discord's identify frame is plain JSON), streams inbound frames back, and closes every socket on VM teardown — relocating the trigger sockets/timers that used to live in daemon module scope.
+
+### Manifest authority — `egress`
+
+The visible authority boundary for network access, peer to `callsTools`/`eventReads`/`eventWrites`:
+
+```
+egress?: Array<{ hosts: string[]; secrets?: string[]; mode?: "placeholder" | "guest" }>
+```
+
+`hosts` are exact or single-level-wildcard patterns; `secrets` bound to those hosts are the extension's `injectHosts` (Anthropic's term for the same idea). `mode` defaults to `placeholder` (broker substitutes at egress); `guest` delivers the real value in-VM (still egress-pinned) for HMAC/binary-frame protocols where substitution can't work. A secret declared in `secrets` but no `egress` entry is a placeholder that can never be substituted — a lint warning, not a failure. `requiresHost: true` marks an extension that cannot isolate (spawns host binaries — e.g. the claude-code starter); flipping it to host mode is a strategic-tier inbox decision persisted as `extensions.isolation='host'`.
+
+### Placement and events
+
+`placementFor(agentId, manifest)` returns a `vmKey`; v1 returns the agentId (one VM per agent), and the pooling future changes only that function plus a `vms.vm_key` lookup. Guest-emitted events cross via `ext.publish` → host-enforced `assertEventWrite` → `bus.publish` with fresh identity and `actorId = extensionId` — **published, not injected**: a guest is a subordinate execution context the host fully owns, not a federation peer (contrast the mesh's `bus.inject`). Subscriptions stream to the guest scrubbed of secret values.
+
+### Backend ladder
+
+`VmBackend` abstracts the hypervisor: **Firecracker** (Linux + KVM, the built tier) → CI-only bare subprocess (no isolation, flagged) → **in-process legacy** (no backend available; emits durable `extension.unisolated`, surfaced in `olle status`). macOS (vfkit over Virtualization.framework) and a real bubblewrap fallback tier are designed behind this interface and deferred until Linux microVM is proven. The guest is a Linux image (custom vmlinux with no network drivers + ext4 rootfs carrying bun, socat, and the shim) built via nix or docker-export, versioned under `~/.olle/vm/images/`, not embedded in the daemon binary.
+
 ## Cross-host mesh (v0)
 
 **Claim model only. No remote code execution.** The substrate is the most-agentic shape we can ship (LOG 2026-05-13): peer-mesh, leaderless arbitration, every cell sovereign. Centralization is a behavior an extension grows on top, not a shape the binary forces.
