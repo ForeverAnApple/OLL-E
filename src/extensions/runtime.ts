@@ -1,22 +1,26 @@
 // Extension runtime.
 //
+// This module owns the registries, gates, api-building, and lifecycle. The
+// three points where agent-authored code actually executes — staging it,
+// running its smoke gate, and importing + registering it — live behind the
+// ExtensionExecutor seam (see executor.ts / executor-legacy.ts) so a future
+// microVM backend can run that code in a guest without touching this file.
+//
 // Responsibilities:
 //  1. Discover extensions under ~/.olle/extensions/<name>/
 //  2. Parse and validate each manifest.json
-//  3. Run the extension's smoke.ts exported `smokeTest` in isolation before
-//     activating. Failure → mark inactive, emit an inbox-worthy event.
-//  4. dynamic-import index.ts, call register(api), track unload handler
+//  3. Ask the executor to smoke-gate the staged code before activating.
+//     Failure → mark inactive, emit an inbox-worthy event.
+//  4. Ask the executor to register(api); track the returned unload handler
 //  5. Track failure counts; on >=2 failures within 5 minutes mark crashed
 //     and emit extension.crashed so the inbox can offer revert.
 //
 // Hot-reload: unload(old) → reload(same name). Bun's ESM cache is keyed by
-// resolved path and ignores query strings, so we bust it by staging a fresh
-// copy under a uniquely-named dir (see stage()) rather than a query-string.
+// resolved path and ignores query strings, so the legacy executor busts it by
+// staging a fresh copy under a uniquely-named dir rather than a query-string.
 
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import type { EventBus } from "../bus/index.ts";
 import type { Event, Unsubscribe } from "../bus/types.ts";
 import type { Store } from "../store/db.ts";
@@ -29,14 +33,14 @@ import type { Scheduler } from "../scheduler/index.ts";
 import { checkTool } from "../permissions/index.ts";
 import { checkToolInvariants } from "../boot/invariants.ts";
 import type { AgentScope } from "../store/schema.ts";
+import type { ExtensionExecutor } from "./executor.ts";
+import { createLegacyExecutor, stagingRootFor } from "./executor-legacy.ts";
 import type {
   CallToolOptions,
   ExtensionApi,
   ExtensionCatalogProse,
-  ExtensionModule,
   LoadedExtension,
   Manifest,
-  SmokeTest,
   TaskRegistration,
   ToolDef,
   TriggerDef,
@@ -62,6 +66,10 @@ export interface ExtensionHostOptions {
    *  to find out if a thread has been retargeted away from the default
    *  mailbox. Omit when routing isn't available (tests). */
   resolveMailbox?: (threadId: string) => string | undefined;
+  /** Backend that runs agent-authored extension code (stage/smoke/register).
+   *  Defaults to the in-process legacy executor; a microVM backend implements
+   *  the same interface. */
+  executor?: ExtensionExecutor;
 }
 
 export type SmokeResult = { ok: true } | { ok: false; error: string };
@@ -157,6 +165,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   const failureLog = new Map<string, number[]>();
   const threshold = opts.failureThreshold ?? 2;
   const windowMs = opts.failureWindowMs ?? 5 * 60 * 1000;
+  const executor = opts.executor ?? createLegacyExecutor({ hostId: opts.hostId });
 
   mkdirSync(opts.extensionsDir, { recursive: true });
 
@@ -173,10 +182,9 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     return found;
   }
 
-  // Staging dir sits outside the extension tree so cpSync is happy, and
-  // outside the git-tracked extensions root so we don't commit copies.
-  const stagingRoot = join(tmpdir(), `olle-stage-${opts.hostId}`);
-  mkdirSync(stagingRoot, { recursive: true });
+  // The legacy executor stages into stagingRootFor(hostId); attribute() must
+  // match that same path, so both sides derive it from the one helper.
+  const stagingRoot = stagingRootFor(opts.hostId);
 
   // Precompiled at construction: both dirs are stable for the lifetime
   // of the host, and `attribute()` runs on every uncaughtException —
@@ -184,27 +192,6 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
   const attributionRegexes = [opts.extensionsDir, stagingRoot].map(
     (root) => new RegExp(`${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/([^/]+)`, "g"),
   );
-
-  /** Stage a fresh copy of the extension into a uniquely-named sibling
-   *  directory so dynamic import resolves a new module URL — Bun's ESM
-   *  cache is keyed by resolved path and ignores query strings. */
-  function stage(extDir: string, name: string): string {
-    const version = ulid();
-    const perExt = join(stagingRoot, name);
-    mkdirSync(perExt, { recursive: true });
-    const stageDir = join(perExt, version);
-    cpSync(extDir, stageDir, { recursive: true });
-    // Best-effort cleanup of older staged versions.
-    try {
-      for (const prior of readdirSync(perExt)) {
-        if (prior === version) continue;
-        rmSync(join(perExt, prior), { recursive: true, force: true });
-      }
-    } catch {
-      /* ignore */
-    }
-    return stageDir;
-  }
 
   function resolveManifestSecrets(manifest: Manifest): Record<string, string> {
     const out: Record<string, string> = {};
@@ -215,15 +202,6 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       }
     }
     return out;
-  }
-
-  async function runSmoke(stagedDir: string, manifest: Manifest): Promise<void> {
-    const smokePath = join(stagedDir, "smoke.ts");
-    if (!existsSync(smokePath)) return; // no smoke.ts is allowed; tool-only extensions
-    const url = pathToFileURL(smokePath).href;
-    const mod = (await import(url)) as { smokeTest?: SmokeTest };
-    if (typeof mod.smokeTest !== "function") return;
-    await mod.smokeTest(opts.bus, { secrets: resolveManifestSecrets(manifest) });
   }
 
   function makeApi(
@@ -620,18 +598,12 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     // Stage a fresh copy so dynamic import resolves a new module URL and
     // bypasses any prior cached version — Bun's ESM cache is keyed by
     // resolved path and ignores query strings.
-    const stagedDir = stage(extDir, name);
+    const staged = await executor.stage(extDir, name);
 
     // Smoke-gate before any side-effect-ful registration.
-    await runSmoke(stagedDir, manifest);
+    await executor.smoke(staged, manifest, resolveManifestSecrets(manifest), opts.bus);
 
     const extensionId = upsertRow(opts.store, manifest, extDir);
-    const indexUrl = pathToFileURL(join(stagedDir, "index.ts")).href;
-    const mod = (await import(indexUrl)) as ExtensionModule | { default: ExtensionModule };
-    const impl: ExtensionModule = "default" in mod ? mod.default : mod;
-    if (typeof impl.register !== "function") {
-      throw new Error(`extensions: ${name} has no register()`);
-    }
 
     // One revocation record per load; purgeRegistry flips it on unload/rollback.
     const revocation = { revoked: false };
@@ -647,8 +619,9 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
     // Transactional registration: any throw between register() and the
     // final loaded.set must roll back all in-memory side effects, or the
     // next load attempt collides with orphaned tools/subs/triggers.
+    let unloadHook: (() => void | Promise<void>) | undefined;
     try {
-      await impl.register(api);
+      ({ unload: unloadHook } = await executor.register(staged, api));
       await startTriggers(extensionId, manifest, revocation);
     } catch (err) {
       await purgeRegistry(extensionId, name);
@@ -662,7 +635,7 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       path: extDir,
       status: "active",
       failures: 0,
-      unload: impl.unload ? async () => impl.unload!() : undefined,
+      unload: unloadHook ? async () => unloadHook!() : undefined,
     };
     loaded.set(name, record);
     markStatus(opts.store, extensionId, "active");
@@ -774,8 +747,8 @@ export function createExtensionHost(opts: ExtensionHostOptions): ExtensionHost {
       };
     }
     try {
-      const stagedDir = stage(extDir, name);
-      await runSmoke(stagedDir, manifest);
+      const staged = await executor.stage(extDir, name);
+      await executor.smoke(staged, manifest, resolveManifestSecrets(manifest), opts.bus);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
