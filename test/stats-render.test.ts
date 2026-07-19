@@ -4,7 +4,7 @@
 // human-readable) and exercise the color:true path for the threshold escapes.
 
 import { describe, expect, test } from "bun:test";
-import { formatTokens, renderStats } from "../src/cli/stats-render.ts";
+import { renderStats } from "../src/cli/stats-render.ts";
 import { ANSI } from "../src/cli/theme.ts";
 import type { BudgetStatus, UsageStats } from "../src/observability/index.ts";
 
@@ -55,17 +55,8 @@ function plain(s: string): string {
 
 const NC = { width: 80, color: false } as const;
 
-describe("formatTokens", () => {
-  test("billions tier — 1e9 is not 1000.0M", () => {
-    expect(formatTokens(1_000_000_000)).toBe("1.00B");
-    expect(formatTokens(2_500_000_000)).toBe("2.50B");
-    expect(formatTokens(15_800_000)).toBe("15.8M");
-    expect(formatTokens(96_300)).toBe("96k");
-    expect(formatTokens(1_180_000)).toBe("1.2M");
-    expect(formatTokens(500)).toBe("500");
-  });
-});
-
+// formatTokens tier boundaries (incl. 1e9 → "1.00B") are covered by
+// render.test.ts; stats-render.ts only re-exports it. No duplicate here.
 describe("renderStats — populated", () => {
   test("humanized headline numbers, no raw integers", () => {
     const out = plain(renderStats(stats(), undefined, NC));
