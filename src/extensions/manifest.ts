@@ -22,6 +22,8 @@ const KNOWN_KEYS = new Set([
   "eventReads",
   "eventWrites",
   "catalog",
+  "egress",
+  "requiresHost",
   "config",
 ]);
 
@@ -96,5 +98,39 @@ export function validateManifestWithWarnings(
       );
     }
   }
+  if (v.egress !== undefined) {
+    if (Array.isArray(v.egress)) {
+      const entries: NonNullable<Manifest["egress"]> = [];
+      for (const [i, raw] of v.egress.entries()) {
+        const entry = parseEgressEntry(raw);
+        if (entry) entries.push(entry);
+        else warnings.push(`manifest[${context}]: egress[${i}] is malformed (needs string[] "hosts") — dropped`);
+      }
+      if (entries.length > 0) out.egress = entries;
+    } else {
+      warnings.push(`manifest[${context}]: egress must be an array — dropped`);
+    }
+  }
+  if (typeof v.requiresHost === "boolean") out.requiresHost = v.requiresHost;
+  else if (v.requiresHost !== undefined) {
+    warnings.push(`manifest[${context}]: requiresHost must be a boolean — dropped`);
+  }
   return { manifest: out, warnings };
+}
+
+/** Parse one egress entry, returning null if malformed. `hosts` is required
+ *  and must be a non-empty string[]; `secrets` and `mode` are optional and a
+ *  bad value drops just that field, not the whole entry. */
+function parseEgressEntry(raw: unknown): NonNullable<Manifest["egress"]>[number] | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.hosts) || r.hosts.length === 0 || !r.hosts.every((x) => typeof x === "string")) {
+    return null;
+  }
+  const entry: NonNullable<Manifest["egress"]>[number] = { hosts: r.hosts as string[] };
+  if (Array.isArray(r.secrets) && r.secrets.every((x) => typeof x === "string")) {
+    entry.secrets = r.secrets as string[];
+  }
+  if (r.mode === "placeholder" || r.mode === "guest") entry.mode = r.mode;
+  return entry;
 }

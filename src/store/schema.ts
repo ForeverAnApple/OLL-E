@@ -19,6 +19,7 @@ import {
   primaryKey,
   sqliteTable,
   text,
+  uniqueIndex,
 } from "drizzle-orm/sqlite-core";
 
 export const hosts = sqliteTable("hosts", {
@@ -152,7 +153,35 @@ export const extensions = sqliteTable("extensions", {
   lastSmokeAt: integer("last_smoke_at"),
   lastCommitSha: text("last_commit_sha"),
   createdAt: integer("created_at").notNull(),
+  // Owning agent (weak ref — backfilled to root at boot, may name a peer
+  // agent absent locally). Placement runs per-agent (LOG 2026-07-18).
+  agentId: text("agent_id"),
+  // auto | vm | host — resolved isolation posture. `host` is an approved
+  // requiresHost extension that cannot run in a VM.
+  isolation: text("isolation").notNull().default("auto"),
 });
+
+// One row per placed microVM (LOG 2026-07-18). vm_key is the placement key;
+// v1 = agent_id (one VM per agent). host_id is a real FK — a VM is always
+// local to the host running it.
+export const vms = sqliteTable(
+  "vms",
+  {
+    id: text("id").primaryKey(),
+    hostId: text("host_id")
+      .notNull()
+      .references(() => hosts.id),
+    vmKey: text("vm_key").notNull(),
+    agentId: text("agent_id").notNull(),
+    backend: text("backend").notNull(), // firecracker | subprocess | legacy | vfkit
+    status: text("status").notNull(), // booting | running | stopped | crashed
+    imageSha: text("image_sha"),
+    bootCount: integer("boot_count").notNull().default(0),
+    createdAt: integer("created_at").notNull(),
+    lastBootAt: integer("last_boot_at"),
+  },
+  (t) => [uniqueIndex("vms_key").on(t.hostId, t.vmKey)],
+);
 
 export const events = sqliteTable(
   "events",
@@ -589,6 +618,8 @@ export type Memory = typeof memories.$inferSelect;
 export type NewMemory = typeof memories.$inferInsert;
 export type Extension = typeof extensions.$inferSelect;
 export type NewExtension = typeof extensions.$inferInsert;
+export type Vm = typeof vms.$inferSelect;
+export type NewVm = typeof vms.$inferInsert;
 export type TaskRow = typeof tasks.$inferSelect;
 export type NewTaskRow = typeof tasks.$inferInsert;
 export type TriggerRow = typeof triggers.$inferSelect;

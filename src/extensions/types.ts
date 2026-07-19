@@ -37,6 +37,27 @@ export interface Manifest {
     blurb: string;
     tools?: Record<string, string>;
   };
+  /** Egress declarations — the visible authority boundary for network access
+   *  from isolated (microVM) execution, peer to callsTools/eventReads/
+   *  eventWrites (LOG 2026-07-18). Each entry allowlists a set of hosts and
+   *  the secrets permitted to reach them (the extension's `injectHosts`).
+   *  `mode: "placeholder"` (default) means api.secrets carries
+   *  `olle-secret://<NAME>` tokens the broker substitutes at egress, so the
+   *  real value never enters the guest; `mode: "guest"` delivers the real
+   *  value in-VM (still egress-pinned to `hosts`) for HMAC/binary-frame
+   *  protocols where substitution can't work. A secret in `secrets` but no
+   *  egress entry is an unroutable placeholder — a lint warning, not a
+   *  failure. Malformed entries are dropped with a warning. */
+  egress?: Array<{
+    hosts: string[];
+    secrets?: string[];
+    mode?: "placeholder" | "guest";
+  }>;
+  /** The extension cannot run isolated — it spawns host binaries or reads the
+   *  host filesystem (e.g. the claude-code starter). Loading it in a VM is
+   *  impossible; running it in-process is a strategic-tier decision persisted
+   *  as extensions.isolation = "host". */
+  requiresHost?: boolean;
 }
 
 /** One rendered catalog-prose entry, derived from a loaded extension's

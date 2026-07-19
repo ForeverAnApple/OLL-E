@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { openStore, tables } from "../src/store/index.ts";
-import { runMigrations } from "../src/store/migrate.ts";
+import { listMigrations, runMigrations } from "../src/store/migrate.ts";
 import { createClock, encodeStamp, ulid } from "../src/id/index.ts";
 
 function fresh() {
@@ -61,6 +61,14 @@ describe("store migrations", () => {
     // never ran. Under the new runner the rebuild preserves the historical
     // row and applies team_mesh.
     const db = new Database(":memory:");
+    // A real legacy DB actually ran its base migrations, so the base tables
+    // (agents, extensions, hosts, …) exist. Reproduce that by execing the
+    // real `init` SQL before seeding the legacy idx-keyed _migrations —
+    // otherwise a later migration that ALTERs a base table (e.g. 0005 on
+    // `extensions`) has nothing to alter in this synthetic fixture.
+    const initSql = listMigrations().find((m) => m.name === "init")?.sql;
+    if (!initSql) throw new Error("init migration missing");
+    db.exec(initSql);
     db.exec(`
       CREATE TABLE _migrations (
         idx INTEGER PRIMARY KEY,
