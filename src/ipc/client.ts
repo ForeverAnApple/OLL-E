@@ -1,6 +1,7 @@
 import { connect, type Socket } from "node:net";
 import type { Response } from "./protocol.ts";
 import type { Event } from "../bus/types.ts";
+import { encodeLine, LineDecoder } from "./codec.ts";
 
 export interface IpcClient {
   call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
@@ -27,21 +28,10 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
     number,
     { push: (ev: Event) => void; end: (err?: Error) => void }
   >();
-  let buffer = "";
+  const decoder = new LineDecoder<Response>();
 
   sock.on("data", (chunk) => {
-    buffer += chunk.toString("utf8");
-    let idx: number;
-    while ((idx = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 1);
-      if (!line.trim()) continue;
-      let msg: Response;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue;
-      }
+    for (const msg of decoder.push(chunk)) {
       if ("stream" in msg) {
         const s = streams.get(msg.id);
         if (!s) continue;
@@ -81,7 +71,7 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
         if (msg.ok) resolve(msg.value as T);
         else reject(new Error(msg.error.message));
       });
-      sock.write(JSON.stringify({ id, method, params }) + "\n");
+      sock.write(encodeLine({ id, method, params }));
     });
   }
 
@@ -118,7 +108,7 @@ export async function connectIpc(socketPath: string): Promise<IpcClient> {
       },
     });
 
-    sock.write(JSON.stringify({ id, method, params }) + "\n");
+    sock.write(encodeLine({ id, method, params }));
 
     const iterable: AsyncIterable<Event> = {
       [Symbol.asyncIterator]() {

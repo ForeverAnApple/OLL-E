@@ -34,6 +34,7 @@ import {
 } from "../observability/index.ts";
 import { setBudget } from "../ledger/index.ts";
 import { isRequest, type Response, type Request } from "./protocol.ts";
+import { encodeLine, LineDecoder } from "./codec.ts";
 import { readDefaultModel, writeDefaultModel } from "../daemon/model-preference.ts";
 import { resolveBootModel } from "../memory/model.ts";
 import type { ToolDispatch } from "../mcp/contract.ts";
@@ -151,22 +152,19 @@ export function createIpcServer(opts: IpcServerOptions): IpcServer {
 }
 
 function handleConnection(sock: Socket, opts: IpcServerOptions): void {
-  let buffer = "";
+  const decoder = new LineDecoder();
   // Map of pending subscription ids → unsub callback. Cleared on close.
   const subscriptions = new Map<number, () => void>();
 
   const send = (msg: Response): void => {
     if (sock.destroyed) return;
-    sock.write(JSON.stringify(msg) + "\n");
+    sock.write(encodeLine(msg));
   };
 
   sock.on("data", (chunk) => {
-    buffer += chunk.toString("utf8");
-    let idx: number;
-    while ((idx = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 1);
-      if (!line.trim()) continue;
+    // The server parses per-line itself (not decoder.push) so a malformed
+    // line replies with a "bad json" error instead of being silently dropped.
+    for (const line of decoder.pushLines(chunk)) {
       let req: unknown;
       try {
         req = JSON.parse(line);
