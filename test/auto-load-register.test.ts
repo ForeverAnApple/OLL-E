@@ -1,9 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { wrapRegisterForAutoLoad } from "../src/agent/chat.ts";
+import { seedExtensionTools, wrapRegisterForAutoLoad } from "../src/agent/chat.ts";
 import type { ExtensionHost, ToolDef } from "../src/extensions/index.ts";
 
+// Two seams over chat.ts's per-thread loaded set: wrapRegisterForAutoLoad
+// (auto-load an extension's tools at register time) and seedExtensionTools
+// (seed a fresh thread with every active extension's tools). Both read the
+// same host.tools() surface, so they share one fake.
+//
 // Minimal fake. Real ExtensionHost has many methods; we only exercise
-// the seam wrapRegisterForAutoLoad reads from.
+// the seam these functions read from.
 function fakeExtensionHost(opts: {
   toolsByExt: Record<string, ToolDef[]>;
   loaded: string[];
@@ -160,5 +165,52 @@ describe("wrapRegisterForAutoLoad", () => {
     const result = await wrapped.execute({ name: "missing-ext" } as never, ctx);
     expect(result).toEqual({ status: "active" });
     expect(loadedTools.size).toBe(0);
+  });
+});
+
+const seedTool = (name: string, alwaysLoaded = false): ToolDef => ({
+  name,
+  description: name,
+  inputSchema: { type: "object", properties: {} },
+  alwaysLoaded,
+  execute: () => name,
+});
+
+describe("seedExtensionTools", () => {
+  // A new thread's loaded set is pre-populated with every active extension's
+  // contributed tools, so the agent sees their schemas from turn one instead
+  // of re-guessing or re-load_tools-ing an already-installed capability.
+  it("seeds the names of every active extension's tools", () => {
+    const host = fakeExtensionHost({
+      loaded: [],
+      toolsByExt: {
+        "claude-code": [seedTool("claude_code")],
+        github: [seedTool("github_list_issues"), seedTool("github_comment")],
+      },
+    });
+    const loaded = seedExtensionTools(host);
+    expect(loaded.has("claude_code")).toBe(true);
+    expect(loaded.has("github_list_issues")).toBe(true);
+    expect(loaded.has("github_comment")).toBe(true);
+    expect(loaded.size).toBe(3);
+  });
+
+  it("skips always-loaded tools — they're sent every turn regardless", () => {
+    const host = fakeExtensionHost({
+      loaded: [],
+      toolsByExt: { "my-ext": [seedTool("ext_tool"), seedTool("always_on", true)] },
+    });
+    const loaded = seedExtensionTools(host);
+    expect(loaded.has("ext_tool")).toBe(true);
+    expect(loaded.has("always_on")).toBe(false);
+    expect(loaded.size).toBe(1);
+  });
+
+  it("returns an empty set when there's no extension host", () => {
+    expect(seedExtensionTools(undefined).size).toBe(0);
+  });
+
+  it("returns an empty set when no extensions are active", () => {
+    expect(seedExtensionTools(fakeExtensionHost({ loaded: [], toolsByExt: {} })).size).toBe(0);
   });
 });
